@@ -1082,6 +1082,88 @@ def cashflow_insights(Plant: str = Query(None)):
             "top_items": top_items, "by_category": by_category}
 
 
+def _replen_frame(pl):
+    rp = da.filter_plant(da.load("stock_replenishment_and_aging_risk"), pl).copy()
+    for c in ["closing_stock", "closing_stock_value", "demand_forecast", "demand_monthly",
+              "unit_cost", "replenishment_quantity", "aging_days", "safe_stock"]:
+        if c in rp:
+            rp[c] = pd.to_numeric(rp[c], errors="coerce").fillna(0.0)
+    rp["material_id"] = rp["material_id"].astype(str)
+    rp["reorder_value"] = rp["replenishment_quantity"] * rp["unit_cost"]
+    rp["cover"] = np.where(rp["demand_monthly"] > 0, rp["closing_stock"] / rp["demand_monthly"],
+                           np.where(rp["closing_stock"] > 0, 999.0, 0.0))
+
+    def _status(r):
+        if r["closing_stock"] <= 0 and r["demand_forecast"] > 0:
+            return "Stock-out"
+        if r["aging_days"] > 365 and r["closing_stock"] > 0:
+            return "Dead stock"
+        if r["replenishment_quantity"] > 0 and r["cover"] < 1:
+            return "Reorder now"
+        if r["cover"] > 9 or r["aging_days"] > 180:
+            return "Overstocked"
+        return "Healthy"
+    rp["status"] = rp.apply(_status, axis=1)
+    return rp
+
+
+@router.get("/forecast/replenishment-insights")
+def replenishment_insights(Plant: str = Query(None)):
+    """Reorder & aging-risk action board: a stock-health spectrum (understock ->
+    overstock), the biggest items to reorder now, the items sitting too long, and
+    a ladder of the cash locked in aging stock."""
+    pl = _plant(Plant)
+    rp = _replen_frame(pl)
+    accd = {str(r["metric"]): float(r["value"]) for _, r in da.load("forecast_accuracy").iterrows()}
+
+    ORDER = ["Stock-out", "Reorder now", "Healthy", "Overstocked", "Dead stock"]
+    spectrum = [{"status": s, "count": int((rp["status"] == s).sum()),
+                 "value": float(rp[rp["status"] == s]["closing_stock_value"].sum())} for s in ORDER]
+
+    need = rp[rp["replenishment_quantity"] > 0].sort_values("reorder_value", ascending=False).head(8)
+    order_now = [{"material": r["material_id"], "desc": str(r.get("material_desc", "")),
+                  "group": _clean_group(r.get("material_group", "")), "qty": float(r["replenishment_quantity"]),
+                  "value": float(r["reorder_value"]), "cover": float(r["cover"]), "stock": float(r["closing_stock"])}
+                 for _, r in need.iterrows()]
+
+    aged = rp[(rp["aging_days"] > 180) & (rp["closing_stock_value"] > 0)].sort_values("closing_stock_value", ascending=False).head(8)
+    aging = [{"material": r["material_id"], "desc": str(r.get("material_desc", "")),
+              "group": _clean_group(r.get("material_group", "")), "value": float(r["closing_stock_value"]),
+              "aging_days": int(r["aging_days"]), "bucket": str(r["aging_risk"])} for _, r in aged.iterrows()]
+
+    LAD = ["<3 Months", "3-6 Months", "6-12 Months", "1+ Year"]
+    ladder = [{"bucket": b, "value": float(rp[rp["aging_risk"] == b]["closing_stock_value"].sum()),
+               "count": int((rp["aging_risk"] == b).sum())} for b in LAD]
+
+    totals = {"reorder_skus": int((rp["replenishment_quantity"] > 0).sum()),
+              "reorder_value": float(rp["reorder_value"].sum()),
+              "reorder_qty": float(rp["replenishment_quantity"].sum()),
+              "stockout_skus": int((rp["status"] == "Stock-out").sum()),
+              "aging_skus": int((rp["aging_days"] > 180).sum()),
+              "aging_value": float(rp[rp["aging_days"] > 180]["closing_stock_value"].sum()),
+              "healthy_skus": int((rp["status"] == "Healthy").sum()),
+              "total_skus": int(len(rp)), "stock_value": float(rp["closing_stock_value"].sum()),
+              "accuracy": accd.get("Aggregate Forecast Accuracy %", 0.0)}
+    return {"totals": totals, "spectrum": spectrum, "order_now": order_now, "aging": aging, "ladder": ladder}
+
+
+@router.get("/forecast/item-risk")
+def item_risk(Plant: str = Query(None), Material: str = Query(...)):
+    """Single-SKU reorder & aging status for the 'check any item' panel."""
+    rp = _replen_frame(_plant(Plant))
+    sub = rp[rp["material_id"] == str(Material)]
+    if not len(sub):
+        return {"found": False}
+    r = sub.iloc[0]
+    return {"found": True, "material": str(r["material_id"]), "desc": str(r.get("material_desc", "")),
+            "group": _clean_group(r.get("material_group", "")), "status": str(r["status"]),
+            "stock": float(r["closing_stock"]), "stock_value": float(r["closing_stock_value"]),
+            "demand_monthly": float(r["demand_monthly"]), "demand_forecast": float(r["demand_forecast"]),
+            "cover": float(r["cover"]), "safe_stock": float(r["safe_stock"]),
+            "reorder_qty": float(r["replenishment_quantity"]), "reorder_value": float(r["reorder_value"]),
+            "aging_days": int(r["aging_days"]), "bucket": str(r["aging_risk"]), "unit_cost": float(r["unit_cost"])}
+
+
 # ---------------- helpers ----------------
 def _num(v):
     try:
