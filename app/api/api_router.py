@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from app.api import kpi_generic, sales_forecast_kpi, replenishment_and_aging_risk
-from app.api import dashboard_summary, legacy_kpi
+from app.api import dashboard_summary, legacy_kpi, authenticate
 
 api_router = APIRouter()
 
@@ -14,9 +14,13 @@ api_router.include_router(sales_forecast_kpi.router, tags=["Forecast KPI"])
 api_router.include_router(replenishment_and_aging_risk.router, tags=["Replenishment & Aging Risk"])
 # Executive summary + admin
 api_router.include_router(dashboard_summary.router, tags=["Dashboard Summary"])
-# NOTE: auth (DB-backed UserService) deferred for the analytics POC — re-add when needed.
 
 
 @api_router.get("/health", tags=["Health"])
 def health():
     return {"status": "ok"}
+
+
+# Auth — local JSON-backed user store (seeds an approved admin: admin@hcg.com).
+# /signin, /signup, /admin/* — same contract the original frontend expects.
+api_router.include_router(authenticate.router, tags=["Auth"])

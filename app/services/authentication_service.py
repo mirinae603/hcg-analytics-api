@@ -1,470 +1,154 @@
-# user_service.py
-import pyodbc
-import pandas as pd
+# user_service.py — local JSON-backed user store.
+# The original implementation used Azure SQL (pyodbc); that dependency was removed
+# for the free Vercel/Render deploy. This keeps the SAME public interface and return
+# shapes so app/api/authenticate.py works unchanged, but persists users to a JSON
+# file and seeds an approved admin so sign-in works out of the box.
+import json
+import os
 import hashlib
-from dotenv import load_dotenv
-import logging, os
-from fastapi import HTTPException
-from typing import Dict, Optional, List
+import logging
+import threading
+from datetime import datetime, timezone
 from enum import Enum
+from typing import Dict, List
 
-load_dotenv()
+from fastapi import HTTPException
+
+USERS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "users.json")
+_LOCK = threading.Lock()
+
+# Seed admin so the app is usable immediately (change via signup/admin later).
+SEED_ADMIN = {"firstName": "HCG", "lastName": "Admin", "email": "admin@hcg.com",
+              "password": "admin123", "status": "approved"}
+
 
 class UserStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
 
+
 class UserService:
     def __init__(self):
-        # Azure SQL Database connection details
-        self.server = 'bideasy-dashboard-server.database.windows.net,1433'
-        self.database = 'bideasy-analytics-kpi'
-        self.username = os.getenv("DATABASE_USERNAME")
-        self.password = os.getenv("DATABASE_PASSWORD")
-        self.driver = '{ODBC Driver 17 for SQL Server}'
-        
-        self.conn_str = (
-            f'DRIVER={self.driver};'
-            f'SERVER={self.server};'
-            f'DATABASE={self.database};'
-            f'UID={self.username};'
-            f'PWD={self.password};'
-            f'Encrypt=yes;'
-            f'TrustServerCertificate=no;'
-            f'Connection Timeout=60;'
-        )
-        
-        # Initialize database table
-        self._initialize_users_table()
-    
-    def _initialize_users_table(self):
-        """Create users table if it doesn't exist"""
-        create_table_query = """
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' AND xtype='U')
-        CREATE TABLE users (
-            id INT IDENTITY(1,1) PRIMARY KEY,
-            firstName NVARCHAR(100) NOT NULL,
-            lastName NVARCHAR(100) NOT NULL,
-            email NVARCHAR(255) UNIQUE NOT NULL,
-            password_hash NVARCHAR(255) NOT NULL,
-            status NVARCHAR(20) DEFAULT 'pending',
-            created_at DATETIME DEFAULT GETDATE(),
-            updated_at DATETIME DEFAULT GETDATE()
-        )
-        """
-        
+        os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
+        self._ensure_seed()
+
+    # ---------- storage helpers ----------
+    def _load(self) -> List[Dict]:
+        if not os.path.exists(USERS_FILE):
+            return []
         try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                cursor.execute(create_table_query)
-                conn.commit()
-                logging.info("Users table initialized successfully")
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception as e:
-            logging.error(f"Error initializing users table: {str(e)}")
-            raise
-    
+            logging.error(f"users.json read error: {e}")
+            return []
+
+    def _save(self, users: List[Dict]) -> None:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2)
+
+    def _ensure_seed(self) -> None:
+        with _LOCK:
+            users = self._load()
+            if not any(u["email"].lower() == SEED_ADMIN["email"].lower() for u in users):
+                now = datetime.now(timezone.utc).isoformat()
+                users.append({"firstName": SEED_ADMIN["firstName"], "lastName": SEED_ADMIN["lastName"],
+                              "email": SEED_ADMIN["email"], "password_hash": self.hash_password(SEED_ADMIN["password"]),
+                              "status": SEED_ADMIN["status"], "created_at": now, "updated_at": now})
+                self._save(users)
+                logging.info("Seeded default admin user")
+
     def hash_password(self, password: str) -> str:
-        """Hash password using SHA256"""
         return hashlib.sha256(password.encode()).hexdigest()
-    
+
+    def _find(self, users: List[Dict], email: str):
+        for u in users:
+            if u["email"].lower() == str(email).lower():
+                return u
+        return None
+
+    def _safe(self, u: Dict) -> Dict:
+        return {"firstName": u.get("firstName"), "lastName": u.get("lastName"),
+                "email": u.get("email"), "status": u.get("status")}
+
+    # ---------- public API (same shapes as the original service) ----------
     async def create_user(self, user_data) -> Dict:
-        """Create a new user in the database"""
-        # Validate input
         if not user_data.firstName.strip():
             raise HTTPException(status_code=400, detail="First name is required")
-        
         if not user_data.lastName.strip():
             raise HTTPException(status_code=400, detail="Last name is required")
-        
         if len(user_data.password) < 6:
             raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
-        
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                
-                # Check if user already exists
-                check_query = "SELECT COUNT(*) FROM users WHERE email = ?"
-                cursor.execute(check_query, (user_data.email,))
-                if cursor.fetchone()[0] > 0:
-                    raise HTTPException(status_code=400, detail="Email already registered")
-                
-                # Insert new user
-                insert_query = """
-                INSERT INTO users (firstName, lastName, email, password_hash, status)
-                VALUES (?, ?, ?, ?, ?)
-                """
-                cursor.execute(insert_query, (
-                    user_data.firstName.strip(),
-                    user_data.lastName.strip(),
-                    user_data.email,
-                    self.hash_password(user_data.password),
-                    UserStatus.PENDING
-                ))
-                conn.commit()
-                
-                logging.info(f"User {user_data.email} registered successfully with pending status")
-                
-                return {
-                    "message": "Account created successfully! Your account is under review and pending approval.",
-                    "user": {
-                        "email": user_data.email,
-                        "firstName": user_data.firstName.strip(),
-                        "lastName": user_data.lastName.strip(),
-                        "status": UserStatus.PENDING
-                    }
-                }
-        
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.error(f"Database error during user creation: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during registration")
-    
+        with _LOCK:
+            users = self._load()
+            if self._find(users, user_data.email):
+                raise HTTPException(status_code=409, detail="An account with this email already exists")
+            now = datetime.now(timezone.utc).isoformat()
+            user = {"firstName": user_data.firstName.strip(), "lastName": user_data.lastName.strip(),
+                    "email": user_data.email, "password_hash": self.hash_password(user_data.password),
+                    "status": UserStatus.PENDING.value, "created_at": now, "updated_at": now}
+            users.append(user)
+            self._save(users)
+        return {"message": "Registration successful! Your account is pending admin approval.",
+                "user": self._safe(user)}
+
     async def authenticate_user(self, credentials) -> Dict:
-        """Authenticate user login"""
-        # Validate input
         if not credentials.email:
             raise HTTPException(status_code=400, detail="Email is required")
-        
         if not credentials.password:
             raise HTTPException(status_code=400, detail="Password is required")
-        
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                
-                # Get user from database
-                query = """
-                SELECT firstName, lastName, email, password_hash, status 
-                FROM users 
-                WHERE email = ?
-                """
-                cursor.execute(query, (credentials.email,))
-                user_row = cursor.fetchone()
-                
-                if not user_row:
-                    logging.warning(f"Login attempt with non-existent email: {credentials.email}")
-                    raise HTTPException(status_code=401, detail="Invalid email or password")
-                
-                # Convert row to dictionary
-                print("Fetched User Row : ", user_row)
-                user = {
-                "firstName": user_row[0],
-                "lastName": user_row[1],        
-                "email": user_row[2],           
-                "password_hash": user_row[3],   
-                "status": user_row[4]          
-            }
-                # Verify password
-                if self.hash_password(credentials.password) != user["password_hash"]:
-                    logging.warning(f"Failed login attempt for email: {credentials.email}")
-                    raise HTTPException(status_code=401, detail="Invalid email or password")
-                
-                # Check if user is approved
-                if user["status"] != UserStatus.APPROVED:
-                    logging.warning(f"Login attempt with pending/rejected account: {credentials.email}")
-                    raise HTTPException(
-                        status_code=403, 
-                        detail="Your Account Approval is Pending ..."
-                    )
-                
-                logging.info(f"User {credentials.email} logged in successfully")
-                
-                return {
-                    "message": "Login successful!",
-                    "user": {
-                        "email": user["email"],
-                        "firstName": user["firstName"],
-                        "lastName": user["lastName"],
-                        "status": user["status"]
-                    }
-                }
-        
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.error(f"Database error during authentication: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during login")
-    
+        users = self._load()
+        user = self._find(users, credentials.email)
+        if not user or self.hash_password(credentials.password) != user["password_hash"]:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        if user["status"] != UserStatus.APPROVED.value:
+            raise HTTPException(status_code=403, detail="Your Account Approval is Pending ...")
+        return {"message": "Login successful!",
+                "user": {"email": user["email"], "firstName": user["firstName"],
+                         "lastName": user["lastName"], "status": user["status"]}}
+
     async def get_all_users(self) -> Dict:
-        """Get all users with their status"""
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                query = """
-                SELECT firstName, lastName, email, status 
-                FROM users 
-                ORDER BY created_at DESC
-                """
-                df = pd.read_sql(query, conn)
-                
-                safe_users = df.to_dict(orient='records')
-                
-                return {
-                    "users": safe_users, 
-                    "total": len(safe_users),
-                    "pending_count": len([u for u in safe_users if u["status"] == UserStatus.PENDING]),
-                    "approved_count": len([u for u in safe_users if u["status"] == UserStatus.APPROVED]),
-                    "rejected_count": len([u for u in safe_users if u["status"] == UserStatus.REJECTED])
-                }
-        
-        except Exception as e:
-            logging.error(f"Database error getting all users: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error")
-    
+        users = self._load()
+        return {"message": "Users fetched successfully", "users": [self._safe(u) for u in users]}
+
     async def get_pending_users(self) -> Dict:
-        """Get only pending users"""
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                query = """
-                SELECT firstName, lastName, email, status 
-                FROM users 
-                WHERE status = ?
-                ORDER BY created_at DESC
-                """
-                df = pd.read_sql(query, conn, params=[UserStatus.PENDING])
-                
-                pending_users = df.to_dict(orient='records')
-                
-                return {
-                    "pending_users": pending_users, 
-                    "count": len(pending_users)
-                }
-        
-        except Exception as e:
-            logging.error(f"Database error getting pending users: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error")
-    
+        users = self._load()
+        return {"users": [self._safe(u) for u in users if u.get("status") == UserStatus.PENDING.value]}
+
     async def approve_reject_user(self, approval_request) -> Dict:
-        """Approve or reject user signup"""
-        email = approval_request.email
-        action = approval_request.action.lower()
-        
-        # Validate action
-        if action not in ["approve", "reject"]:
-            raise HTTPException(status_code=400, detail="Action must be 'approve' or 'reject'")
-        
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                
-                # Check if user exists and get current status
-                check_query = """
-                SELECT firstName, lastName, email, status 
-                FROM users 
-                WHERE email = ?
-                """
-                cursor.execute(check_query, (email,))
-                user_row = cursor.fetchone()
-                
-                if not user_row:
-                    raise HTTPException(status_code=404, detail="User not found")
-                
-                # In approve_reject_user method, fix this part:
-                user = {
-                    "firstName": user_row[0],
-                    "lastName": user_row[1],    
-                    "email": user_row[2],       
-                    "status": user_row[3]       
-                }
+        action = str(getattr(approval_request, "action", "")).lower()
+        new_status = UserStatus.APPROVED.value if action == "approve" else UserStatus.REJECTED.value
+        with _LOCK:
+            users = self._load()
+            user = self._find(users, approval_request.email)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            user["status"] = new_status
+            user["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save(users)
+        return {"message": f"User {new_status} successfully", "user": self._safe(user)}
 
-                
-                # Check if user is currently pending
-                if user["status"] != UserStatus.PENDING:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"User is already {user['status']}. Only pending users can be approved/rejected."
-                    )
-                
-                # Update user status
-                new_status = UserStatus.APPROVED if action == "approve" else UserStatus.REJECTED
-                update_query = """
-                UPDATE users 
-                SET status = ?, updated_at = GETDATE() 
-                WHERE email = ?
-                """
-                cursor.execute(update_query, (new_status, email))
-                conn.commit()
-                
-                message = f"User {email} has been {'approved' if action == 'approve' else 'rejected'} successfully"
-                logging.info(f"Admin action: {action} user {email}")
-                
-                return {
-                    "message": message,
-                    "user": {
-                        "email": user["email"],
-                        "firstName": user["firstName"],
-                        "lastName": user["lastName"],
-                        "status": new_status
-                    }
-                }
-        
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.error(f"Database error during user approval: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during user approval")
-    
     async def get_user_credentials(self) -> Dict:
-        """Get user credentials for debugging - remove in production"""
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                query = """
-                SELECT email, firstName, lastName, password_hash, status 
-                FROM users 
-                ORDER BY created_at DESC
-                """
-                df = pd.read_sql(query, conn)
-                
-                credentials = df.to_dict(orient='records')
-                
-                return {
-                    "message": "WARNING: This endpoint should be removed in production",
-                    "credentials": credentials,
-                    "total": len(credentials)
-                }
-        
-        except Exception as e:
-            logging.error(f"Database error getting credentials: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error")
-    
+        users = self._load()
+        return {"users": [self._safe(u) for u in users]}
+
     async def health_check(self) -> Dict:
-        """Health check with user statistics"""
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                # Get count statistics
-                query = """
-                SELECT 
-                    COUNT(*) as total_users,
-                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_users,
-                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved_users,
-                    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected_users
-                FROM users
-                """
-                cursor = conn.cursor()
-                cursor.execute(query)
-                row = cursor.fetchone()
-                
-                return {
-                    "status": "healthy", 
-                    "total_users": row[0] or 0,
-                    "pending_users": row or 0,
-                    "approved_users": row or 0,
-                    "rejected_users": row or 0
-                }
-        
-        except Exception as e:
-            logging.error(f"Database error during health check: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during health check")
-
-
+        return {"status": "ok", "store": "json", "users": len(self._load())}
 
     async def delete_user(self, email: str) -> Dict:
-        """Delete a user from the database"""
-        if not email:
-            raise HTTPException(status_code=400, detail="Email is required")
-        
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                
-                # Check if user exists
-                check_query = """
-                SELECT firstName, lastName, email, status 
-                FROM users 
-                WHERE email = ?
-                """
-                cursor.execute(check_query, (email,))
-                user_row = cursor.fetchone()
-                
-                if not user_row:
-                    raise HTTPException(status_code=404, detail="User not found")
-                
-                user = {
-                    "firstName": user_row[0],
-                    "lastName": user_row[1],
-                    "email": user_row[2],
-                    "status": user_row[3]
-                }
-                
-                # Delete the user
-                delete_query = "DELETE FROM users WHERE email = ?"
-                cursor.execute(delete_query, (email,))
-                rows_affected = cursor.rowcount
-                conn.commit()
-                
-                if rows_affected == 0:
-                    raise HTTPException(status_code=404, detail="User not found or already deleted")
-                
-                logging.info(f"User {email} deleted successfully")
-                
-                return {
-                    "message": f"User {email} has been deleted successfully",
-                    "deleted_user": {
-                        "email": user["email"],
-                        "firstName": user["firstName"],
-                        "lastName": user["lastName"],
-                        "status": user["status"]
-                    }
-                }
-        
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.error(f"Database error during user deletion: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during user deletion")
+        with _LOCK:
+            users = self._load()
+            if not self._find(users, email):
+                raise HTTPException(status_code=404, detail="User not found")
+            users = [u for u in users if u["email"].lower() != str(email).lower()]
+            self._save(users)
+        return {"message": "User deleted successfully"}
 
     async def bulk_delete_users(self, emails: List[str]) -> Dict:
-        """Delete multiple users from the database"""
-        if not emails:
-            raise HTTPException(status_code=400, detail="Email list cannot be empty")
-        
-        try:
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
-                
-                deleted_users = []
-                not_found_emails = []
-                
-                for email in emails:
-                    # Check if user exists
-                    check_query = """
-                    SELECT firstName, lastName, email, status 
-                    FROM users 
-                    WHERE email = ?
-                    """
-                    cursor.execute(check_query, (email,))
-                    user_row = cursor.fetchone()
-                    
-                    if user_row:
-                        user = {
-                            "firstName": user_row[0],
-                            "lastName": user_row[1],
-                            "email": user_row[2],
-                            "status": user_row[3]
-                        }
-                        deleted_users.append(user)
-                    else:
-                        not_found_emails.append(email)
-                
-                if deleted_users:
-                    # Create placeholders for the IN clause
-                    placeholders = ','.join(['?' for _ in emails])
-                    delete_query = f"DELETE FROM users WHERE email IN ({placeholders})"
-                    cursor.execute(delete_query, emails)
-                    conn.commit()
-                    
-                    logging.info(f"Bulk deleted {len(deleted_users)} users")
-                
-                return {
-                    "message": f"Bulk deletion completed. {len(deleted_users)} users deleted.",
-                    "deleted_users": deleted_users,
-                    "not_found_emails": not_found_emails,
-                    "deleted_count": len(deleted_users),
-                    "not_found_count": len(not_found_emails)
-                }
-        
-        except Exception as e:
-            logging.error(f"Database error during bulk deletion: {str(e)}")
-            raise HTTPException(status_code=500, detail="Database error during bulk deletion")
+        lows = {str(e).lower() for e in emails}
+        with _LOCK:
+            users = self._load()
+            users = [u for u in users if u["email"].lower() not in lows]
+            self._save(users)
+        return {"message": f"Deleted {len(lows)} user(s)"}

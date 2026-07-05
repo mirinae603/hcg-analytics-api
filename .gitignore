@@ -15,3 +15,6 @@ venv/
 # OS / editor
 .DS_Store
 *.log
+
+# local user store (seeded at runtime)
+app/data/users.json
