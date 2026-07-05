@@ -1,0 +1,21 @@
+Plant,Aging Category,Count
+Bangalore,1+ Year,476
+Bangalore,3+ Months,481
+Bangalore,6+ Months,604
+Bangalore,<3 Months,2422
+Chennai,1+ Year,15
+Chennai,3+ Months,157
+Chennai,6+ Months,210
+Chennai,<3 Months,1243
+Hyderabad East,1+ Year,42
+Hyderabad East,3+ Months,44
+Hyderabad East,6+ Months,66
+Hyderabad East,<3 Months,433
+Hyderabad West,1+ Year,85
+Hyderabad West,3+ Months,126
+Hyderabad West,6+ Months,82
+Hyderabad West,<3 Months,809
+Vijayawada,1+ Year,151
+Vijayawada,3+ Months,220
+Vijayawada,6+ Months,283
+Vijayawada,<3 Months,1579

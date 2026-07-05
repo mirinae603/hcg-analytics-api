@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pandas
+pyarrow
+openpyxl
+numpy
+colorlog
+pydantic-settings
+rich
+email-validator

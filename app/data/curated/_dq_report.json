@@ -1,0 +1,19 @@
+{
+  "consumption_rows": 128369,
+  "inventory_rows": 97590,
+  "grn_rows": 255803,
+  "po_rows": 249884,
+  "plants": 53,
+  "materials": 24931,
+  "vendors": 3576,
+  "cost_centers": 730,
+  "months_consumption": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    12
+  ],
+  "elapsed_sec": 114.1
+}

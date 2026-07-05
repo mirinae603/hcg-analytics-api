@@ -1,0 +1,10 @@
+# Render Blueprint — deploys the FastAPI backend as a free Docker web service.
+# In Render: New → Blueprint → point at this repo. Or New → Web Service → Docker.
+services:
+  - type: web
+    name: hcg-analytics-api
+    runtime: docker
+    plan: free            # free tier: sleeps after 15 min idle, ~512 MB RAM
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
