@@ -12,6 +12,7 @@ api/service file pairs. Each KPI is described once in REGISTRY.
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from functools import lru_cache
 from typing import Optional
 
 from app.core import data_access as da
@@ -124,13 +125,36 @@ def meta_kpis():
     return [{"key": k, "table": t, "status": s} for k, (t, s) in REGISTRY.items()]
 
 
+@lru_cache(maxsize=1)
+def _plant_domains():
+    """Which data domains each plant actually has data for — so the UI can hide
+    plants that would only show zeros on a given section (e.g. corporate offices &
+    labs have no inventory)."""
+    inv = set(da.load("fact_inventory")["plant"].astype(str))
+    con = set(da.load("fact_consumption")["plant"].astype(str))
+    grn = set(da.load("fact_grn")["plant"].astype(str))
+    return inv, con, grn
+
+
 @router.get("/meta/plants")
 def meta_plants():
     df = da.load("dim_plant")
-    items = [{"code": r["plant"], "name": r.get("plant_name", r["plant"])}
-             for r in df.to_dict("records")]
+    inv, con, grn = _plant_domains()
+    items = []
+    for r in df.to_dict("records"):
+        code = str(r["plant"])
+        domains = []
+        if code in inv:
+            domains.append("inventory")
+        if code in con:
+            domains += ["consumption", "forecasting"]   # forecasts are built from consumption
+        if code in grn:
+            domains.append("procurement")
+        items.append({"code": r["plant"], "name": r.get("plant_name", r["plant"]), "domains": domains})
+    items = [it for it in items if it["domains"]]        # drop plants with no data at all
     items.sort(key=lambda x: x["name"])
-    return {"plants": [{"code": "ALL", "name": "All Plants"}] + items}
+    return {"plants": [{"code": "ALL", "name": "All Plants",
+                        "domains": ["inventory", "consumption", "forecasting", "procurement"]}] + items}
 
 
 @router.get("/meta/materials")
