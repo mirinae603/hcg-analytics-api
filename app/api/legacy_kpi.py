@@ -1135,6 +1135,19 @@ def replenishment_insights(Plant: str = Query(None)):
     ladder = [{"bucket": b, "value": float(rp[rp["aging_risk"] == b]["closing_stock_value"].sum()),
                "count": int((rp["aging_risk"] == b).sum())} for b in LAD]
 
+    # reorder pressure by category — the hero chart (clean, actionable columns):
+    # how much reorder cash each department needs vs cash tied up in its aging stock.
+    cat = rp.copy()
+    cat["g"] = cat["material_group"].apply(_clean_group)
+    cat["aged_val"] = np.where(cat["aging_days"] > 180, cat["closing_stock_value"], 0.0)
+    by = (cat.groupby("g").agg(reorder_value=("reorder_value", "sum"),
+                               reorder_count=("replenishment_quantity", lambda s: int((s > 0).sum())),
+                               aging_value=("aged_val", "sum")).reset_index()
+             .sort_values("reorder_value", ascending=False).head(7))
+    by_category = [{"group": r["g"], "reorder_value": float(r["reorder_value"]),
+                    "reorder_count": int(r["reorder_count"]), "aging_value": float(r["aging_value"])}
+                   for _, r in by.iterrows()]
+
     totals = {"reorder_skus": int((rp["replenishment_quantity"] > 0).sum()),
               "reorder_value": float(rp["reorder_value"].sum()),
               "reorder_qty": float(rp["replenishment_quantity"].sum()),
@@ -1144,7 +1157,8 @@ def replenishment_insights(Plant: str = Query(None)):
               "healthy_skus": int((rp["status"] == "Healthy").sum()),
               "total_skus": int(len(rp)), "stock_value": float(rp["closing_stock_value"].sum()),
               "accuracy": accd.get("Aggregate Forecast Accuracy %", 0.0)}
-    return {"totals": totals, "spectrum": spectrum, "order_now": order_now, "aging": aging, "ladder": ladder}
+    return {"totals": totals, "spectrum": spectrum, "by_category": by_category,
+            "order_now": order_now, "aging": aging, "ladder": ladder}
 
 
 @router.get("/forecast/item-risk")
