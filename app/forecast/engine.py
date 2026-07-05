@@ -60,8 +60,13 @@ def _forecast(M: np.ndarray, horizon: int):
       - fall back to the full-history mean *rate* when the trailing window is empty
         (rescues ~6,100 intermittent SKUs whose demand fell outside the last 3 months
         from being forecast at 0 — critical so replenishment doesn't blind-spot them).
-    Forecast is flat over the horizon (no evidence of trend); the 95% band widens with
-    the square root of the horizon (uncertainty grows with lead). Returns (fc,lo,hi,std)."""
+    Forecast is flat over the horizon (no evidence of trend). The interval is
+    MULTIPLICATIVE, not symmetric: demand is non-negative and right-skewed, so a
+    symmetric ±z·σ band produces negative lower bounds that clip to 0. Instead we
+    scale by each SKU's coefficient of variation (σ/level) — tight for steady items,
+    wide for volatile ones — so the lower bound stays a positive fraction of the
+    forecast unless the item is genuinely near-zero. Widens only mildly across the
+    horizon. Returns (fc, lo, hi, resid_std)."""
     n = M.shape[1]
     w = min(MA_WINDOW, n)
     level = M[:, -w:].mean(axis=1)
@@ -69,12 +74,13 @@ def _forecast(M: np.ndarray, horizon: int):
     base = np.where(level > 0, level, rate)
 
     fc = np.repeat(base[:, None], horizon, axis=1)
-    resid = M - base[:, None]
-    resid_std = resid.std(axis=1, ddof=0)
+    resid_std = (M - base[:, None]).std(axis=1, ddof=0)
+    cv = np.divide(resid_std, base, out=np.zeros_like(base), where=base > 0)  # coefficient of variation
+    cv = np.clip(cv, 0.0, 1.5)
     step = np.arange(1, horizon + 1, dtype=float)
-    band = Z * resid_std[:, None] * np.sqrt(step)[None, :]
-    lo = np.clip(fc - band, 0, None)
-    hi = fc + band
+    r = (Z * cv)[:, None] * (1.0 + 0.15 * (step - 1))[None, :]         # mild horizon widening
+    lo = fc / (1.0 + r)                                                # >0 whenever fc>0
+    hi = fc * (1.0 + r)
     return fc, lo, hi, resid_std
 
 
