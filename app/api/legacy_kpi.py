@@ -1021,6 +1021,67 @@ def demand_insights(Plant: str = Query(None)):
             "top_items": top_items, "by_category": by_category}
 
 
+@router.get("/forecast/cashflow-insights")
+def cashflow_insights(Plant: str = Query(None)):
+    """Rich procurement-budget (cash-flow) insights for the bespoke Cash-Flow page:
+    monthly spend timeline (actual consumption cost -> forecast budget), headline
+    rupee totals, biggest spend items and a per-category budget breakdown. Values
+    are the forecast consumption cost (amount_lc) = the cash needed to restock."""
+    pl = _plant(Plant)
+    fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
+    accd = {str(r["metric"]): float(r["value"]) for _, r in da.load("forecast_accuracy").iterrows()}
+    dm = da.load("dim_material")[["material", "material_desc", "material_group"]].copy()
+    dm["material"] = dm["material"].astype(str)
+    desc_of = dict(zip(dm["material"], dm["material_desc"].astype(str)))
+    grp_of = dict(zip(dm["material"], dm["material_group"].astype(str)))
+
+    fs["material_id"] = fs["material_id"].astype(str)
+    fs["pd"] = pd.to_datetime(fs["posting_date"], errors="coerce")
+
+    g = (fs.groupby("pd").agg(actual=("sales_value", "sum"), fc=("cashflow_forecast", "sum"),
+                              lo=("lower_bound_cashflow_forecast", "sum"),
+                              hi=("upper_bound_cashflow_forecast", "sum")).reset_index().sort_values("pd"))
+    timeline, cum = [], 0.0
+    for _, r in g.iterrows():
+        isf = float(r["fc"]) > 0
+        if isf:
+            cum += float(r["fc"])
+        timeline.append({"label": r["pd"].strftime("%b"), "month": r["pd"].strftime("%b %Y"),
+                         "actual": float(r["actual"]) if float(r["actual"]) > 0 else None,
+                         "forecast": float(r["fc"]) if isf else None,
+                         "lower": float(r["lo"]) if isf else None, "upper": float(r["hi"]) if isf else None,
+                         "cumulative": cum if isf else None, "is_forecast": bool(isf)})
+    fcr = [t for t in timeline if t["is_forecast"]]
+
+    ff = fs[fs["cashflow_forecast"].notna() & (fs["cashflow_forecast"] > 0)].copy()
+    last_actual = (fs[fs["sales_value"].notna()].sort_values("pd")
+                     .groupby("material_id")["sales_value"].last().to_dict())
+    itm = ff.groupby("material_id").agg(fc=("cashflow_forecast", "sum"),
+                                        lo=("lower_bound_cashflow_forecast", "sum"),
+                                        hi=("upper_bound_cashflow_forecast", "sum"),
+                                        next_mo=("cashflow_forecast", "first")).reset_index()
+    top = itm.nlargest(12, "fc")
+    top_items = [{"material": r["material_id"], "desc": desc_of.get(r["material_id"], r["material_id"]),
+                  "group": _clean_group(grp_of.get(r["material_id"], "")), "forecast": float(r["fc"]),
+                  "next_mo": float(r["next_mo"]), "lower": float(r["lo"]), "upper": float(r["hi"]),
+                  "last_actual": float(last_actual.get(r["material_id"], 0.0))} for _, r in top.iterrows()]
+
+    ff["grp"] = ff["material_id"].map(grp_of).fillna("")
+    cat = ff[ff["grp"].astype(str).str.len() > 0].groupby("grp")["cashflow_forecast"].sum().reset_index()
+    cat = cat.sort_values("cashflow_forecast", ascending=False).head(10)
+    by_category = [{"group": _clean_group(r["grp"]), "forecast": float(r["cashflow_forecast"])} for _, r in cat.iterrows()]
+
+    total_h = float(ff["cashflow_forecast"].sum())
+    return {"timeline": timeline,
+            "totals": {"next_budget": fcr[0]["forecast"] if fcr else 0.0,
+                       "next_lower": fcr[0]["lower"] if fcr else 0.0, "next_upper": fcr[0]["upper"] if fcr else 0.0,
+                       "total_horizon": total_h, "avg_month": (total_h / len(fcr)) if fcr else 0.0,
+                       "accuracy": accd.get("Aggregate Forecast Accuracy %", 0.0),
+                       "weighted_acc": accd.get("Weighted Forecast Accuracy %", 0.0),
+                       "materials": int(ff["material_id"].nunique()), "horizon": len(fcr)},
+            "top_items": top_items, "by_category": by_category}
+
+
 # ---------------- helpers ----------------
 def _num(v):
     try:
