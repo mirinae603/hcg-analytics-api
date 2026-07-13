@@ -1166,6 +1166,35 @@ def replenishment_insights(Plant: str = Query(None)):
             "order_now": order_now, "aging": aging, "ladder": ladder}
 
 
+@router.get("/forecast/risk-items")
+def risk_items(Plant: str = Query(None), status: str = Query(None), aging: str = Query(None),
+               kind: str = Query(None), limit: int = Query(200)):
+    """Full item list behind any reorder/aging cut — powers the drill-downs the
+    client asked for (click a status / bucket / 'see all' → the actual items)."""
+    rp = _replen_frame(_plant(Plant))
+    if status:
+        sub = rp[rp["status"] == status]
+    elif aging:
+        sub = rp[rp["aging_risk"] == aging]
+    elif kind == "order_now":
+        sub = rp[rp["replenishment_quantity"] > 0]
+    elif kind == "aging":
+        sub = rp[(rp["aging_days"] > 180) & (rp["closing_stock_value"] > 0)]
+    else:
+        sub = rp
+    reorder_sorted = bool(kind == "order_now" or status in ("Stock-out", "Reorder now"))
+    sortcol = "reorder_value" if reorder_sorted else "closing_stock_value"
+    total = int(len(sub))
+    sub = sub.sort_values(sortcol, ascending=False).head(int(limit))
+    items = [{"material": str(r["material_id"]), "desc": str(r.get("material_desc", "")),
+              "group": _clean_group(r.get("material_group", "")), "status": str(r["status"]),
+              "stock": float(r["closing_stock"]), "stock_value": float(r["closing_stock_value"]),
+              "demand_monthly": float(r["demand_monthly"]), "cover": float(r["cover"]),
+              "reorder_qty": float(r["replenishment_quantity"]), "reorder_value": float(r["reorder_value"]),
+              "aging_days": int(r["aging_days"])} for _, r in sub.iterrows()]
+    return {"count": total, "returned": len(items), "items": items}
+
+
 @router.get("/forecast/item-risk")
 def item_risk(Plant: str = Query(None), Material: str = Query(...)):
     """Single-SKU reorder & aging status for the 'check any item' panel."""
