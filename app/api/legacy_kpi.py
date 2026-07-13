@@ -9,10 +9,15 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 from typing import Optional
+import os
 import numpy as np
 import pandas as pd
 
 from app.core import data_access as da
+
+_KPI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "kpi")
+_MN = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+       "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
 
 router = APIRouter()
 
@@ -1176,6 +1181,81 @@ def item_risk(Plant: str = Query(None), Material: str = Query(...)):
             "cover": float(r["cover"]), "safe_stock": float(r["safe_stock"]),
             "reorder_qty": float(r["replenishment_quantity"]), "reorder_value": float(r["reorder_value"]),
             "aging_days": int(r["aging_days"]), "bucket": str(r["aging_risk"]), "unit_cost": float(r["unit_cost"])}
+
+
+@router.get("/revenue/insights")
+def revenue_insights():
+    """Real revenue & margin from IP + OP billing (fact_sales aggregates).
+    Revenue = billed MRP, Margin = MRP − cost (actual, not proxy). Splits by
+    patient (IP/OP), hospital, manufacturer, category and top items."""
+    def _p(name):
+        fp = os.path.join(_KPI_DIR, name + ".parquet")
+        return pd.read_parquet(fp) if os.path.exists(fp) else None
+    tot = _p("sales_totals")
+    if tot is None or not len(tot):
+        return {"ready": False}
+    mon = _p("sales_monthly"); hos = _p("sales_by_hospital")
+    mfr = _p("sales_by_manufacturer"); matx = _p("sales_by_material")
+
+    def rc(df):
+        return (float(df["revenue"].sum()), float(df["cost"].sum()), float(df["qty"].sum()), int(df["lines"].sum()))
+    ipr, ipc, ipq, ipl = rc(tot[tot.patient == "IP"]) if (tot.patient == "IP").any() else (0, 0, 0, 0)
+    opr, opc, opq, opl = rc(tot[tot.patient == "OP"]) if (tot.patient == "OP").any() else (0, 0, 0, 0)
+    rev, cost = ipr + opr, ipc + opc
+    margin = rev - cost
+
+    timeline = []
+    if mon is not None and len(mon):
+        mon["month"] = mon["month"].astype(str)
+        for mm in sorted(mon["month"].unique()):
+            sub = mon[mon.month == mm]
+            ipx, opx = sub[sub.patient == "IP"], sub[sub.patient == "OP"]
+            ir, ic = float(ipx.revenue.sum()), float(ipx.cost.sum())
+            orr, oc = float(opx.revenue.sum()), float(opx.cost.sum())
+            timeline.append({"month": mm, "label": _MN.get(mm[5:7], mm), "ip_revenue": ir, "op_revenue": orr,
+                             "revenue": ir + orr, "ip_margin": ir - ic, "op_margin": orr - oc, "margin": (ir + orr) - (ic + oc)})
+
+    def top(df, n, namecol):
+        if df is None or not len(df):
+            return []
+        d = df.copy(); d["margin"] = d["revenue"] - d["cost"]
+        d = d.sort_values("revenue", ascending=False).head(n)
+        return [{namecol: str(r[namecol]), "revenue": float(r.revenue), "margin": float(r.margin),
+                 "qty": float(r.qty), "margin_pct": (float(r.margin) / float(r.revenue) * 100 if r.revenue else 0.0)}
+                for _, r in d.iterrows()]
+    by_hospital = top(hos, 8, "hospital")
+    by_manufacturer = top(mfr, 10, "manufacturer")
+
+    top_items, by_category = [], []
+    if matx is not None and len(matx):
+        mm = matx.copy(); mm["margin"] = mm["revenue"] - mm["cost"]
+        for _, r in mm.sort_values("revenue", ascending=False).head(12).iterrows():
+            top_items.append({"material": str(r.material), "desc": str(r.desc), "group": _clean_group(r.group),
+                              "revenue": float(r.revenue), "margin": float(r.margin), "qty": float(r.qty),
+                              "margin_pct": (float(r.margin) / float(r.revenue) * 100 if r.revenue else 0.0)})
+        mm["g"] = mm["group"].apply(_clean_group)
+        cat = mm.groupby("g").agg(revenue=("revenue", "sum"), cost=("cost", "sum")).reset_index()
+        cat["margin"] = cat.revenue - cat.cost
+        for _, r in cat.sort_values("revenue", ascending=False).head(8).iterrows():
+            by_category.append({"group": r.g, "revenue": float(r.revenue), "margin": float(r.margin),
+                                "margin_pct": (float(r.margin) / float(r.revenue) * 100 if r.revenue else 0.0)})
+
+    try:
+        internal = float(da.load("fact_consumption")["amount_lc"].sum())
+    except Exception:
+        internal = 0.0
+
+    return {"ready": True,
+            "totals": {"revenue": rev, "cost": cost, "margin": margin, "margin_pct": (margin / rev * 100 if rev else 0.0),
+                       "ip_revenue": ipr, "op_revenue": opr, "ip_margin": ipr - ipc, "op_margin": opr - opc,
+                       "ip_share": (ipr / rev * 100 if rev else 0.0), "op_share": (opr / rev * 100 if rev else 0.0),
+                       "qty": ipq + opq, "lines": ipl + opl,
+                       "materials": int(matx.material.nunique()) if matx is not None else 0,
+                       "manufacturers": int(len(mfr)) if mfr is not None else 0,
+                       "hospitals": int(len(hos)) if hos is not None else 0,
+                       "internal_cost": internal, "months": len(timeline)},
+            "timeline": timeline, "by_hospital": by_hospital, "by_manufacturer": by_manufacturer,
+            "top_items": top_items, "by_category": by_category}
 
 
 # ---------------- helpers ----------------
