@@ -416,6 +416,37 @@ def risk_insights(Plant: str = Query(None)):
             "tiers": tiers, "arows": arows, "ecols": ecols, "matrix": matrix, "factors": factors, "categories": cats}
 
 
+# ---------------- NEAR-EXPIRY — full expiry ladder (client #3: 5-slab breakup) ----------------
+# The kpi_near_expiry parquet is horizon-limited to <=180 days, so the client's
+# 181-365 / 365+ slabs are computed straight off fact_inventory vs the snapshot date.
+_EXP_SLAB_ORDER = ["Expired", "0-30d", "31-90d", "91-180d", "181-365d", "365d+"]
+
+
+def _inv_expiry(pl):
+    """fact_inventory (plant-filtered, positive qty, known expiry) + days-to-expiry & slab."""
+    df = da.filter_plant(da.load("fact_inventory"), pl).copy()
+    df = df.dropna(subset=["expiry_date"])
+    df = df[df["qty"] > 0]
+    snap = pd.to_datetime(df["snapshot_date"], errors="coerce").max()
+    if pd.isna(snap):
+        snap = pd.Timestamp("2026-05-31")
+    df["dte"] = (pd.to_datetime(df["expiry_date"], errors="coerce") - snap).dt.days
+    df = df.dropna(subset=["dte"])
+    bins = [-10**12, -1, 30, 90, 180, 365, 10**12]
+    df["slab"] = pd.cut(df["dte"], bins=bins, labels=_EXP_SLAB_ORDER, right=True)
+    return df, snap
+
+
+def _expiry_ladder(df):
+    out = []
+    for s in _EXP_SLAB_ORDER:
+        sub = df[df["slab"] == s]
+        out.append({"slab": s, "lines": int(len(sub)), "items": int(sub["material"].nunique()) if len(sub) else 0,
+                    "qty": float(sub["qty"].sum()), "value": float(sub["total_cost"].sum()),
+                    "mrp": float(sub["total_mrp"].sum())})
+    return out
+
+
 # ---------------- NEAR-EXPIRY — expiry timeline (E1) ----------------
 @router.get("/kpi/near-expiry/insights")
 def nearexp_insights(Plant: str = Query(None)):
@@ -432,11 +463,42 @@ def nearexp_insights(Plant: str = Query(None)):
     timeline = [{"label": p.strftime("%b %y"), "value": float(v), "count": int(c)} for p, v, c in zip(tl["period"], tl["value"], tl["count"])][:10]
     cat = df.groupby("material_group", observed=True).agg(value=("total_cost", "sum"), skus=("material", "nunique")).reset_index().sort_values("value", ascending=False).head(10)
     cats = [{"name": r["material_group"], "value": float(r["value"]), "skus": int(r["skus"])} for _, r in cat.iterrows()]
+    # Full expiry ladder (all 6 slabs incl. 181-365 / 365+) from fact_inventory.
+    try:
+        invdf, snap = _inv_expiry(_plant(Plant))
+        ladder = _expiry_ladder(invdf)
+        ladder_asof = snap.strftime("%d %b %Y") if snap is not None else None
+    except Exception:
+        ladder, ladder_asof = [], None
     return {"totals": {"exposure": float(df["total_cost"].sum()), "skus": int(len(df)),
                        "expired_value": float(df.loc[df["expiry_bucket"] == "Expired", "total_cost"].sum()),
                        "urgent_value": float(df.loc[df["expiry_bucket"] == "0-30d", "total_cost"].sum()),
                        "mrp_exposure": float(df["total_mrp"].sum())},
-            "buckets": buckets, "timeline": timeline, "categories": cats}
+            "buckets": buckets, "timeline": timeline, "categories": cats,
+            "ladder": ladder, "ladder_asof": ladder_asof}
+
+
+@router.get("/kpi/near-expiry/items")
+def nearexp_items(slab: str = Query(None), Plant: str = Query(None),
+                  q: str = Query(None), limit: int = Query(500)):
+    """Drill: item lines for an expiry slab (client #3 — clickable slab → item list)."""
+    invdf, snap = _inv_expiry(_plant(Plant))
+    if slab:
+        invdf = invdf[invdf["slab"].astype(str) == slab]
+    if q:
+        ql = str(q).strip().lower()
+        invdf = invdf[invdf["material_desc"].astype(str).str.lower().str.contains(ql, na=False)
+                      | invdf["material"].astype(str).str.lower().str.contains(ql, na=False)]
+    total = int(len(invdf))
+    invdf = invdf.sort_values("total_cost", ascending=False).head(int(limit))
+    items = [{"material": r["material"], "desc": r["material_desc"],
+              "batch": (None if pd.isna(r.get("batch")) else str(r.get("batch"))),
+              "plant": r["plant"], "qty": float(r["qty"]), "value": float(r["total_cost"]),
+              "mrp": float(r["total_mrp"]), "days": int(r["dte"]),
+              "expiry": (pd.to_datetime(r["expiry_date"]).strftime("%d %b %Y") if pd.notna(r["expiry_date"]) else None),
+              "slab": str(r["slab"])} for _, r in invdf.iterrows()]
+    return {"slab": slab, "count": total, "returned": len(items), "items": items,
+            "asof": (snap.strftime("%d %b %Y") if snap is not None else None)}
 
 
 # ---------------- INVENTORY AGING (KPI_5 / Chart_KPI_5) ----------------
