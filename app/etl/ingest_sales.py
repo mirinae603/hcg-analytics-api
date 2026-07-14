@@ -157,6 +157,8 @@ def run():
     hosp = defaultdict(lambda: defaultdict(float))
     mfr = defaultdict(lambda: defaultdict(float))
     mat = defaultdict(lambda: defaultdict(float))
+    mfr_mat = defaultdict(lambda: defaultdict(float))   # (manufacturer, material) → for mfr drill
+    hosp_mat = defaultdict(lambda: defaultdict(float))  # (hospital, material) → for hospital drill
     matdesc = {}
 
     def files(sub):
@@ -179,14 +181,20 @@ def run():
             if not code or code.lower() == "none":
                 continue
             ymk = f"{ym[0]:04d}-{ym[1]:02d}"
+            hk = hosp_of(g("inv"), g("loc"))
             for bucket, key in ((tot, patient), (month, (patient, ymk)),
-                                (hosp, hosp_of(g("inv"), g("loc"))), (mat, code)):
+                                (hosp, hk), (mat, code)):
                 bucket[key]["revenue"] += rev; bucket[key]["cost"] += cost
                 bucket[key]["qty"] += qty; bucket[key]["lines"] += 1
+            hm = hosp_mat[(hk, code)]
+            hm["revenue"] += rev; hm["cost"] += cost; hm["qty"] += qty; hm["lines"] += 1
             m = g("mfr")
             if m and str(m).strip().lower() not in ("none", "nan", ""):
-                mm = mfr[str(m).strip().title()]
+                mt = str(m).strip().title()
+                mm = mfr[mt]
                 mm["revenue"] += rev; mm["cost"] += cost; mm["qty"] += qty; mm["lines"] += 1
+                mmx = mfr_mat[(mt, code)]
+                mmx["revenue"] += rev; mmx["cost"] += cost; mmx["qty"] += qty; mmx["lines"] += 1
             matdesc.setdefault(code, str(g("desc")) if g("desc") else code)
             kept += 1
         print(f"[sales] {patient:2s} {os.path.basename(path)[:38]:38s} seen={seen:>8,} kept={kept:>8,}", flush=True)
@@ -211,6 +219,9 @@ def run():
     pd.DataFrame([{"hospital": k, **v} for k, v in hosp.items()]).to_parquet(os.path.join(KPI, "sales_by_hospital.parquet"), index=False)
     pd.DataFrame([{"manufacturer": k, **v} for k, v in mfr.items()]).to_parquet(os.path.join(KPI, "sales_by_manufacturer.parquet"), index=False)
     pd.DataFrame([{"material": k, "desc": matdesc.get(k, k), "group": grp.get(k, ""), **v} for k, v in mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material.parquet"), index=False)
+    pd.DataFrame([{"manufacturer": k[0], "material": k[1], "desc": matdesc.get(k[1], k[1]), "group": grp.get(k[1], ""), **v} for k, v in mfr_mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material_mfr.parquet"), index=False)
+    pd.DataFrame([{"hospital": k[0], "material": k[1], "desc": matdesc.get(k[1], k[1]), "group": grp.get(k[1], ""), **v} for k, v in hosp_mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material_hospital.parquet"), index=False)
+    print(f"[sales] wrote mfr_mat={len(mfr_mat):,} hosp_mat={len(hosp_mat):,} pairs", flush=True)
 
     grand = sum(v["revenue"] for v in tot.values())
     gcost = sum(v["cost"] for v in tot.values())

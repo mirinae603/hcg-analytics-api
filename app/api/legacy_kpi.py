@@ -841,10 +841,37 @@ def monthly_purchase_insights(Plant: str = Query(None)):
         vals = [float(sub.get(m, 0)) for m in order]
         mrows.append({"name": str(g), "values": vals, "total": float(sum(vals))})
     matrix = {"labels": [m[:3] for m in order], "months": order, "rows": mrows, "col_totals": total_series}
+    # Category × month MARGIN matrix (MRP-proxy) aligned to the SAME rows/months, so the
+    # heatmap can toggle Spend ↔ Margin %. GRN's own taxonomy differs from material_group,
+    # so map via material → material_group. Margin % = (MRP − net price) on matched rows.
+    margin_matrix = None
+    try:
+        g = da.filter_plant(da.load("fact_grn"), _plant(Plant)).copy()
+        mat2grp = dict(zip(mp["material"].astype(str), mp["material_group"].astype(str)))
+        g2 = g[(g["unit_mrp"] > 0) & (g["net_price"] > 0) & (g["gr_qty"] > 0)].copy()
+        if not g2.empty:
+            g2["grp"] = g2["material"].astype(str).map(mat2grp)
+            g2["mrp_val"] = g2["gr_qty"] * g2["unit_mrp"]
+            g2["cost_val"] = g2["gr_qty"] * g2["net_price"]
+            piv_mrp = g2.groupby(["grp", "month"], observed=True)["mrp_val"].sum()
+            piv_cost = g2.groupby(["grp", "month"], observed=True)["cost_val"].sum()
+            mgn_rows = []
+            for grp in list(tg.head(8).index):
+                gk = str(grp); vals = []
+                tmv = tcv = 0.0
+                for m in order:
+                    mv = float(piv_mrp.get((gk, m), 0.0)); cv = float(piv_cost.get((gk, m), 0.0))
+                    tmv += mv; tcv += cv
+                    vals.append(round((mv - cv) / mv * 100, 1) if mv > 0 else None)
+                mgn_rows.append({"name": gk, "values": vals,
+                                 "total": (round((tmv - tcv) / tmv * 100, 1) if tmv > 0 else None)})
+            margin_matrix = {"labels": [m[:3] for m in order], "months": order, "rows": mgn_rows}
+    except Exception:
+        margin_matrix = None
     return {"totals": {"total": total, "avg": total / max(len(order), 1),
                        "top_group": str(top_groups[0]) if top_groups else "-", "skus": int(mp["material"].nunique())},
             "timeline": {"labels": [m[:3] for m in order], "total": total_series, "series": series},
-            "matrix": matrix, "top_skus": top_skus, "groups": groups}
+            "matrix": matrix, "margin_matrix": margin_matrix, "top_skus": top_skus, "groups": groups}
 
 
 # ---------------- MONTHLY PURCHASE VALUE (KPI_6) ----------------
@@ -1291,16 +1318,28 @@ def replenishment_insights(Plant: str = Query(None)):
 
 
 @router.get("/revenue/items")
-def revenue_items(group: str = Query(None), sort: str = Query("revenue"), limit: int = Query(400)):
+def revenue_items(group: str = Query(None), manufacturer: str = Query(None), hospital: str = Query(None),
+                  sort: str = Query("revenue"), limit: int = Query(400)):
     """Full billed-item list (with true margin) for the Revenue & Margin drill-down —
-    optionally filtered to one category. Uses the existing sales_by_material aggregate."""
-    fp = os.path.join(_KPI_DIR, "sales_by_material.parquet")
-    if not os.path.exists(fp):
+    filterable by category, or by manufacturer / hospital (material×dimension cross-tabs)."""
+    if manufacturer:
+        fp = os.path.join(_KPI_DIR, "sales_by_material_mfr.parquet")
+        m = pd.read_parquet(fp).copy() if os.path.exists(fp) else pd.DataFrame()
+        if len(m):
+            m = m[m["manufacturer"].astype(str) == str(manufacturer)].copy()
+    elif hospital:
+        fp = os.path.join(_KPI_DIR, "sales_by_material_hospital.parquet")
+        m = pd.read_parquet(fp).copy() if os.path.exists(fp) else pd.DataFrame()
+        if len(m):
+            m = m[m["hospital"].astype(str) == str(hospital)].copy()
+    else:
+        fp = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+        m = pd.read_parquet(fp).copy() if os.path.exists(fp) else pd.DataFrame()
+    if not len(m):
         return {"count": 0, "returned": 0, "items": []}
-    m = pd.read_parquet(fp).copy()
     m["margin"] = m["revenue"] - m["cost"]
     m["g"] = m["group"].apply(_clean_group)
-    if group:
+    if group and not manufacturer and not hospital:
         m = m[m["g"] == group]
     m["margin_pct"] = np.where(m["revenue"] > 0, m["margin"] / m["revenue"] * 100, 0.0)
     sortcol = sort if sort in ("revenue", "margin", "margin_pct", "qty") else "revenue"
