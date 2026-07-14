@@ -507,6 +507,19 @@ def procurement_overview(Plant: str = Query(None)):
     locations = [{"plant": str(r["plant"]), "value": float(r["purchase_value"]), "vendors": int(r["vendor_count"]), "lines": int(r["po_lines"])} for _, r in lg.head(8).iterrows()]
     n_plants = int(loc["plant"].nunique())
 
+    # MRP-based procurement margin proxy (client #12: "add Margin % to the card").
+    # Only rows where BOTH MRP and cost are recorded (unit_mrp is sparse in GRN, so
+    # summing over all rows would count cost without its matching MRP → false negative).
+    try:
+        grn = da.filter_plant(da.load("fact_grn"), pl)
+        g2 = grn[(grn["unit_mrp"] > 0) & (grn["net_price"] > 0) & (grn["gr_qty"] > 0)]
+        mrp_val = float((g2["gr_qty"] * g2["unit_mrp"]).sum())
+        cost_val = float((g2["gr_qty"] * g2["net_price"]).sum())
+    except Exception:
+        mrp_val = cost_val = 0.0
+    margin_val = mrp_val - cost_val
+    margin_pct = (margin_val / mrp_val * 100) if mrp_val else 0.0
+
     cards = {
         "purchase-value": {"value": spend, "kind": "inr", "sub": "6-mo PO spend"},
         "monthly-purchase-value": {"value": spend / max(len(timeline), 1), "kind": "inr", "sub": "avg / month"},
@@ -521,7 +534,8 @@ def procurement_overview(Plant: str = Query(None)):
     return {
         "totals": {"spend": spend, "vendors": n_vendors, "po_lines": po_lines, "avg_po_gr": avg_po_gr,
                    "avg_pr_gr": avg_pr_gr, "median_lead": med_lead, "completion": completion,
-                   "top5_share": top5_share, "n_plants": n_plants},
+                   "top5_share": top5_share, "n_plants": n_plants,
+                   "margin_pct": margin_pct, "margin_value": margin_val, "mrp_value": mrp_val},
         "timeline": timeline, "categories": categories, "vendors": top_vendors, "locations": locations, "cards": cards,
     }
 
