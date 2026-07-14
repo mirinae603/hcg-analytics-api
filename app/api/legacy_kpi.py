@@ -531,12 +531,25 @@ def procurement_overview(Plant: str = Query(None)):
         "fill-rate": {"value": completion, "kind": "pct", "sub": "order completion"},
     }
 
+    # Open POs — undelivered order value by category (client #12: category + number + value).
+    try:
+        po = da.filter_plant(da.load("fact_po"), pl)
+        op = po[po["open_qty"] > 0].copy()
+        op["open_value"] = op["open_qty"] * op["net_price"]
+        op["g"] = op["major_group"].apply(_clean_group)
+        opby = op.groupby("g").agg(po_count=("po_no", "nunique"), open_value=("open_value", "sum")).reset_index().sort_values("open_value", ascending=False)
+        open_po = {"total_value": float(op["open_value"].sum()), "total_pos": int(op["po_no"].nunique()), "total_lines": int(len(op)),
+                   "categories": [{"category": r["g"], "pos": int(r["po_count"]), "value": float(r["open_value"])} for _, r in opby.head(7).iterrows()]}
+    except Exception:
+        open_po = {"total_value": 0.0, "total_pos": 0, "total_lines": 0, "categories": []}
+
     return {
         "totals": {"spend": spend, "vendors": n_vendors, "po_lines": po_lines, "avg_po_gr": avg_po_gr,
                    "avg_pr_gr": avg_pr_gr, "median_lead": med_lead, "completion": completion,
                    "top5_share": top5_share, "n_plants": n_plants,
                    "margin_pct": margin_pct, "margin_value": margin_val, "mrp_value": mrp_val},
         "timeline": timeline, "categories": categories, "vendors": top_vendors, "locations": locations, "cards": cards,
+        "open_po": open_po,
     }
 
 
