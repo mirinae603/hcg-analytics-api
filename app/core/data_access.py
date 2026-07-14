@@ -130,7 +130,8 @@ def summarize(table: str, plant=None, material=None, material_group=None) -> dic
     for c in df.columns:
         if df[c].dtype.kind in "fiu":
             s = pd.to_numeric(df[c], errors="coerce")
-            out[c] = {"sum": float(s.sum()), "mean": float(s.mean()) if len(s) else 0.0}
+            out[c] = {"sum": float(s.sum()), "mean": float(s.mean()) if len(s) else 0.0,
+                      "median": float(s.median()) if len(s) else 0.0}
         else:
             out[c] = {"distinct": int(df[c].nunique())}
     return out
