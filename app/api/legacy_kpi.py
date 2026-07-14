@@ -615,6 +615,41 @@ def procurement_overview(Plant: str = Query(None)):
     }
 
 
+# ---------------- PROCUREMENT SAVING OPPORTUNITY (client #12: item-wise loss/saving) ----------------
+@router.get("/portfolio/procurement/savings")
+def procurement_savings(Plant: str = Query(None), limit: int = Query(12)):
+    """Price-consolidation headroom: for each material bought >=4 times at a
+    consistent unit (max/min <= 2.5x, so we don't compare mixed pack sizes), sum the
+    spend ABOVE that item's own median achieved price. Conservative negotiation
+    headroom — an honest 'you paid above your own median' figure, not a guaranteed saving."""
+    empty = {"totals": {"opportunity": 0.0, "items_flagged": 0, "spend_base": 0.0}, "items": []}
+    try:
+        g = da.filter_plant(da.load("fact_grn"), _plant(Plant))
+        d = g[(g["net_price"] > 0) & (g["gr_qty"] > 0)][["material", "material_desc", "net_price", "gr_qty", "major_group"]].copy()
+        if d.empty:
+            return empty
+        st = d.groupby("material")["net_price"].agg(["min", "max", "median", "size"])
+        st = st[st["size"] >= 4]
+        st = st[(st["max"] / st["min"].replace(0, np.nan)) <= 2.5].dropna(subset=["max"])
+        if st.empty:
+            return empty
+        d2 = d[d["material"].isin(st.index)].merge(st[["median"]], left_on="material", right_index=True)
+        d2["over"] = (d2["net_price"] - d2["median"]).clip(lower=0) * d2["gr_qty"]
+        opp = d2.groupby(["material", "material_desc"]).agg(
+            over=("over", "sum"), lines=("net_price", "size"), med=("median", "first"),
+            pmax=("net_price", "max"), qty=("gr_qty", "sum"), group=("major_group", "first")).reset_index()
+        opp = opp[opp["over"] > 0].sort_values("over", ascending=False)
+        items = [{"material": r["material"], "desc": r["material_desc"], "group": _clean_group(r["group"]),
+                  "median": float(r["med"]), "max": float(r["pmax"]), "lines": int(r["lines"]),
+                  "qty": float(r["qty"]), "over": float(r["over"]),
+                  "spread_pct": (float((r["pmax"] - r["med"]) / r["med"] * 100) if r["med"] else 0.0)}
+                 for _, r in opp.head(int(limit)).iterrows()]
+        return {"totals": {"opportunity": float(opp["over"].sum()), "items_flagged": int(len(opp)),
+                           "spend_base": float((d2["net_price"] * d2["gr_qty"]).sum())}, "items": items}
+    except Exception:
+        return empty
+
+
 # ---------------- PURCHASE VALUE insights (B1) ----------------
 @router.get("/kpi/purchase-value/insights")
 def purchase_value_insights(Plant: str = Query(None)):
