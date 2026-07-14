@@ -1166,6 +1166,28 @@ def replenishment_insights(Plant: str = Query(None)):
             "order_now": order_now, "aging": aging, "ladder": ladder}
 
 
+@router.get("/revenue/items")
+def revenue_items(group: str = Query(None), sort: str = Query("revenue"), limit: int = Query(400)):
+    """Full billed-item list (with true margin) for the Revenue & Margin drill-down —
+    optionally filtered to one category. Uses the existing sales_by_material aggregate."""
+    fp = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+    if not os.path.exists(fp):
+        return {"count": 0, "returned": 0, "items": []}
+    m = pd.read_parquet(fp).copy()
+    m["margin"] = m["revenue"] - m["cost"]
+    m["g"] = m["group"].apply(_clean_group)
+    if group:
+        m = m[m["g"] == group]
+    m["margin_pct"] = np.where(m["revenue"] > 0, m["margin"] / m["revenue"] * 100, 0.0)
+    sortcol = sort if sort in ("revenue", "margin", "margin_pct", "qty") else "revenue"
+    total = int(len(m))
+    m = m.sort_values(sortcol, ascending=False).head(int(limit))
+    items = [{"material": str(r["material"]), "desc": str(r["desc"]), "group": r["g"],
+              "revenue": float(r["revenue"]), "margin": float(r["margin"]),
+              "margin_pct": float(r["margin_pct"]), "qty": float(r["qty"])} for _, r in m.iterrows()]
+    return {"count": total, "returned": len(items), "items": items}
+
+
 @router.get("/forecast/risk-items")
 def risk_items(Plant: str = Query(None), status: str = Query(None), aging: str = Query(None),
                kind: str = Query(None), limit: int = Query(200)):
