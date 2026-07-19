@@ -6,7 +6,9 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.ai import orchestrator
+from fastapi import Query
+
+from app.ai import orchestrator, warehouse
 
 router = APIRouter()
 
@@ -19,6 +21,15 @@ class ChatReq(BaseModel):
 @router.get("/ai/status")
 def ai_status():
     return {"configured": orchestrator.has_key(), "model": orchestrator.AZURE_DEPLOYMENT}
+
+
+@router.get("/ai/mentions")
+def ai_mentions(q: str = Query(""), limit: int = Query(12)):
+    """Live entity search for the @-picker (items, vendors, manufacturers, categories, hospitals)."""
+    try:
+        return {"items": warehouse.mentions(q, limit)}
+    except Exception:
+        return {"items": []}
 
 
 @router.post("/ai/chat")

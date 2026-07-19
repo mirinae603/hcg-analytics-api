@@ -119,6 +119,59 @@ def run_sql(sql: str, row_cap: int = 500, timeout_s: float = 20.0) -> dict:
     return {"columns": colnames, "rows": rows, "row_count": len(rows), "truncated": truncated, "sql": s}
 
 
+def _clean_group(g) -> str:
+    g = str(g).strip()
+    if not g or g.lower() in ("nan", "none"):
+        return "Uncategorised"
+    g = g.split("-", 1)[-1] if "-" in g else g
+    return g.strip().title() or "Uncategorised"
+
+
+def mentions(q: str, limit: int = 12) -> list[dict]:
+    """Live entity search for the @-picker — items, vendors, manufacturers,
+    categories, hospitals. Injection-safe (parameterised), read-only."""
+    q = (q or "").strip()
+    if not q:
+        return []
+    c = con()
+    specs = [
+        ("item", "SELECT DISTINCT material_desc FROM dim_material WHERE material_desc IS NOT NULL AND material_desc ILIKE '%' || ? || '%' ORDER BY length(material_desc), material_desc LIMIT 7", False),
+        ("vendor", "SELECT DISTINCT vendor_name FROM dim_vendor WHERE vendor_name IS NOT NULL AND vendor_name ILIKE '%' || ? || '%' ORDER BY length(vendor_name), vendor_name LIMIT 5", False),
+        ("manufacturer", "SELECT DISTINCT manufacturer_desc FROM dim_material WHERE manufacturer_desc IS NOT NULL AND manufacturer_desc != '' AND manufacturer_desc ILIKE '%' || ? || '%' ORDER BY length(manufacturer_desc) LIMIT 5", False),
+        ("category", "SELECT DISTINCT material_group FROM dim_material WHERE material_group IS NOT NULL AND material_group ILIKE '%' || ? || '%' ORDER BY length(material_group) LIMIT 5", True),
+        ("hospital", "SELECT DISTINCT hospital FROM sales_by_hospital WHERE hospital IS NOT NULL AND hospital ILIKE '%' || ? || '%' LIMIT 3", False),
+    ]
+    per_type: dict[str, list] = {}
+    seen = set()
+    with _lock:
+        for typ, sql, is_cat in specs:
+            try:
+                rows = c.execute(sql, [q]).fetchall()
+            except Exception:
+                rows = []
+            bucket = []
+            for (label,) in rows:
+                if label is None:
+                    continue
+                disp = _clean_group(label) if is_cat else str(label)
+                key = (typ, disp.lower())
+                if disp and key not in seen:
+                    seen.add(key)
+                    bucket.append({"type": typ, "label": disp})
+            per_type[typ] = bucket
+    # interleave (round-robin) so every category is represented, items first
+    order = ["item", "category", "manufacturer", "vendor", "hospital"]
+    out: list[dict] = []
+    i = 0
+    while len(out) < limit and any(per_type.get(t) and i < len(per_type[t]) for t in order):
+        for t in order:
+            b = per_type.get(t, [])
+            if i < len(b) and len(out) < limit:
+                out.append(b[i])
+        i += 1
+    return out
+
+
 def schema_text() -> str:
     """Compact schema listing for the agent prompt: table[rows]: col:type, …"""
     c = con()
