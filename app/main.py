@@ -24,20 +24,30 @@ app.add_middleware(
 
 app.include_router(api_router)
 
+# NOTE: NO startup cache-warming. On the 512 MB free tier, eagerly loading fact_grn +
+# fact_po (168 MB) plus every summary at boot spikes RSS past the limit → OOM crash-loop.
+# Tables load lazily per request; the per-endpoint result caches keep warm navigation
+# instant, and the big fact tables are not held resident (see data_access.load).
 
-@app.on_event("startup")
-def _warm_caches() -> None:
-    """Precompute the heavy portfolio overviews in a background thread on boot, so the
-    first user request after a (free-tier) cold start is instant instead of paying the
-    one-time 255k-row parquet load. Daemon thread → never blocks startup / health."""
-    import threading
+# After each request, hand the memory freed by transient big-table loads back to the OS.
+# glibc keeps freed heap by default (RSS stays high on a 512 MB box); malloc_trim(0)
+# releases it. Linux-only — resolves to a no-op everywhere else.
+import ctypes
+import ctypes.util as _cu
 
-    def _run() -> None:
+try:
+    _libc = ctypes.CDLL(_cu.find_library("c"))
+    _HAS_TRIM = hasattr(_libc, "malloc_trim")
+except Exception:
+    _libc, _HAS_TRIM = None, False
+
+
+@app.middleware("http")
+async def _reclaim_memory(request, call_next):
+    response = await call_next(request)
+    if _HAS_TRIM:
         try:
-            from app.api import legacy_kpi, kpi_generic
-            legacy_kpi.warmup()
-            kpi_generic.warmup()
+            _libc.malloc_trim(0)
         except Exception:
             pass
-
-    threading.Thread(target=_run, daemon=True, name="cache-warmup").start()
+    return response

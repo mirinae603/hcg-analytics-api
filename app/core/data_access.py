@@ -23,9 +23,14 @@ MONTH_ORDER = ["January", "February", "March", "April", "May", "June",
                "July", "August", "September", "October", "November", "December"]
 
 
-@lru_cache(maxsize=128)
-def load(table: str) -> pd.DataFrame:
-    """Load a KPI aggregate (or curated) parquet, cached. `table` has no extension."""
+# The big fact tables (fact_grn/fact_po ≈ 84 MB each) are NOT held resident: keeping
+# them all in the lru_cache pushes RSS past the 512 MB free-tier limit → OOM. They load
+# fresh per request and are freed right after (the heavy endpoints that scan them are
+# result-cached, so this reload happens rarely). Small KPI aggregates stay cached.
+_BIG_TABLES = {"fact_grn", "fact_po", "fact_inventory", "fact_consumption", "forecast_sales"}
+
+
+def _read_parquet(table: str) -> pd.DataFrame:
     for base in (KPI, CURATED):
         p = base / f"{table}.parquet"
         if p.exists():
@@ -33,8 +38,21 @@ def load(table: str) -> pd.DataFrame:
     raise FileNotFoundError(f"parquet not found: {table}")
 
 
+@lru_cache(maxsize=128)
+def _load_cached(table: str) -> pd.DataFrame:
+    return _read_parquet(table)
+
+
+def load(table: str) -> pd.DataFrame:
+    """Load a KPI aggregate (or curated) parquet. Small tables are cached; the big fact
+    tables load fresh each call so they don't stay resident (512 MB free-tier budget)."""
+    if table in _BIG_TABLES:
+        return _read_parquet(table)
+    return _load_cached(table)
+
+
 def refresh_cache() -> None:
-    load.cache_clear()
+    _load_cached.cache_clear()
     _name_to_code.cache_clear()
 
 
