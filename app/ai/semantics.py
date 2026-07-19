@@ -16,7 +16,7 @@ RULES = """BUSINESS DEFINITIONS (use these exactly):
 • Days of cover (DOH) = kpi_doh.doh_days; report the MEDIAN over rows where doh_days>0 (the mean is skewed by overstock — never report the mean).
 • Expiry: compute days-to-expiry as date_diff('day', DATE '2026-05-31', expiry_date) on fact_inventory (qty>0, expiry_date not null). Bands: Expired (<0), 0-30, 31-90, 91-180, 181-365, 365+. "Near-expiry / actionable" = Expired + everything ≤180 days.
 • Manufacturer lives in dim_material.manufacturer_desc (join on material) and in sales_by_manufacturer / sales_by_material_mfr for revenue.
-• Department name = dim_costcenter.department_name (join kpi_consumption_by_department.cost_ctr = dim_costcenter.cost_ctr) or use the department_name already on kpi_consumption_by_department.
+• Department: in THIS dataset there are NO readable department names — dim_costcenter.department_name and kpi_consumption_by_department.department_name are both just the cost-centre CODE (a number like '1080101005'). Group consumption by cost_ctr and present it as "Cost centre <code>"; do NOT imply a named department exists. Treat cost_ctr as a text label, never a numeric value.
 • Category = material_group (codes like 'M065-INJECTIONS'); strip the 'M###-' prefix and Title-Case for display."""
 
 # ── Which table for what + join keys ────────────────────────────────────────
@@ -72,7 +72,8 @@ GOTCHAS = """CRITICAL GOTCHAS (ignore these and the numbers are wrong):
 8. SALES have NO per-material month dimension: sales_by_material is a 6-month TOTAL per product. A per-item SALES trend over time is NOT available — sales_monthly is only IP/OP aggregate. But a per-item PURCHASE trend over months IS available via kpi_monthly_purchase_value (or fact_po/fact_grn by month). If asked for an item's "sales trend", give its total sales + monthly PURCHASE trend, and say the monthly split is on the procurement side.
 9. dim_material is the full CATALOG — many SKUs have ZERO transactions (no sales, no purchases). If an item returns no rows in the fact tables, DON'T call it a technical error: say plainly it has no recorded sales/purchases in this 6-month window, and offer its sibling SKUs (same generic_name or material_group that DO have activity, e.g. via dim_material) so the question isn't a dead end.
 10. Column names are already clean — use material_desc / material_group (never a bare `desc` or `group`; those reserved words have been aliased away). Just write plain identifiers.
-11. NAME LOOKUPS: a product's brand name (e.g. 'CALPOL', 'AUGMENTIN') lives in material_desc. To find a named item, filter material_desc ILIKE '%name%'. generic_name is the MOLECULE ('PARACETAMOL','TRAMADOL') — use it only to group products by active ingredient, NEVER to search for a brand. When the user quotes an item that returns nothing, try a looser material_desc ILIKE on the distinctive word (e.g. 'CALPOL') before concluding there's no data — the exact SKU string ('CALPOL-T TAB') may not exist even though the brand family does."""
+11. NAME LOOKUPS: a product's brand name (e.g. 'CALPOL', 'AUGMENTIN') lives in material_desc. To find a named item, filter material_desc ILIKE '%name%'. generic_name is the MOLECULE ('PARACETAMOL','TRAMADOL') — use it only to group products by active ingredient, NEVER to search for a brand. When the user quotes an item that returns nothing, try a looser material_desc ILIKE on the distinctive word (e.g. 'CALPOL') before concluding there's no data — the exact SKU string ('CALPOL-T TAB') may not exist even though the brand family does.
+12. dim_material (24,931 SKUs) is the FULL multi-year item master; sales/PO/GRN/consumption only cover the 6-month analytics window, so most catalog SKUs (~57%) show zero rows there — that alone is not newsworthy. Before telling a user an item "has no data", ALWAYS also check fact_inventory (physical on-hand snapshot, which can hold batches received before the window even started) and fact_consumption. If it HAS inventory, that's the real story — report qty, aging_days, expiry_date (vs snapshot 2026-05-31 — flag if already expired) and formulary status (dim_material.formulary / fact_inventory.formulary: 'OUT OF FORMULARY' often explains why an item stopped moving). A catalog item with stock but no sales/purchase in-window is classic DEAD / NON-MOVING stock — say so plainly instead of a flat "no data"."""
 
 # ── Worked examples (teach the agent good patterns) ─────────────────────────
 EXAMPLES = """WORKED EXAMPLES:
@@ -98,7 +99,12 @@ Q: Portfolio days of cover.
 SQL: SELECT median(doh_days) AS median_doh FROM kpi_doh WHERE doh_days>0;
 
 Q: Top vendors by spend (dedup across plants).
-SQL: SELECT vendor_name, sum(vendor_value) AS spend FROM kpi_vendor_volume GROUP BY 1 ORDER BY spend DESC LIMIT 10;"""
+SQL: SELECT vendor_name, sum(vendor_value) AS spend FROM kpi_vendor_volume GROUP BY 1 ORDER BY spend DESC LIMIT 10;
+
+Q: "Does <item X> have any sales/purchase activity?" and sales_by_material + fact_po + fact_grn all return 0 rows.
+Before answering "no data", ALSO check physical inventory (don't stop at sales/purchase):
+SQL: SELECT plant, qty, total_cost, aging_days, expiry_date, formulary FROM fact_inventory WHERE material = '<code>' AND qty > 0;
+If this returns rows: it's NOT a data gap — it's dead/non-moving stock. Report the qty, how long it's been aging, whether expiry_date is already past the 2026-05-31 snapshot, and the formulary flag (OUT OF FORMULARY commonly explains why it stopped moving). Only say "no data at all" if inventory is ALSO empty."""
 
 
 def context() -> str:

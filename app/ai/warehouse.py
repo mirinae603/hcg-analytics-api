@@ -223,16 +223,99 @@ def mentions(q: str, mtype: str | None = None, limit: int = 18) -> list[dict]:
     return out
 
 
+_TYPE_SHORT = {
+    "VARCHAR": "text", "TEXT": "text", "CHAR": "text", "STRING": "text",
+    "DOUBLE": "num", "FLOAT": "num", "REAL": "num", "DECIMAL": "num",
+    "BIGINT": "int", "INTEGER": "int", "HUGEINT": "int", "SMALLINT": "int", "TINYINT": "int", "UBIGINT": "int",
+    "TIMESTAMP": "date", "DATE": "date", "TIME": "date", "TIMESTAMP_NS": "date",
+    "BOOLEAN": "bool", "BOOL": "bool",
+}
+
+
+def _short_type(t: str) -> str:
+    base = str(t).split("(")[0].strip().upper()
+    return _TYPE_SHORT.get(base, base.lower())
+
+
 def schema_text() -> str:
-    """Compact schema listing for the agent prompt: table[rows]: col:type, …"""
+    """Compact TYPED schema listing for the agent prompt so it knows exactly what
+    every table holds: `table [N rows]: col:type, col:type, …`."""
     c = con()
     lines = []
     for name in tables():
         try:
             info = c.execute(f"DESCRIBE {name}").fetchall()
             n = c.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
-            cols = ", ".join(f"{r[0]}" for r in info)
+            cols = ", ".join(f"{r[0]}:{_short_type(r[1])}" for r in info)
             lines.append(f"{name} [{n:,} rows]: {cols}")
         except Exception:
             pass
     return "\n".join(lines)
+
+
+def _material_col(cols: list[str]) -> str | None:
+    low = {c.lower(): c for c in cols}
+    for cand in ("material", "material_id"):
+        if cand in low:
+            return low[cand]
+    return None
+
+
+def _code_variants(codes: list[str]) -> list[str]:
+    """Some fact tables store the material key as a float string ('218766.0') while
+    others use the int form ('218766'). Match both so a footprint never undercounts."""
+    out: set[str] = set()
+    for c in codes:
+        s = str(c)
+        out.add(s)
+        if s.endswith(".0"):
+            out.add(s[:-2])
+        elif s.replace(".", "", 1).isdigit() and "." not in s:
+            out.add(s + ".0")
+    return list(out)
+
+
+def item_footprint(name: str, limit: int = 8) -> dict:
+    """Resolve a specific product (by material_desc name OR material code) and report
+    its identity + a COMPLETE footprint: how many rows it has in EVERY table that keys
+    on material. This is what stops the agent concluding "no data" after checking only
+    sales/purchase — an item with 0 sales but rows in fact_inventory is dead stock, and
+    this surfaces that in one deterministic call. Read-only, parameterised."""
+    q = (name or "").strip()
+    c = con()
+    cols_m = ["material", "material_desc", "material_group", "generic_name",
+              "manufacturer_desc", "formulary", "material_type"]
+    with _lock:
+        try:
+            matches = c.execute(
+                f"SELECT {', '.join(cols_m)} FROM dim_material "
+                "WHERE material = ? OR material_desc ILIKE '%' || ? || '%' "
+                "ORDER BY (CASE WHEN material = ? THEN 0 WHEN material_desc ILIKE ? || '%' THEN 1 ELSE 2 END), length(material_desc) "
+                "LIMIT ?", [q, q, q, q, limit]).fetchall()
+        except Exception:
+            matches = []
+        resolved = [{k: _coerce(v) for k, v in zip(cols_m, r)} for r in matches]
+        codes = _code_variants([r["material"] for r in resolved if r.get("material")])
+        footprint: dict[str, int] = {}
+        if codes:
+            ph = ",".join(["?"] * len(codes))
+            for name_ in sorted(_tables.keys()):
+                try:
+                    info = c.execute(f"DESCRIBE {name_}").fetchall()
+                    mcol = _material_col([r[0] for r in info])
+                    if not mcol:
+                        continue
+                    n = c.execute(f"SELECT count(*) FROM {name_} WHERE CAST({mcol} AS VARCHAR) IN ({ph})", codes).fetchone()[0]
+                    footprint[name_] = int(n)
+                except Exception:
+                    pass
+    return {
+        "query": q,
+        "match_count": len(resolved),
+        "matches": resolved,
+        "footprint": footprint,
+        "tables_with_data": sorted([t for t, n in footprint.items() if n > 0]),
+        "note": ("No catalog match — try a looser name or ask about the brand family."
+                 if not resolved else
+                 "footprint = row count per table for the matched material code(s); 0 means absent from that table."),
+    }

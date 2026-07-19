@@ -24,7 +24,7 @@ from app.ai import warehouse, semantics, charts
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-MAX_SQL_STEPS = 6
+MAX_SQL_STEPS = 8
 
 
 def has_key() -> bool:
@@ -69,6 +69,8 @@ def col_kind(col: str, rows: list) -> str:
 def _fmt(v, kind):
     if v is None or v == "":
         return None
+    if kind == "text":
+        return v   # codes / ids / names — never coerce to a number
     try:
         n = float(v)
     except (TypeError, ValueError):
@@ -93,7 +95,9 @@ def _fmt(v, kind):
 
 def _format_result(res: dict, limit: int = 30) -> dict:
     cols = res["columns"]
-    kinds = {c: infer_kind(c) for c in cols}
+    # data-aware typing (not name-based): a string column — e.g. a numeric-looking cost-
+    # centre or material code — stays text and is never comma/₹-formatted for the model.
+    kinds = {c: col_kind(c, res["rows"]) for c in cols}
     rows = [{c: _fmt(r.get(c), kinds[c]) for c in cols} for r in res["rows"][:limit]]
     return {"columns": cols, "rows": rows, "row_count": res["row_count"],
             "truncated": res.get("truncated", False)}
@@ -105,6 +109,7 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 
 HOW YOU WORK — like a sharp, friendly human analyst:
 • UNDERSTAND the real intent first. If the request is genuinely ambiguous or under-specified (unclear time range, which metric/entity, or a term the data doesn't have), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
+• SPECIFIC ITEM? For ANY question about a particular product/SKU (named or by code), call lookup_item FIRST. It returns the item's identity (generic, group, manufacturer, formulary status) and a COMPLETE footprint — the row count in EVERY table it touches (sales, PO, GRN, consumption, inventory, forecasts). This guarantees you never miss a source: an item with 0 sales/purchases but rows in fact_inventory is DEAD / NON-MOVING stock (report qty, aging, expiry, formulary) — never call that "no data". Then run_sql only the tables the footprint shows have rows.
 • Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
 • Every number in your final answer MUST come from a query you actually ran.
 • When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep it TIGHT — 2–4 sentences: the headline number(s) + the one insight that matters. Do NOT enumerate long lists item-by-item in the prose (the chart AND the data table below already show every row) — mention the top 1–2 and summarise the rest. No filler sign-offs like "let me know if you'd like…". NEVER paste a markdown/pipe table into the answer text.
@@ -146,6 +151,13 @@ PRESENT_TOOL = {
             "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly."},
             "charts": {"type": "array", "description": "One or MORE charts. If the user asks for multiple/different charts, or two views genuinely help (e.g. a ranking bar AND a share donut), include several. Empty for a single-number answer.", "items": _CHART_SPEC},
             "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'.")}}},
+}
+LOOKUP_TOOL = {
+    "type": "function", "function": {
+        "name": "lookup_item",
+        "description": "Resolve a SPECIFIC product/SKU by name or material code and get (a) its identity — generic name, category, manufacturer, formulary status — and (b) a COMPLETE footprint: the row count in every table it appears in (sales, purchase orders, receipts, consumption, inventory, forecasts, risk). Call this FIRST for any single-item question so you never miss a data source. If it has 0 sales/purchases but rows in fact_inventory, it's dead/non-moving stock — not 'no data'.",
+        "parameters": {"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string", "description": "The product name or material code the user asked about, e.g. 'CALPOL-T TAB' or '218766'."}}}},
 }
 CLARIFY_TOOL = {
     "type": "function", "function": {
@@ -278,7 +290,7 @@ def answer(query: str, history: list | None = None):
         try:
             resp = client.chat.completions.create(
                 model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
-                tools=[RUN_SQL_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
+                tools=[RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
         except Exception as e:
             yield {"type": "error", "text": f"AI request failed: {e}"}
             return
@@ -308,6 +320,17 @@ def answer(query: str, history: list | None = None):
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "ok"})
                 stop = True
                 continue
+            if tc.function.name == "lookup_item":
+                name = (args.get("name") or "").strip()
+                yield {"type": "step", "text": f"Locating “{name}” across all tables"}
+                try:
+                    fp = warehouse.item_footprint(name)
+                    hit = ", ".join(fp["tables_with_data"][:6]) or "no tables"
+                    yield {"type": "sql", "purpose": f"footprint of “{name}”", "sql": f"-- lookup_item('{name}')", "rows": fp["match_count"]}
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(fp)[:5000]})
+                except Exception as e:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:200]})})
+                continue
             # run_sql
             purpose = args.get("purpose") or "querying the data"
             sql = args.get("sql", "")
@@ -319,8 +342,11 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "sql", "sql": res["sql"], "purpose": purpose, "rows": res["row_count"]}
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_result(res))})
             except Exception as e:
-                yield {"type": "sql", "sql": sql, "purpose": purpose, "error": str(e)[:200]}
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:300]})})
+                # Keep internal self-corrections invisible: feed the error back to the model
+                # so it fixes the query, but don't surface a scary errored query to the user.
+                yield {"type": "step", "text": "Refining the query"}
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": json.dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
         if stop:
             break
 
