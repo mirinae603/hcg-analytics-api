@@ -33,6 +33,42 @@ _FORBIDDEN = re.compile(
 _ALLOWED_START = re.compile(r"^\s*(with|select)\b", re.I)
 
 
+# Reserved-word column names → safe, schema-consistent aliases. A column literally
+# named `desc` or `group` (both SQL keywords) forces the LLM to quote it, which it
+# reliably forgets — producing a ParserException the user sees as a "technical issue".
+# We alias them away at load time so plain `SELECT material_desc FROM …` just works.
+_RENAME = {"desc": "material_desc", "group": "material_group"}
+
+
+def _needs_alias(con: duckdb.DuckDBPyConnection, view: str, col: str) -> bool:
+    try:
+        con.execute(f"SELECT {col} FROM {view} LIMIT 0")
+        return False
+    except Exception:
+        return True   # reserved keyword / otherwise unquotable as a bare identifier
+
+
+def _harden_view(con: duckdb.DuckDBPyConnection, name: str, path: str) -> None:
+    """Recreate the view with any reserved-word column aliased to a safe name, so the
+    agent never has to quote identifiers (quoting is what it forgets)."""
+    cols = [r[0] for r in con.execute(f"DESCRIBE {name}").fetchall()]
+    lower = {c.lower() for c in cols}
+    renames: dict[str, str] = {}
+    for c in cols:
+        if not _needs_alias(con, name, c):
+            continue
+        tgt = _RENAME.get(c.lower(), f"{c}_col")
+        if tgt.lower() in lower and tgt.lower() != c.lower():
+            tgt = f"{c}_col"
+        if tgt[:1].isdigit():
+            tgt = "c_" + tgt
+        renames[c] = tgt
+    if not renames:
+        return
+    proj = ", ".join(f'"{c}" AS {renames[c]}' if c in renames else f'"{c}"' for c in cols)
+    con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT {proj} FROM read_parquet('{path}')")
+
+
 def _connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(database=":memory:")
     try:
@@ -46,6 +82,7 @@ def _connect() -> duckdb.DuckDBPyConnection:
                 continue
             try:
                 con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{f}')")
+                _harden_view(con, name, f)
                 _tables[name] = f
             except Exception:
                 pass
@@ -133,7 +170,7 @@ _MEN_TYPES = ["item", "category", "manufacturer", "vendor", "hospital"]
 def _men_spec(t: str):
     # (table, column, browse_sql[l, ord], is_category)  — browse is ordered by 'ord' desc (importance)
     return {
-        "item": ("dim_material", "material_desc", 'SELECT "desc" AS l, revenue AS ord FROM sales_by_material', False),
+        "item": ("sales_by_material", "material_desc", "SELECT material_desc AS l, revenue AS ord FROM sales_by_material", False),
         "vendor": ("dim_vendor", "vendor_name", "SELECT vendor_name AS l, sum(vendor_value) AS ord FROM kpi_vendor_volume GROUP BY 1", False),
         "manufacturer": ("dim_material", "manufacturer_desc", "SELECT manufacturer AS l, revenue AS ord FROM sales_by_manufacturer", False),
         "category": ("dim_material", "material_group", "SELECT material_group AS l, count(*) AS ord FROM dim_material GROUP BY 1", True),

@@ -24,10 +24,10 @@ GUIDE = """TABLE GUIDE (pick the right source):
 REVENUE / MARGIN (billed sales, 6mo):
   sales_by_manufacturer(manufacturer, revenue, cost, qty)          — revenue/margin by manufacturer
   sales_by_hospital(hospital, revenue, cost, qty)                  — by billing hospital (23 hospital codes)
-  sales_by_material(material, desc, group, revenue, cost, qty)     — by product
-  sales_by_material_mfr(manufacturer, material, desc, group, …)    — product×manufacturer (mfr drill)
-  sales_by_material_hospital(hospital, material, desc, group, …)   — product×hospital (hospital drill)
-  sales_monthly(patient['IP'|'OP'], month, revenue, cost, qty)     — monthly trend & IP vs OP split
+  sales_by_material(material, material_desc, material_group, revenue, cost, qty)     — by product (6-MONTH TOTAL, no month column)
+  sales_by_material_mfr(manufacturer, material, material_desc, material_group, …)    — product×manufacturer (mfr drill)
+  sales_by_material_hospital(hospital, material, material_desc, material_group, …)   — product×hospital (hospital drill)
+  sales_monthly(patient['IP'|'OP'], month, revenue, cost, qty)     — monthly revenue trend & IP vs OP split (NOT per-material)
   sales_totals(patient, revenue, cost, qty)                        — grand totals by IP/OP
 INVENTORY (snapshot 2026-05-31):
   kpi_stock_value(plant, material, material_desc, material_group, stock_qty, stock_value_cost, stock_value_mrp)
@@ -39,8 +39,9 @@ INVENTORY (snapshot 2026-05-31):
   kpi_near_expiry(material, material_desc, batch, expiry_date, days_to_expiry, expiry_bucket, qty, total_cost)  — capped ≤180d; for full ladder use fact_inventory
 PROCUREMENT:
   fact_grn(plant, material, vendor_name, po_no, gr_qty, net_price, unit_mrp, total_amount_wo_tax, major_group, gr_date)  — actual receipts & prices (255k rows)
-  fact_po(plant, material, vendor_name, po_no, po_qty, open_qty, net_price, total_value_wo_tax, major_group)  — orders; open_qty>0 = open PO
-  kpi_purchase_value(plant, vendor_name, category, year, month, purchase_value, purchase_qty)
+  fact_po(plant, material, material_desc, vendor_name, po_no, po_qty, open_qty, net_price, total_value_wo_tax, major_group, po_date, year, month)  — orders; open_qty>0 = open PO
+  kpi_monthly_purchase_value(year, month, plant, material, material_desc, material_group, monthly_purchase_value, purchase_qty)  — PER-MATERIAL monthly purchase trend (use this for an item's spend over time)
+  kpi_purchase_value(plant, vendor_name, category, year, month, purchase_value, purchase_qty)  — by vendor/category, not per-material
   kpi_vendor_volume(plant, vendor_name, vendor_value, value_share_pct)  — per plant; SUM by vendor_name for portfolio
   kpi_vendor_lead_time(vendor_name, avg_lead_time_days, median_lead_time_days)
 CONSUMPTION:
@@ -67,7 +68,11 @@ GOTCHAS = """CRITICAL GOTCHAS (ignore these and the numbers are wrong):
 4. DOH: report MEDIAN(doh_days) WHERE doh_days>0, never AVG (mean is ~1445d nonsense due to overstock tail; median ≈ 121d).
 5. Purchases-by-MANUFACTURER via dim_material.manufacturer_desc covers only ~18% of purchase VALUE (master is sparse for high-value items) — if asked, compute it but STATE the coverage caveat. Manufacturer on the REVENUE side (sales_by_manufacturer) is clean.
 6. month is a text label ('December','January',…). To sort chronologically use a CASE/ordering, not alphabetical. Prefer sales_monthly.month which is 'YYYY-MM'.
-7. Always round money to ₹Cr/₹L in the FINAL answer, but keep raw values in SQL for correctness."""
+7. Always round money to ₹Cr/₹L in the FINAL answer, but keep raw values in SQL for correctness.
+8. SALES have NO per-material month dimension: sales_by_material is a 6-month TOTAL per product. A per-item SALES trend over time is NOT available — sales_monthly is only IP/OP aggregate. But a per-item PURCHASE trend over months IS available via kpi_monthly_purchase_value (or fact_po/fact_grn by month). If asked for an item's "sales trend", give its total sales + monthly PURCHASE trend, and say the monthly split is on the procurement side.
+9. dim_material is the full CATALOG — many SKUs have ZERO transactions (no sales, no purchases). If an item returns no rows in the fact tables, DON'T call it a technical error: say plainly it has no recorded sales/purchases in this 6-month window, and offer its sibling SKUs (same generic_name or material_group that DO have activity, e.g. via dim_material) so the question isn't a dead end.
+10. Column names are already clean — use material_desc / material_group (never a bare `desc` or `group`; those reserved words have been aliased away). Just write plain identifiers.
+11. NAME LOOKUPS: a product's brand name (e.g. 'CALPOL', 'AUGMENTIN') lives in material_desc. To find a named item, filter material_desc ILIKE '%name%'. generic_name is the MOLECULE ('PARACETAMOL','TRAMADOL') — use it only to group products by active ingredient, NEVER to search for a brand. When the user quotes an item that returns nothing, try a looser material_desc ILIKE on the distinctive word (e.g. 'CALPOL') before concluding there's no data — the exact SKU string ('CALPOL-T TAB') may not exist even though the brand family does."""
 
 # ── Worked examples (teach the agent good patterns) ─────────────────────────
 EXAMPLES = """WORKED EXAMPLES:
@@ -85,7 +90,7 @@ SQL: SELECT m.manufacturer_desc AS manufacturer, sum(i.total_cost) AS expiring_v
 Q: For items expiring in 90 days, did we overpay vs the median purchase price?
 SQL: WITH med AS (SELECT material, median(net_price) med_price FROM fact_grn WHERE net_price>0 AND gr_qty>0 GROUP BY 1),
      exp AS (SELECT DISTINCT material FROM fact_inventory WHERE qty>0 AND date_diff('day', DATE '2026-05-31', expiry_date) BETWEEN 0 AND 90)
-     SELECT g.material, any_value(g.material_desc) desc, sum(greatest(g.net_price-med.med_price,0)*g.gr_qty) AS overpay
+     SELECT g.material, any_value(g.material_desc) AS item, sum(greatest(g.net_price-med.med_price,0)*g.gr_qty) AS overpay
      FROM fact_grn g JOIN med USING(material) JOIN exp USING(material)
      WHERE g.net_price>0 AND g.gr_qty>0 GROUP BY 1 HAVING overpay>0 ORDER BY overpay DESC LIMIT 10;
 

@@ -208,6 +208,14 @@ def _enhance_spec(spec: dict, res: dict):
         spec["y2_format"] = "pct"
 
 
+def _has_data(res) -> bool:
+    """True only if the result has rows with at least one non-null cell. A SUM/aggregate
+    over zero matching rows returns a single all-NULL row — that's 'no data', not a table."""
+    if not res or not res.get("rows"):
+        return False
+    return any(v is not None for row in res["rows"] for v in row.values())
+
+
 def _pick_result(results, chart):
     """Find the query result whose columns cover the chart's referenced columns (prefer most recent)."""
     if not chart:
@@ -373,8 +381,8 @@ def answer(query: str, history: list | None = None):
         table_res = table_res or res
 
     if not table_res and results:
-        table_res = results[-1]
-    if table_res:
+        table_res = next((r for r in reversed(results) if _has_data(r)), None)
+    if _has_data(table_res):
         yield {"type": "table", "table": {"title": table_res.get("purpose", ""),
                                           "columns": [{"key": c, "label": c, "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
                                           "rows": table_res["rows"][:50]},
