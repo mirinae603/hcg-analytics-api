@@ -220,13 +220,24 @@ def _combo(rows, x, ys, y2, title, kind):
 def _pie(rows, x, y, title, hole, kind):
     labels = [str(v) for v in _rows_get(rows, x)]
     vals = [_num(v) for v in _rows_get(rows, y)]
+    many = len(labels) > 7
     data = [{"type": "pie", "labels": labels, "values": vals, "hole": hole, "sort": True, "direction": "clockwise",
-             "marker": {"colors": PALETTE[:len(labels)], "line": {"color": "#fff", "width": 2}},
-             "textinfo": "label+percent", "textposition": "outside", "textfont": {"size": 11, "family": FONT},
+             "marker": {"colors": (PALETTE * (len(labels) // len(PALETTE) + 1))[:len(labels)], "line": {"color": "#fff", "width": 2}},
+             # many slices → percents inside + a legend (avoids a wall of outside labels that squashes the pie)
+             "textinfo": "percent" if many else "label+percent",
+             "textposition": "inside" if many else "outside",
+             "insidetextorientation": "horizontal",
+             "textfont": {"size": 11, "family": FONT},
+             "automargin": True,
              "customdata": [_label(v, kind) for v in vals],
              "hovertemplate": "<b>%{label}</b><br>%{customdata} · %{percent}<extra></extra>"}]
     lay = _base_layout(title)
-    lay["margin"] = {"l": 20, "r": 20, "t": 58, "b": 30}
+    lay["height"] = 440
+    lay["margin"] = {"l": 24, "r": 24, "t": 56, "b": 20}
+    lay["uniformtext"] = {"minsize": 9, "mode": "hide"}
+    if many:
+        lay["showlegend"] = True
+        lay["legend"] = {"orientation": "h", "y": -0.05, "x": 0.5, "xanchor": "center", "font": {"size": 10}}
     return {"data": data, "layout": lay}
 
 

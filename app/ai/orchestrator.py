@@ -103,14 +103,18 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 
 {context}
 
-HOW YOU WORK:
-• Call run_sql to fetch data. You may call it MULTIPLE times — decompose complex questions, run an exploratory query, then a precise one, join across tables freely (CTEs, window functions, subqueries all supported by DuckDB).
-• Prefer ONE well-formed query when possible; use several when the question is genuinely multi-part or you need to discover values first.
-• Every number in your final answer MUST come from a query result you actually ran.
-• When you have enough, call present() with a tight 2–5 sentence answer and the best chart. ALWAYS include a chart when the result is a ranking, breakdown, trend, or comparison (bar for rankings, line for time trends, donut for shares, heatmap for matrix, scatter for correlation). When two metrics are on very different scales (e.g. a ₹ amount and a percentage, or IP vs OP), use type "combo" with the smaller/percentage metric as y2 so both are readable. Only omit the chart for a single-number answer.
+HOW YOU WORK — like a sharp, friendly human analyst:
+• UNDERSTAND the real intent first. If the request is genuinely ambiguous or under-specified (unclear time range, which metric/entity, or a term the data doesn't have), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
+• Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
+• Every number in your final answer MUST come from a query you actually ran.
+• When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s):
+   – ALWAYS chart a ranking, breakdown, trend, comparison or share.
+   – If the user asks for "two charts", "different charts", "a pie and a bar", etc., or if two views genuinely illuminate the data, put MULTIPLE specs in `charts` (e.g. a ranking bar AND a share donut).
+   – bar=rankings, line=time trend, donut=shares, combo (percentage on y2)=two different scales, heatmap=matrix, scatter/bubble=correlation, treemap/sunburst=hierarchy, waterfall=build-up.
+   – Only omit charts for a pure single-number answer.
 • Money is already formatted (₹Cr/₹L) in results — quote those strings verbatim, never recompute units.
-• Be a sharp analyst: lead with the answer, add one real insight (a share, concentration, trend, or risk). Respect any caveats in the schema notes (e.g. manufacturer-of-purchases coverage).
-• If the data genuinely can't answer it, say so briefly in present()."""
+• Be genuinely analytical: lead with the answer, then add the insight that matters (a concentration, a trend, a risk, a surprise) and, when useful, a short takeaway or suggested next question. Respect caveats in the schema notes (e.g. manufacturer-of-purchases coverage).
+• If the data truly can't answer it, say so plainly and suggest the closest thing you CAN answer."""
 
 
 RUN_SQL_TOOL = {
@@ -121,22 +125,34 @@ RUN_SQL_TOOL = {
             "sql": {"type": "string", "description": "A single SELECT or WITH query. No semicolons, no DDL/DML."},
             "purpose": {"type": "string", "description": "Short human phrase for what this query finds (shown to the user), e.g. 'expiring value by manufacturer'."}}}},
 }
+_CHART_SPEC = {
+    "type": "object", "description": "One visualization.", "properties": {
+        "type": {"type": "string", "enum": ["bar", "grouped_bar", "stacked_bar", "line", "area", "combo", "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "sunburst", "funnel", "waterfall", "histogram", "box", "indicator"]},
+        "x": {"type": "string", "description": "Result column for the category / x-axis / labels."},
+        "y": {"description": "Result column (or list of columns) for values.", "type": ["string", "array"], "items": {"type": "string"}},
+        "color": {"type": "string", "description": "Optional grouping column (scatter/heatmap/sunburst)."},
+        "size": {"type": "string", "description": "Optional bubble-size column."},
+        "y2": {"type": "string", "description": "Optional secondary-axis column for combo."},
+        "value_format": {"type": "string", "enum": ["inr", "pct", "num", "days"]},
+        "orientation": {"type": "string", "enum": ["v", "h"]},
+        "title": {"type": "string"}}}
+
 PRESENT_TOOL = {
     "type": "function", "function": {
         "name": "present",
-        "description": "Deliver the final answer + optional chart. Call this once you have the data.",
+        "description": "Deliver the final answer + chart(s). Call this once you have the data.",
         "parameters": {"type": "object", "required": ["answer"], "properties": {
-            "answer": {"type": "string", "description": "Final answer in concise markdown. Quote the pre-formatted figures exactly."},
-            "chart": {"type": ["object", "null"], "description": "Best visualization, or null if a chart adds nothing.", "properties": {
-                "type": {"type": "string", "enum": ["bar", "grouped_bar", "stacked_bar", "line", "area", "combo", "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "sunburst", "funnel", "waterfall", "histogram", "box", "indicator"]},
-                "x": {"type": "string", "description": "Result column for the category / x-axis / labels."},
-                "y": {"description": "Result column (or list of columns) for values.", "type": ["string", "array"], "items": {"type": "string"}},
-                "color": {"type": "string", "description": "Optional grouping column (scatter/heatmap/sunburst)."},
-                "size": {"type": "string", "description": "Optional bubble-size column."},
-                "y2": {"type": "string", "description": "Optional secondary-axis column for combo."},
-                "value_format": {"type": "string", "enum": ["inr", "pct", "num", "days"]},
-                "orientation": {"type": "string", "enum": ["v", "h"]},
-                "title": {"type": "string"}}}}}},
+            "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly."},
+            "charts": {"type": "array", "description": "One or MORE charts. If the user asks for multiple/different charts, or two views genuinely help (e.g. a ranking bar AND a share donut), include several. Empty for a single-number answer.", "items": _CHART_SPEC},
+            "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'.")}}},
+}
+CLARIFY_TOOL = {
+    "type": "function", "function": {
+        "name": "ask_clarification",
+        "description": "Ask the user ONE short clarifying question when the request is genuinely ambiguous or under-specified (e.g. unclear time range, which metric, which entity, or a term the data doesn't have). Only use when you truly cannot pick a sensible default.",
+        "parameters": {"type": "object", "required": ["question"], "properties": {
+            "question": {"type": "string", "description": "A single, friendly clarifying question."},
+            "options": {"type": "array", "items": {"type": "string"}, "description": "Optional 2–4 suggested answers as quick chips."}}}},
 }
 
 
@@ -225,14 +241,14 @@ def answer(query: str, history: list | None = None):
         try:
             resp = client.chat.completions.create(
                 model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
-                tools=[RUN_SQL_TOOL, PRESENT_TOOL], tool_choice="auto")
+                tools=[RUN_SQL_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
         except Exception as e:
             yield {"type": "error", "text": f"AI request failed: {e}"}
             return
         msg = resp.choices[0].message
         if not msg.tool_calls:
             if msg.content:
-                present_args = {"answer": msg.content, "chart": None}
+                present_args = {"answer": msg.content}
             break
 
         messages.append({"role": "assistant", "content": msg.content or None,
@@ -245,6 +261,11 @@ def answer(query: str, history: list | None = None):
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
+            if tc.function.name == "ask_clarification":
+                yield {"type": "clarify", "text": args.get("question", "Could you clarify what you'd like?"),
+                       "options": args.get("options", [])}
+                yield {"type": "done"}
+                return
             if tc.function.name == "present":
                 present_args = args
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "ok"})
@@ -272,7 +293,11 @@ def answer(query: str, history: list | None = None):
         return
 
     ans = (present_args.get("answer") or "").strip()
-    chart_spec = present_args.get("chart") or None
+    chart_specs = present_args.get("charts")
+    if not chart_specs:
+        single = present_args.get("chart")
+        chart_specs = [single] if single else []
+    chart_specs = [c for c in chart_specs if c]
 
     # VERIFY (only when we actually queried data)
     verified = None
@@ -298,28 +323,31 @@ def answer(query: str, history: list | None = None):
 
     yield {"type": "answer", "text": ans, "verified": verified}
 
-    # CHART — use the model's spec, else auto-build one if the data is chartable
-    if not chart_spec and results:
-        chart_spec = _auto_chart(results[-1])
-    if chart_spec:
-        res = _pick_result(results, chart_spec)
-        if res and res["rows"]:
-            if not chart_spec.get("value_format") and chart_spec.get("y"):
-                yk = chart_spec["y"][0] if isinstance(chart_spec["y"], list) else chart_spec["y"]
-                chart_spec["value_format"] = infer_kind(str(yk))
-            fig = charts.build(res["rows"], chart_spec)
-            if fig:
-                yield {"type": "chart", "plotly": fig}
-            # a compact table of the charted data
-            yield {"type": "table", "table": {"title": chart_spec.get("title", ""),
-                                              "columns": [{"key": c, "label": c, "kind": col_kind(c, res["rows"])} for c in res["columns"]],
-                                              "rows": res["rows"][:25]},
-                   "note": ("Showing top 25 of %d rows." % res["row_count"]) if res.get("truncated") or res["row_count"] > 25 else ""}
-    elif results:
-        # no chart but we have data → still surface the final table
-        res = results[-1]
-        yield {"type": "table", "table": {"title": res.get("purpose", ""),
-                                          "columns": [{"key": c, "label": c, "kind": col_kind(c, res["rows"])} for c in res["columns"]],
-                                          "rows": res["rows"][:25]}, "note": ""}
+    # CHARTS — use the model's spec(s), else auto-build one if the data is chartable
+    if not chart_specs and results:
+        auto = _auto_chart(results[-1])
+        if auto:
+            chart_specs = [auto]
+
+    table_res = None
+    for spec in chart_specs:
+        res = _pick_result(results, spec)
+        if not res or not res["rows"]:
+            continue
+        if not spec.get("value_format") and spec.get("y"):
+            yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
+            spec["value_format"] = infer_kind(str(yk))
+        fig = charts.build(res["rows"], spec)
+        if fig:
+            yield {"type": "chart", "plotly": fig}
+        table_res = table_res or res
+
+    if not table_res and results:
+        table_res = results[-1]
+    if table_res:
+        yield {"type": "table", "table": {"title": table_res.get("purpose", ""),
+                                          "columns": [{"key": c, "label": c, "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
+                                          "rows": table_res["rows"][:50]},
+               "note": ("Showing top 50 of %d rows." % table_res["row_count"]) if table_res.get("truncated") or table_res["row_count"] > 50 else ""}
 
     yield {"type": "done"}
