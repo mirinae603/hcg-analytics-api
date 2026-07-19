@@ -24,10 +24,10 @@ def ai_status():
 
 
 @router.get("/ai/mentions")
-def ai_mentions(q: str = Query(""), limit: int = Query(12)):
-    """Live entity search for the @-picker (items, vendors, manufacturers, categories, hospitals)."""
+def ai_mentions(q: str = Query(""), type: str = Query(None), limit: int = Query(18)):
+    """Entity picker source. type= filters to one kind (browse when q empty); no type + q = cross-type search."""
     try:
-        return {"items": warehouse.mentions(q, limit)}
+        return {"items": warehouse.mentions(q, type, limit)}
     except Exception:
         return {"items": []}
 

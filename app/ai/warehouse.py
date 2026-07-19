@@ -127,45 +127,59 @@ def _clean_group(g) -> str:
     return g.strip().title() or "Uncategorised"
 
 
-def mentions(q: str, limit: int = 12) -> list[dict]:
-    """Live entity search for the @-picker — items, vendors, manufacturers,
-    categories, hospitals. Injection-safe (parameterised), read-only."""
+_MEN_TYPES = ["item", "category", "manufacturer", "vendor", "hospital"]
+
+
+def _men_spec(t: str):
+    # (table, column, browse_sql[l, ord], is_category)  — browse is ordered by 'ord' desc (importance)
+    return {
+        "item": ("dim_material", "material_desc", 'SELECT "desc" AS l, revenue AS ord FROM sales_by_material', False),
+        "vendor": ("dim_vendor", "vendor_name", "SELECT vendor_name AS l, sum(vendor_value) AS ord FROM kpi_vendor_volume GROUP BY 1", False),
+        "manufacturer": ("dim_material", "manufacturer_desc", "SELECT manufacturer AS l, revenue AS ord FROM sales_by_manufacturer", False),
+        "category": ("dim_material", "material_group", "SELECT material_group AS l, count(*) AS ord FROM dim_material GROUP BY 1", True),
+        "hospital": ("sales_by_hospital", "hospital", "SELECT hospital AS l, revenue AS ord FROM sales_by_hospital", False),
+    }[t]
+
+
+def mentions(q: str, mtype: str | None = None, limit: int = 18) -> list[dict]:
+    """Entity picker source. With a query → ILIKE search (prefix-ranked). Empty query
+    → a CURATED browse list ordered by importance (top items by revenue, top vendors by
+    spend, biggest categories, etc.). Injection-safe (parameterised), read-only."""
     q = (q or "").strip()
-    if not q:
-        return []
     c = con()
-    specs = [
-        ("item", "SELECT DISTINCT material_desc FROM dim_material WHERE material_desc IS NOT NULL AND material_desc ILIKE '%' || ? || '%' ORDER BY length(material_desc), material_desc LIMIT 7", False),
-        ("vendor", "SELECT DISTINCT vendor_name FROM dim_vendor WHERE vendor_name IS NOT NULL AND vendor_name ILIKE '%' || ? || '%' ORDER BY length(vendor_name), vendor_name LIMIT 5", False),
-        ("manufacturer", "SELECT DISTINCT manufacturer_desc FROM dim_material WHERE manufacturer_desc IS NOT NULL AND manufacturer_desc != '' AND manufacturer_desc ILIKE '%' || ? || '%' ORDER BY length(manufacturer_desc) LIMIT 5", False),
-        ("category", "SELECT DISTINCT material_group FROM dim_material WHERE material_group IS NOT NULL AND material_group ILIKE '%' || ? || '%' ORDER BY length(material_group) LIMIT 5", True),
-        ("hospital", "SELECT DISTINCT hospital FROM sales_by_hospital WHERE hospital IS NOT NULL AND hospital ILIKE '%' || ? || '%' LIMIT 3", False),
-    ]
-    per_type: dict[str, list] = {}
-    seen = set()
+    types = [mtype] if mtype in _MEN_TYPES else _MEN_TYPES
+    cap = limit if mtype in _MEN_TYPES else 6   # per-type cap for the cross-type mix
+    per: dict[str, list] = {}
     with _lock:
-        for typ, sql, is_cat in specs:
+        for t in types:
+            tbl, col, browse, is_cat = _men_spec(t)
             try:
-                rows = c.execute(sql, [q]).fetchall()
+                if q:
+                    sql = (f"SELECT DISTINCT {col} AS l FROM {tbl} "
+                           f"WHERE {col} IS NOT NULL AND {col} != '' AND {col} ILIKE '%' || ? || '%' "
+                           f"ORDER BY (CASE WHEN {col} ILIKE ? || '%' THEN 0 ELSE 1 END), length({col}), {col} LIMIT ?")
+                    rows = c.execute(sql, [q, q, cap]).fetchall()
+                else:
+                    rows = c.execute(f"SELECT l FROM ({browse}) t WHERE l IS NOT NULL AND l != '' ORDER BY ord DESC NULLS LAST LIMIT ?", [cap]).fetchall()
             except Exception:
                 rows = []
-            bucket = []
+            seen = set(); bucket = []
             for (label,) in rows:
                 if label is None:
                     continue
                 disp = _clean_group(label) if is_cat else str(label)
-                key = (typ, disp.lower())
-                if disp and key not in seen:
-                    seen.add(key)
-                    bucket.append({"type": typ, "label": disp})
-            per_type[typ] = bucket
-    # interleave (round-robin) so every category is represented, items first
-    order = ["item", "category", "manufacturer", "vendor", "hospital"]
-    out: list[dict] = []
-    i = 0
-    while len(out) < limit and any(per_type.get(t) and i < len(per_type[t]) for t in order):
-        for t in order:
-            b = per_type.get(t, [])
+                k = disp.lower()
+                if disp and k not in seen:
+                    seen.add(k)
+                    bucket.append({"type": t, "label": disp})
+            per[t] = bucket
+    if mtype in _MEN_TYPES:
+        return per.get(mtype, [])[:limit]
+    # cross-type: interleave (round-robin) so each type shows up
+    out: list[dict] = []; i = 0
+    while len(out) < limit and any(i < len(per.get(t, [])) for t in types):
+        for t in types:
+            b = per.get(t, [])
             if i < len(b) and len(out) < limit:
                 out.append(b[i])
         i += 1
