@@ -1,25 +1,30 @@
 """
-AI Analyst orchestrator — Azure OpenAI (gpt-4o) function-calling over the
-deterministic catalog. One tool-decision turn + one grounded-answer turn.
+Agentic AI-analyst orchestrator (Azure OpenAI / gpt-4o).
 
-Design goals vs. the reference backend (which generated SQL *and* Python plot code
-and exec'd it): NO code generation/execution, NO SQL DB, numbers always come from
-catalog.py. The model only (a) chooses a tool + params and (b) writes prose over the
-real rows. Charts are built deterministically from the tool's own suggestion.
+Flow — an autonomous SQL analyst that can answer ANYTHING the data supports:
+  1. GATHER (recursive): the model issues run_sql queries against the DuckDB
+     warehouse — as many as it needs, decomposing complex questions, refining after
+     seeing intermediate results (multi-step / recursive analytics).
+  2. PRESENT: it returns a grounded prose answer + a chart spec (deterministic build).
+  3. VERIFY: a strict auditor pass re-checks every figure in the answer against the
+     actual query results; on a flag, one correction pass runs. A "verified" badge
+     is emitted only when the auditor is satisfied.
 
-Secrets: the API key is read from AZURE_OPENAI_API_KEY (env / gitignored .env) and
-is NEVER hardcoded. Endpoint/version/deployment are non-secret and may default.
+No LLM-written Python is ever executed. SQL is governed (SELECT-only, capped,
+timed-out). Numbers fed back to the model are pre-formatted (₹Cr/L/%) so it never
+mis-converts units. The key is read from env — never hardcoded.
 """
 from __future__ import annotations
 import json
 import os
+import re
 
-from app.ai import catalog, charts
+from app.ai import warehouse, semantics, charts
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-_KEY = os.getenv("AZURE_OPENAI_API_KEY")  # required — no default
+MAX_SQL_STEPS = 6
 
 
 def has_key() -> bool:
@@ -34,201 +39,287 @@ def _client():
     return AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=key, api_version=AZURE_API_VERSION)
 
 
-SYSTEM = """You are the HCG Supply-Chain AI Analyst for a hospital-group analytics platform.
-You answer questions about REAL data using the provided tools — never invent numbers.
-
-Data you can reach (all real, last 6 months unless noted):
-• revenue — billed IP+OP pharmacy revenue & true margin (MRP−cost); by manufacturer, hospital, category, product, or month.
-• procurement — purchase spend by vendor/category/location/month, open purchase orders, price-consolidation savings.
-• inventory — stock value, days-of-cover (DOH), aging distribution, non-moving stock, health mix, expiry.
-• expiry — 6-band expiry ladder (Expired/0-30d/31-90d/91-180d/181-365d/365d+) and item lists per band.
-• stock_risk — replenishment / stock-out risk and reorder lists.
-• forecast — forward demand risk radar and fulfillment.
-• overview — one-shot portfolio headline numbers.
-
-Rules:
-1. ALWAYS call a tool when the question needs data. Pick the single best tool + params.
-2. After the tool returns, answer in 2–4 tight sentences. Lead with the number that answers the question.
-3. The tool result already gives figures PRE-FORMATTED in ₹Cr / ₹L / %. Quote them EXACTLY as shown — never recompute, rescale, or re-convert units yourself.
-4. Quote only figures present in the tool result. If a caveat/note is given, respect it.
-5. Be an analyst: add one crisp insight (a share, a concentration, a risk), not just the raw number.
-6. If the question is off-topic or not answerable from the data, say so briefly.
-Never mention tools, JSON, or internal mechanics to the user."""
+# ── number pre-formatting so the model can't mis-convert units ───────────────
+_INR = re.compile(r"(revenue|margin|value|cost|spend|price|amount|opportunity|overpay|mrp|purchase|sales|cr\b)", re.I)
+_PCT = re.compile(r"(pct|percent|share|rate|margin_pct|%)", re.I)
+_DAYS = re.compile(r"(doh|days|aging|lead|cover|tat)", re.I)
 
 
-TOOL_SCHEMAS = [
-    {"type": "function", "function": {
-        "name": "revenue",
-        "description": "Billed pharmacy revenue and true margin (MRP−cost). Use for sales/revenue/margin questions, top manufacturers, hospitals, products, categories, or revenue trend over months.",
-        "parameters": {"type": "object", "properties": {
-            "dimension": {"type": "string", "enum": ["manufacturer", "hospital", "category", "material", "month"], "description": "What to break revenue down by. 'material' = individual products."},
-            "metric": {"type": "string", "enum": ["revenue", "margin", "margin_pct", "qty"]},
-            "top_n": {"type": "integer", "description": "How many rows (default 10)."}}}}},
-    {"type": "function", "function": {
-        "name": "procurement",
-        "description": "Purchase/procurement analytics: vendor spend, spend by category/location/month, open purchase orders, or price-consolidation savings opportunity.",
-        "parameters": {"type": "object", "properties": {
-            "view": {"type": "string", "enum": ["vendors", "spend", "open_po", "savings"], "description": "'vendors'=top suppliers; 'spend'+dimension; 'open_po'=undelivered orders; 'savings'=overpay vs own median."},
-            "dimension": {"type": "string", "enum": ["vendor", "category", "location", "month"]},
-            "top_n": {"type": "integer"}}}}},
-    {"type": "function", "function": {
-        "name": "inventory",
-        "description": "Inventory analytics: stock value by category, days-of-cover (DOH), aging distribution, non-moving stock, health mix, or expiry.",
-        "parameters": {"type": "object", "properties": {
-            "view": {"type": "string", "enum": ["stock_value", "doh", "aging", "non_moving", "health", "expiry"]},
-            "top_n": {"type": "integer"}}}}},
-    {"type": "function", "function": {
-        "name": "expiry",
-        "description": "Near-expiry exposure. No slab → the full 6-band ladder by value. With a slab → the item list for that band.",
-        "parameters": {"type": "object", "properties": {
-            "slab": {"type": "string", "enum": ["Expired", "0-30d", "31-90d", "91-180d", "181-365d", "365d+"]},
-            "top_n": {"type": "integer"}}}}},
-    {"type": "function", "function": {
-        "name": "stock_risk",
-        "description": "Replenishment / stock-out risk. No status → risk-band summary. status='stock-out' or 'reorder' → items needing reorder.",
-        "parameters": {"type": "object", "properties": {
-            "status": {"type": "string", "enum": ["stock-out", "reorder", "overstock"]},
-            "top_n": {"type": "integer"}}}}},
-    {"type": "function", "function": {
-        "name": "forecast",
-        "description": "Forward-looking risk radar and fulfillment. view: demand (radar), fulfillment.",
-        "parameters": {"type": "object", "properties": {
-            "view": {"type": "string", "enum": ["demand", "fulfillment"]}}}}},
-    {"type": "function", "function": {
-        "name": "overview",
-        "description": "One-shot portfolio headline numbers (revenue, margin, stock value, purchase value, expiry). Use for 'how are we doing' / summary questions.",
-        "parameters": {"type": "object", "properties": {}}}},
-]
+def infer_kind(col: str) -> str:
+    c = col.lower()
+    if _PCT.search(c):
+        return "pct"
+    if _DAYS.search(c):
+        return "days"
+    if _INR.search(c):
+        return "inr"
+    return "num"
+
+
+def col_kind(col: str, rows: list) -> str:
+    """Kind from the actual data: text if the column holds strings, else name-inferred."""
+    vals = [r.get(col) for r in (rows or [])[:25]]
+    has_num = any(isinstance(v, (int, float)) for v in vals if v is not None)
+    has_str = any(isinstance(v, str) for v in vals if v is not None)
+    if has_str and not has_num:
+        return "text"
+    return infer_kind(col)
 
 
 def _fmt(v, kind):
-    """Pre-format numbers EXACTLY as they should appear, so the model never
-    recomputes ₹ units (LLMs are unreliable at crore/lakh conversion)."""
     if v is None or v == "":
-        return "—"
+        return None
     try:
         n = float(v)
     except (TypeError, ValueError):
-        return str(v)
+        return v
     if kind == "inr":
         a = abs(n)
         if a >= 1e7:
-            return f"₹{n / 1e7:.2f} Cr"
+            return f"₹{n/1e7:.2f} Cr"
         if a >= 1e5:
-            return f"₹{n / 1e5:.2f} L"
+            return f"₹{n/1e5:.2f} L"
         if a >= 1e3:
-            return f"₹{n / 1e3:.1f} K"
-        return f"₹{round(n)}"
+            return f"₹{n/1e3:.1f} K"
+        return f"₹{n:.0f}"
     if kind == "pct":
         return f"{n:.1f}%"
     if kind == "days":
-        return f"{round(n)} d"
-    if kind == "num":
+        return f"{n:,.0f} d"
+    if abs(n) >= 1000 or n == int(n):
         return f"{n:,.0f}"
-    return str(v)
+    return f"{n:,.2f}"
 
 
-def _compact(result: dict) -> dict:
-    """Trim + PRE-FORMAT a Result before feeding it back to the model (correct units,
-    low tokens). The model must echo these strings verbatim — never recompute."""
-    cols = result.get("columns", [])
-    kinds = {c["key"]: c.get("kind", "num") for c in cols}
-    rows_fmt = []
-    for r in result.get("rows", [])[:20]:
-        rows_fmt.append({c["label"]: _fmt(r.get(c["key"]), kinds.get(c["key"], "num")) for c in cols})
-    # stats: format inr-looking scalars to ₹Cr/L too (heuristic on key name + magnitude)
-    stats_fmt = {}
-    for k, v in (result.get("stats") or {}).items():
-        if isinstance(v, (int, float)):
-            kind = "inr" if any(t in k for t in ("value", "revenue", "margin", "spend", "cost", "opportunity", "180d")) and "pct" not in k else \
-                   "pct" if "pct" in k or "percent" in k else \
-                   "days" if "doh" in k or "days" in k else "num"
-            stats_fmt[k] = _fmt(v, kind)
-        else:
-            stats_fmt[k] = v
-    return {
-        "title": result.get("title"),
-        "stats": stats_fmt,
-        "note": result.get("note"),
-        "rows": rows_fmt,
-        "row_count": len(result.get("rows", [])),
-        "_instruction": "All figures above are already formatted (₹Cr/L, %). Quote them EXACTLY as shown — never recompute or rescale.",
-    }
+def _format_result(res: dict, limit: int = 30) -> dict:
+    cols = res["columns"]
+    kinds = {c: infer_kind(c) for c in cols}
+    rows = [{c: _fmt(r.get(c), kinds[c]) for c in cols} for r in res["rows"][:limit]]
+    return {"columns": cols, "rows": rows, "row_count": res["row_count"],
+            "truncated": res.get("truncated", False)}
+
+
+SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question about the data by writing DuckDB SQL against the warehouse below and reasoning over the REAL results. You never invent numbers.
+
+{context}
+
+HOW YOU WORK:
+• Call run_sql to fetch data. You may call it MULTIPLE times — decompose complex questions, run an exploratory query, then a precise one, join across tables freely (CTEs, window functions, subqueries all supported by DuckDB).
+• Prefer ONE well-formed query when possible; use several when the question is genuinely multi-part or you need to discover values first.
+• Every number in your final answer MUST come from a query result you actually ran.
+• When you have enough, call present() with a tight 2–5 sentence answer and the best chart. ALWAYS include a chart when the result is a ranking, breakdown, trend, or comparison (bar for rankings, line for time trends, donut for shares, heatmap for matrix, scatter for correlation). When two metrics are on very different scales (e.g. a ₹ amount and a percentage, or IP vs OP), use type "combo" with the smaller/percentage metric as y2 so both are readable. Only omit the chart for a single-number answer.
+• Money is already formatted (₹Cr/₹L) in results — quote those strings verbatim, never recompute units.
+• Be a sharp analyst: lead with the answer, add one real insight (a share, concentration, trend, or risk). Respect any caveats in the schema notes (e.g. manufacturer-of-purchases coverage).
+• If the data genuinely can't answer it, say so briefly in present()."""
+
+
+RUN_SQL_TOOL = {
+    "type": "function", "function": {
+        "name": "run_sql",
+        "description": "Run one read-only DuckDB SELECT/WITH query over the warehouse and get the rows back. Call repeatedly to build up an answer.",
+        "parameters": {"type": "object", "required": ["sql", "purpose"], "properties": {
+            "sql": {"type": "string", "description": "A single SELECT or WITH query. No semicolons, no DDL/DML."},
+            "purpose": {"type": "string", "description": "Short human phrase for what this query finds (shown to the user), e.g. 'expiring value by manufacturer'."}}}},
+}
+PRESENT_TOOL = {
+    "type": "function", "function": {
+        "name": "present",
+        "description": "Deliver the final answer + optional chart. Call this once you have the data.",
+        "parameters": {"type": "object", "required": ["answer"], "properties": {
+            "answer": {"type": "string", "description": "Final answer in concise markdown. Quote the pre-formatted figures exactly."},
+            "chart": {"type": ["object", "null"], "description": "Best visualization, or null if a chart adds nothing.", "properties": {
+                "type": {"type": "string", "enum": ["bar", "grouped_bar", "stacked_bar", "line", "area", "combo", "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "sunburst", "funnel", "waterfall", "histogram", "box", "indicator"]},
+                "x": {"type": "string", "description": "Result column for the category / x-axis / labels."},
+                "y": {"description": "Result column (or list of columns) for values.", "type": ["string", "array"], "items": {"type": "string"}},
+                "color": {"type": "string", "description": "Optional grouping column (scatter/heatmap/sunburst)."},
+                "size": {"type": "string", "description": "Optional bubble-size column."},
+                "y2": {"type": "string", "description": "Optional secondary-axis column for combo."},
+                "value_format": {"type": "string", "enum": ["inr", "pct", "num", "days"]},
+                "orientation": {"type": "string", "enum": ["v", "h"]},
+                "title": {"type": "string"}}}}}},
+}
+
+
+_MONTHISH = re.compile(r"(^\d{4}-\d{2}$)|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.I)
+
+
+def _auto_chart(res: dict) -> dict | None:
+    """When the model doesn't specify a chart, build a sensible one if the shape fits:
+    one label column + at least one numeric column, 2..40 rows."""
+    if not res or not res.get("rows") or not (2 <= res["row_count"] <= 40):
+        return None
+    cols = res["columns"]
+    rows = res["rows"]
+    numeric = [c for c in cols if all(isinstance(r.get(c), (int, float)) or r.get(c) is None for r in rows) and any(isinstance(r.get(c), (int, float)) for r in rows)]
+    if not numeric:
+        return None
+    label = next((c for c in cols if c not in numeric), cols[0])
+    ycol = numeric[0]
+    xs = [str(r.get(label)) for r in rows]
+    is_time = sum(1 for v in xs if _MONTHISH.search(v)) >= max(2, len(xs) // 2)
+    ctype = "line" if is_time else "bar"
+    return {"type": ctype, "x": label, "y": ycol, "value_format": infer_kind(ycol),
+            "title": f"{ycol.replace('_', ' ').title()} by {label.replace('_', ' ')}",
+            "orientation": "h" if (ctype == "bar" and len(rows) > 6) else "v"}
+
+
+def _pick_result(results, chart):
+    """Find the query result whose columns cover the chart's referenced columns (prefer most recent)."""
+    if not chart:
+        return None
+    needed = set()
+    for k in ("x", "color", "size", "y2"):
+        if chart.get(k):
+            needed.add(chart[k])
+    y = chart.get("y")
+    for c in (y if isinstance(y, list) else [y]):
+        if c:
+            needed.add(c)
+    for res in reversed(results):
+        if needed.issubset(set(res["columns"])):
+            return res
+    return results[-1] if results else None
+
+
+def _verify(client, query, results, answer):
+    """Strict auditor: does every figure in the answer match the query results?"""
+    payload = {"question": query, "answer": answer,
+               "queries": [{"sql": r["sql"], "result": _format_result(r, 15)} for r in results]}
+    try:
+        resp = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT, temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a strict data auditor. Given a question, the SQL query results, and a proposed answer, verify that EVERY number and claim in the answer is supported by the query results and actually answers the question. Reply ONLY JSON: {\"ok\": true|false, \"issue\": \"<empty if ok, else the specific problem>\"}."},
+                {"role": "user", "content": json.dumps(payload)[:12000]},
+            ])
+        out = json.loads(resp.choices[0].message.content or "{}")
+        return bool(out.get("ok", True)), str(out.get("issue", ""))
+    except Exception:
+        return True, ""  # never block on a verifier failure
 
 
 def answer(query: str, history: list | None = None):
-    """Generator of event dicts: step / token / answer / chart / table / done / error."""
+    """Generator of SSE event dicts: step / sql / answer / chart / table / verified / done / error."""
     if not has_key():
-        yield {"type": "error", "text": "The AI Analyst isn't configured yet — set AZURE_OPENAI_API_KEY on the server."}
+        yield {"type": "error", "text": "The AI Analyst isn't configured — set AZURE_OPENAI_API_KEY on the server."}
         return
     try:
         client = _client()
+        ctx = semantics.context()
     except Exception as e:
         yield {"type": "error", "text": f"AI service unavailable: {e}"}
         return
 
-    yield {"type": "step", "text": "Understanding your question"}
-    messages = [{"role": "system", "content": SYSTEM}]
+    messages = [{"role": "system", "content": SYSTEM.format(context=ctx)}]
     for h in (history or [])[-6:]:
         if h.get("role") in ("user", "assistant") and h.get("content"):
-            messages.append({"role": h["role"], "content": str(h["content"])[:2000]})
+            messages.append({"role": h["role"], "content": str(h["content"])[:1500]})
     messages.append({"role": "user", "content": query})
 
-    try:
-        first = client.chat.completions.create(
-            model=AZURE_DEPLOYMENT, messages=messages, tools=TOOL_SCHEMAS,
-            tool_choice="auto", temperature=0)
-    except Exception as e:
-        yield {"type": "error", "text": f"AI request failed: {e}"}
-        return
+    yield {"type": "step", "text": "Understanding your question"}
+    results: list[dict] = []
+    present_args = None
 
-    msg = first.choices[0].message
-    if not msg.tool_calls:
-        yield {"type": "answer", "text": msg.content or "I can help with revenue, inventory, procurement, expiry and forecast analytics — ask me anything about the numbers."}
+    for _ in range(MAX_SQL_STEPS):
+        try:
+            resp = client.chat.completions.create(
+                model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
+                tools=[RUN_SQL_TOOL, PRESENT_TOOL], tool_choice="auto")
+        except Exception as e:
+            yield {"type": "error", "text": f"AI request failed: {e}"}
+            return
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            if msg.content:
+                present_args = {"answer": msg.content, "chart": None}
+            break
+
+        messages.append({"role": "assistant", "content": msg.content or None,
+                         "tool_calls": [{"id": tc.id, "type": "function",
+                                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                                        for tc in msg.tool_calls]})
+        stop = False
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            if tc.function.name == "present":
+                present_args = args
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": "ok"})
+                stop = True
+                continue
+            # run_sql
+            purpose = args.get("purpose") or "querying the data"
+            sql = args.get("sql", "")
+            yield {"type": "step", "text": purpose[:80]}
+            try:
+                res = warehouse.run_sql(sql)
+                res["purpose"] = purpose
+                results.append(res)
+                yield {"type": "sql", "sql": res["sql"], "purpose": purpose, "rows": res["row_count"]}
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_result(res))})
+            except Exception as e:
+                yield {"type": "sql", "sql": sql, "purpose": purpose, "error": str(e)[:200]}
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:300]})})
+        if stop:
+            break
+
+    if not present_args:
+        yield {"type": "answer", "text": "I couldn't resolve that into a query — try rephrasing, or ask about revenue, inventory, procurement, expiry, or forecasts."}
         yield {"type": "done"}
         return
 
-    messages.append({"role": "assistant", "content": msg.content or None,
-                     "tool_calls": [{"id": tc.id, "type": "function",
-                                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                                    for tc in msg.tool_calls]})
-    primary = None
-    for tc in msg.tool_calls:
-        name = tc.function.name
-        try:
-            args = json.loads(tc.function.arguments or "{}")
-        except Exception:
-            args = {}
-        yield {"type": "step", "text": f"Querying {name.replace('_', ' ')}"}
-        res = catalog.run_tool(name, args)
-        if primary is None:
-            primary = res
-        messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_compact(res))})
+    ans = (present_args.get("answer") or "").strip()
+    chart_spec = present_args.get("chart") or None
 
-    yield {"type": "step", "text": "Composing the answer"}
-    full = ""
-    try:
-        stream = client.chat.completions.create(model=AZURE_DEPLOYMENT, messages=messages,
-                                                temperature=0.2, stream=True)
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                full += piece
-                yield {"type": "token", "text": piece}
-    except Exception as e:
-        yield {"type": "error", "text": f"Answer generation failed: {e}"}
-        return
-    yield {"type": "answer", "text": full}
+    # VERIFY (only when we actually queried data)
+    verified = None
+    if results and ans:
+        yield {"type": "step", "text": "Verifying the numbers"}
+        ok, issue = _verify(client, query, results, ans)
+        if not ok and issue:
+            # one correction pass
+            try:
+                fix = client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT, temperature=0,
+                    messages=[
+                        {"role": "system", "content": "Rewrite the answer to fix the auditor's issue, using ONLY the query results provided. Keep it concise. Reply with just the corrected answer text."},
+                        {"role": "user", "content": json.dumps({"question": query, "answer": ans, "issue": issue,
+                                                                 "queries": [{"sql": r["sql"], "result": _format_result(r, 15)} for r in results]})[:12000]},
+                    ])
+                ans = (fix.choices[0].message.content or ans).strip()
+                verified = "corrected"
+            except Exception:
+                verified = "flagged"
+        else:
+            verified = "ok"
 
-    if primary and primary.get("rows"):
-        chart = charts.build(primary)
-        if chart:
-            yield {"type": "chart", "plotly": chart, "title": primary.get("title", "")}
-        yield {"type": "table", "table": {"title": primary.get("title", ""),
-                                          "columns": primary.get("columns", []),
-                                          "rows": primary.get("rows", [])[:25]},
-               "note": primary.get("note", "")}
+    yield {"type": "answer", "text": ans, "verified": verified}
+
+    # CHART — use the model's spec, else auto-build one if the data is chartable
+    if not chart_spec and results:
+        chart_spec = _auto_chart(results[-1])
+    if chart_spec:
+        res = _pick_result(results, chart_spec)
+        if res and res["rows"]:
+            if not chart_spec.get("value_format") and chart_spec.get("y"):
+                yk = chart_spec["y"][0] if isinstance(chart_spec["y"], list) else chart_spec["y"]
+                chart_spec["value_format"] = infer_kind(str(yk))
+            fig = charts.build(res["rows"], chart_spec)
+            if fig:
+                yield {"type": "chart", "plotly": fig}
+            # a compact table of the charted data
+            yield {"type": "table", "table": {"title": chart_spec.get("title", ""),
+                                              "columns": [{"key": c, "label": c, "kind": col_kind(c, res["rows"])} for c in res["columns"]],
+                                              "rows": res["rows"][:25]},
+                   "note": ("Showing top 25 of %d rows." % res["row_count"]) if res.get("truncated") or res["row_count"] > 25 else ""}
+    elif results:
+        # no chart but we have data → still surface the final table
+        res = results[-1]
+        yield {"type": "table", "table": {"title": res.get("purpose", ""),
+                                          "columns": [{"key": c, "label": c, "kind": col_kind(c, res["rows"])} for c in res["columns"]],
+                                          "rows": res["rows"][:25]}, "note": ""}
+
     yield {"type": "done"}
