@@ -107,7 +107,7 @@ HOW YOU WORK — like a sharp, friendly human analyst:
 • UNDERSTAND the real intent first. If the request is genuinely ambiguous or under-specified (unclear time range, which metric/entity, or a term the data doesn't have), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
 • Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
 • Every number in your final answer MUST come from a query you actually ran.
-• When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s):
+• When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep the answer PROSE — 2–5 sentences with the key numbers woven in. NEVER paste a big markdown/pipe table into the answer text; the data table is shown separately below your answer.
    – ALWAYS chart a ranking, breakdown, trend, comparison or share.
    – If the user asks for "two charts", "different charts", "a pie and a bar", etc., or if two views genuinely illuminate the data, put MULTIPLE specs in `charts` (e.g. a ranking bar AND a share donut).
    – bar=rankings, line=time trend, donut=shares, combo (percentage on y2)=two different scales, heatmap=matrix, scatter/bubble=correlation, treemap/sunburst=hierarchy, waterfall=build-up.
@@ -132,8 +132,9 @@ _CHART_SPEC = {
         "y": {"description": "Result column (or list of columns) for values.", "type": ["string", "array"], "items": {"type": "string"}},
         "color": {"type": "string", "description": "Optional grouping column (scatter/heatmap/sunburst)."},
         "size": {"type": "string", "description": "Optional bubble-size column."},
-        "y2": {"type": "string", "description": "Optional secondary-axis column for combo."},
+        "y2": {"type": "string", "description": "Optional secondary-axis column for combo (put a % metric here alongside a ₹ metric)."},
         "value_format": {"type": "string", "enum": ["inr", "pct", "num", "days"]},
+        "y2_format": {"type": "string", "enum": ["inr", "pct", "num", "days"]},
         "orientation": {"type": "string", "enum": ["v", "h"]},
         "title": {"type": "string"}}}
 
@@ -161,7 +162,8 @@ _MONTHISH = re.compile(r"(^\d{4}-\d{2}$)|(jan|feb|mar|apr|may|jun|jul|aug|sep|oc
 
 def _auto_chart(res: dict) -> dict | None:
     """When the model doesn't specify a chart, build a sensible one if the shape fits:
-    one label column + at least one numeric column, 2..40 rows."""
+    one label column + at least one numeric column, 2..40 rows. If a ₹ value AND a
+    percentage co-occur, build a combo (bars + %-line on a secondary axis)."""
     if not res or not res.get("rows") or not (2 <= res["row_count"] <= 40):
         return None
     cols = res["columns"]
@@ -170,13 +172,40 @@ def _auto_chart(res: dict) -> dict | None:
     if not numeric:
         return None
     label = next((c for c in cols if c not in numeric), cols[0])
-    ycol = numeric[0]
     xs = [str(r.get(label)) for r in rows]
     is_time = sum(1 for v in xs if _MONTHISH.search(v)) >= max(2, len(xs) // 2)
+    inr_cols = [c for c in numeric if infer_kind(c) == "inr"]
+    pct_cols = [c for c in numeric if infer_kind(c) == "pct"]
+    # value + percentage → combo (the "revenue and margin %" case)
+    if inr_cols and pct_cols and not is_time and res["row_count"] <= 14:
+        return {"type": "combo", "x": label, "y": inr_cols[0], "y2": pct_cols[0],
+                "value_format": "inr", "y2_format": "pct",
+                "title": f"{inr_cols[0].replace('_', ' ').title()} & {pct_cols[0].replace('_', ' ').title()} by {label.replace('_', ' ')}"}
+    ycol = inr_cols[0] if inr_cols else numeric[0]
     ctype = "line" if is_time else "bar"
     return {"type": ctype, "x": label, "y": ycol, "value_format": infer_kind(ycol),
             "title": f"{ycol.replace('_', ' ').title()} by {label.replace('_', ' ')}",
             "orientation": "h" if (ctype == "bar" and len(rows) > 6) else "v"}
+
+
+def _enhance_spec(spec: dict, res: dict):
+    """Add depth: a single ₹ bar over a result that ALSO has a % column becomes a
+    combo (bars + %-line on y2) — so 'revenue and margin %' shows both, not just revenue."""
+    if spec.get("type") not in ("bar", "grouped_bar"):
+        return
+    y = spec.get("y")
+    ys = y if isinstance(y, list) else [y]
+    if len(ys) != 1 or infer_kind(str(ys[0])) != "inr":
+        return
+    if len(res.get("rows", [])) > 14:
+        return
+    pct_col = next((c for c in res["columns"] if c not in ys and infer_kind(c) == "pct"), None)
+    if pct_col:
+        spec["type"] = "combo"
+        spec["y"] = ys[0]
+        spec["y2"] = pct_col
+        spec["value_format"] = "inr"
+        spec["y2_format"] = "pct"
 
 
 def _pick_result(results, chart):
@@ -337,6 +366,7 @@ def answer(query: str, history: list | None = None):
         if not spec.get("value_format") and spec.get("y"):
             yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
             spec["value_format"] = infer_kind(str(yk))
+        _enhance_spec(spec, res)
         fig = charts.build(res["rows"], spec)
         if fig:
             yield {"type": "chart", "plotly": fig}
