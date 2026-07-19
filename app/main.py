@@ -23,3 +23,21 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+def _warm_caches() -> None:
+    """Precompute the heavy portfolio overviews in a background thread on boot, so the
+    first user request after a (free-tier) cold start is instant instead of paying the
+    one-time 255k-row parquet load. Daemon thread → never blocks startup / health."""
+    import threading
+
+    def _run() -> None:
+        try:
+            from app.api import legacy_kpi, kpi_generic
+            legacy_kpi.warmup()
+            kpi_generic.warmup()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True, name="cache-warmup").start()

@@ -9,11 +9,45 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 from typing import Optional
+from functools import lru_cache
 import os
 import numpy as np
 import pandas as pd
 
 from app.core import data_access as da
+
+# Portfolio-overview results are pure functions of the STATIC snapshot parquet, so the
+# output for a given plant never changes until the data is refreshed. We memoize the
+# whole computation per normalized plant — the first call warms it (and pulls the heavy
+# fact_grn/fact_po parquet), every later call is instant. refresh_cache() clears these.
+_RESULT_CACHES: list = []
+
+
+def _cache(fn):
+    cached = lru_cache(maxsize=64)(fn)
+    _RESULT_CACHES.append(cached)
+    return cached
+
+
+def clear_result_caches() -> None:
+    for c in _RESULT_CACHES:
+        c.cache_clear()
+
+
+def warmup() -> None:
+    """Precompute the default (All-Plants) portfolio overviews so the FIRST request
+    after a cold start hits a warm cache instead of loading fact_grn/fact_po live.
+    Names resolve at call time (the cached fns are defined below)."""
+    for fn_name, args in (
+        ("_procurement_overview_cached", (None,)),
+        ("_procurement_savings_cached", (None, 12)),
+        ("_consumption_overview_cached", (None,)),
+        ("_forecasting_overview_cached", (None,)),
+    ):
+        try:
+            globals()[fn_name](*args)
+        except Exception:
+            pass
 
 _KPI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "kpi")
 _MN = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
@@ -528,7 +562,11 @@ def inventory_aging_table(request: Request, Plant: str = Query(None)):
 # ---------------- PROCUREMENT OVERVIEW (portfolio dashboard) ----------------
 @router.get("/portfolio/procurement/overview")
 def procurement_overview(Plant: str = Query(None)):
-    pl = _plant(Plant)
+    return _procurement_overview_cached(_plant(Plant))
+
+
+@_cache
+def _procurement_overview_cached(pl):
     pv = da.filter_plant(da.load("kpi_purchase_value"), pl)
     vv = da.filter_plant(da.load("kpi_vendor_volume"), pl)
     ct = da.filter_plant(da.load("kpi_cycle_time"), pl)
@@ -622,9 +660,14 @@ def procurement_savings(Plant: str = Query(None), limit: int = Query(12)):
     consistent unit (max/min <= 2.5x, so we don't compare mixed pack sizes), sum the
     spend ABOVE that item's own median achieved price. Conservative negotiation
     headroom — an honest 'you paid above your own median' figure, not a guaranteed saving."""
+    return _procurement_savings_cached(_plant(Plant), limit)
+
+
+@_cache
+def _procurement_savings_cached(pl, limit):
     empty = {"totals": {"opportunity": 0.0, "items_flagged": 0, "spend_base": 0.0}, "items": []}
     try:
-        g = da.filter_plant(da.load("fact_grn"), _plant(Plant))
+        g = da.filter_plant(da.load("fact_grn"), pl)
         d = g[(g["net_price"] > 0) & (g["gr_qty"] > 0)][["material", "material_desc", "net_price", "gr_qty", "major_group"]].copy()
         if d.empty:
             return empty
@@ -978,7 +1021,11 @@ def _chrono_months(df):
 
 @router.get("/portfolio/consumption/overview")
 def consumption_overview(Plant: str = Query(None)):
-    pl = _plant(Plant)
+    return _consumption_overview_cached(_plant(Plant))
+
+
+@_cache
+def _consumption_overview_cached(pl):
     uc = da.filter_plant(da.load("kpi_units_consumed"), pl).copy()
     dp = da.filter_plant(da.load("kpi_consumption_by_department"), pl).copy()
     cost = float(uc["consumption_cost"].sum()); units = float(uc["total_units"].sum())
@@ -1061,7 +1108,11 @@ def dept_insights(Plant: str = Query(None)):
 # ================= FORECASTING portfolio overview (D1–D8) =================
 @router.get("/portfolio/forecasting/overview")
 def forecasting_overview(Plant: str = Query(None)):
-    pl = _plant(Plant)
+    return _forecasting_overview_cached(_plant(Plant))
+
+
+@_cache
+def _forecasting_overview_cached(pl):
     fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
     rp = da.filter_plant(da.load("stock_replenishment_and_aging_risk"), pl).copy()
     rd = da.filter_plant(da.load("kpi_stock_radar"), pl).copy()

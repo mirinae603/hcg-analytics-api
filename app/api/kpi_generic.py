@@ -59,6 +59,34 @@ def _resolve(key: str) -> str:
     return REGISTRY[key][0]
 
 
+# Static-snapshot chart/summary results are pure functions of their args → memoize so
+# every KPI detail page is instant after the first hit. Table pagination stays uncached
+# (its search/sort/filter params vary too widely to cache usefully).
+_KPI_RESULT_CACHES: list = []
+
+
+def _kc(fn):
+    cached = lru_cache(maxsize=256)(fn)
+    _KPI_RESULT_CACHES.append(cached)
+    return cached
+
+
+def clear_kpi_caches() -> None:
+    for c in _KPI_RESULT_CACHES:
+        c.cache_clear()
+
+
+@_kc
+def _kpi_chart_cached(table, plant, material, material_group, group_by, measures, top):
+    return da.chart_series(table, plant=plant, material=material, material_group=material_group,
+                           group_by=group_by, measures=measures, top=top)
+
+
+@_kc
+def _kpi_summary_cached(table, plant, material, material_group):
+    return da.summarize(table, plant=plant, material=material, material_group=material_group)
+
+
 @router.get("/kpi/{key}")
 def kpi_chart(
     key: str,
@@ -69,9 +97,7 @@ def kpi_chart(
     measures: Optional[str] = Query(None, description="comma numeric cols to sum"),
     top: Optional[int] = Query(None, description="keep top-N rows by first measure"),
 ):
-    table = _resolve(key)
-    return da.chart_series(table, plant=plant, material=material, material_group=material_group,
-                           group_by=group_by, measures=measures, top=top)
+    return _kpi_chart_cached(_resolve(key), plant, material, material_group, group_by, measures, top)
 
 
 @router.get("/kpi/{key}/summary")
@@ -81,8 +107,7 @@ def kpi_summary(
     material: Optional[str] = Query(None, alias="Material"),
     material_group: Optional[str] = Query(None, alias="MaterialGroup"),
 ):
-    table = _resolve(key)
-    return da.summarize(table, plant=plant, material=material, material_group=material_group)
+    return _kpi_summary_cached(_resolve(key), plant, material, material_group)
 
 
 @router.get("/kpi/{key}/table")
@@ -110,14 +135,24 @@ PORTFOLIOS = {
 
 @router.get("/portfolio/{name}/summary")
 def portfolio_summary(name: str, plant: Optional[str] = Query(None, alias="Plant")):
-    keys = PORTFOLIOS.get(name)
-    if not keys:
+    if name not in PORTFOLIOS:
         raise HTTPException(status_code=404, detail=f"Unknown portfolio '{name}'")
-    out = {}
-    for k in keys:
-        table = REGISTRY[k][0]
-        out[k] = da.summarize(table, plant=da.resolve_plant(plant))
-    return out
+    return _portfolio_summary_cached(name, da.resolve_plant(plant))
+
+
+# Static snapshot → the summary for (portfolio, plant) never changes until refresh.
+@lru_cache(maxsize=64)
+def _portfolio_summary_cached(name: str, plant: Optional[str]):
+    return {k: da.summarize(REGISTRY[k][0], plant=plant) for k in PORTFOLIOS[name]}
+
+
+def warmup() -> None:
+    """Precompute every portfolio's All-Plants summary at startup."""
+    for name in PORTFOLIOS:
+        try:
+            _portfolio_summary_cached(name, None)
+        except Exception:
+            pass
 
 
 @router.get("/meta/kpis")

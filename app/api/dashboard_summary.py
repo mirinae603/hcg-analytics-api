@@ -100,4 +100,13 @@ def refresh_data(x_admin_token: Optional[str] = Header(None)):
     if x_admin_token != settings.ADMIN_REFRESH_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
     da.refresh_cache()
+    # Also drop the memoized portfolio-overview / summary results so they recompute
+    # against the refreshed data (otherwise they'd serve the previous snapshot).
+    try:
+        from app.api import legacy_kpi, kpi_generic
+        legacy_kpi.clear_result_caches()
+        kpi_generic._portfolio_summary_cached.cache_clear()
+        kpi_generic.clear_kpi_caches()
+    except Exception:
+        pass
     return {"status": "cache cleared"}
