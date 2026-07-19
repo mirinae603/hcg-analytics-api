@@ -253,6 +253,61 @@ def schema_text() -> str:
     return "\n".join(lines)
 
 
+# ── Auto-derived dimensional model (grain) ───────────────────────────────────
+# Every column is mechanically classified as a TIME axis, a DIMENSION (something you
+# can group/filter by), or a MEASURE (a number you aggregate). The agent is then told
+# exactly what each table can be sliced by — so it can't attribute a table's numbers to
+# a dimension the table doesn't carry, or invent a time trend a table doesn't have.
+_TIME_RE = re.compile(r"(^month$|^month_num$|^year$|^week$|^quarter$|_date$|^date$|snapshot|posting|^period$)", re.I)
+_ID_RE = re.compile(r"(^material$|^material_id$|^plant$|^sloc$|^hsn$|^batch$|vendor_code|vendor_name|cost_ctr|^hospital$|^manufacturer$|manufacturer_desc|^patient$|po_no|gr_no|^generic_name$|_code$|_id$|_no$)", re.I)
+_MEASURE_RE = re.compile(r"(revenue|cost|value|price|amount|margin|mrp|spend|overpay|opportunity|"
+                         r"qty|quantity|units|unit_|count|lines|sku_count|"
+                         r"pct|percent|share|rate|score|ratio|"
+                         r"days|doh|aging|lead|tat|cover|coverage|"
+                         r"stock|closing|demand|forecast|replenish|turnover|fulfil|fill|consumption|cashflow)", re.I)
+
+
+def _classify_col(name: str, dtype: str) -> str:
+    n = name.lower()
+    short = _short_type(dtype)
+    if _TIME_RE.search(n):
+        return "time"
+    if short in ("date",):
+        return "time"
+    if short == "text":
+        return "dim"          # any label / code / name
+    if _ID_RE.search(n):
+        return "dim"          # numeric identifier
+    if _MEASURE_RE.search(n):
+        return "measure"
+    return "measure"          # unknown numeric → treat as a measure
+
+
+def grain_text() -> str:
+    """One line per table describing its GRAIN: which dimensions it can be sliced by
+    and whether it has a time axis. Derived purely from column names/types — general,
+    no hand-coded per-table rules."""
+    c = con()
+    lines = []
+    for name in tables():
+        try:
+            info = c.execute(f"DESCRIBE {name}").fetchall()
+        except Exception:
+            continue
+        dims, times = [], []
+        for r in info:
+            col, dtype = r[0], r[1]
+            k = _classify_col(col, dtype)
+            if k == "time":
+                times.append(col)
+            elif k == "dim":
+                dims.append(col)
+        slice_by = ", ".join(dims) if dims else "— (single total row / no dimensions)"
+        tpart = ", ".join(times) if times else "NONE — this is a fixed total, it has NO time axis"
+        lines.append(f"{name}: slice by [{slice_by}] · time axis [{tpart}]")
+    return "\n".join(lines)
+
+
 def _material_col(cols: list[str]) -> str | None:
     low = {c.lower(): c for c in cols}
     for cand in ("material", "material_id"):

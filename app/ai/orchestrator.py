@@ -24,7 +24,8 @@ from app.ai import warehouse, semantics, charts
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-MAX_SQL_STEPS = 8
+MAX_SQL_STEPS = 9
+MAX_AUDIT_RETRIES = 2   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
 
 
 def has_key() -> bool:
@@ -43,10 +44,13 @@ def _client():
 _INR = re.compile(r"(revenue|margin|value|cost|spend|price|amount|opportunity|overpay|mrp|purchase|sales|cr\b)", re.I)
 _PCT = re.compile(r"(pct|percent|share|rate|margin_pct|%)", re.I)
 _DAYS = re.compile(r"(doh|days|aging|lead|cover|tat)", re.I)
+_YEAR = re.compile(r"^(year|yr|fiscal_year|fy)$", re.I)   # a calendar year is a label, not a quantity
 
 
 def infer_kind(col: str) -> str:
     c = col.lower()
+    if _YEAR.search(c):
+        return "year"
     if _PCT.search(c):
         return "pct"
     if _DAYS.search(c):
@@ -71,6 +75,11 @@ def _fmt(v, kind):
         return None
     if kind == "text":
         return v   # codes / ids / names — never coerce to a number
+    if kind == "year":
+        try:
+            return str(int(float(v)))   # 2025 — no thousands separator, no ₹
+        except (TypeError, ValueError):
+            return str(v)
     try:
         n = float(v)
     except (TypeError, ValueError):
@@ -108,8 +117,10 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 {context}
 
 HOW YOU WORK — like a sharp, friendly human analyst:
-• UNDERSTAND the real intent first. If the request is genuinely ambiguous or under-specified (unclear time range, which metric/entity, or a term the data doesn't have), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
+• UNDERSTAND the real intent first. If the request is ANSWERABLE from the data but genuinely ambiguous or under-specified (unclear time range, which metric/entity), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
+• OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts). If asked for something the data simply doesn't contain — people/roles (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
 • SPECIFIC ITEM? For ANY question about a particular product/SKU (named or by code), call lookup_item FIRST. It returns the item's identity (generic, group, manufacturer, formulary status) and a COMPLETE footprint — the row count in EVERY table it touches (sales, PO, GRN, consumption, inventory, forecasts). This guarantees you never miss a source: an item with 0 sales/purchases but rows in fact_inventory is DEAD / NON-MOVING stock (report qty, aging, expiry, formulary) — never call that "no data". Then run_sql only the tables the footprint shows have rows.
+• BEFORE you write a query, check the DIMENSIONAL MODEL above for the table you're about to use: you may only GROUP BY / filter on a dimension in its "slice by" list, and may only show a time trend if its "time axis" isn't NONE. If the cut the user wants (a dimension × a time axis, or two dimensions) doesn't exist together in any one table, that exact breakdown is NOT available — give the closest correct cut and say so. Never take a broader table's numbers and label them as a narrower entity/period.
 • Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
 • Every number in your final answer MUST come from a query you actually ran.
 • When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep it TIGHT — 2–4 sentences: the headline number(s) + the one insight that matters. Do NOT enumerate long lists item-by-item in the prose (the chart AND the data table below already show every row) — mention the top 1–2 and summarise the rest. No filler sign-offs like "let me know if you'd like…". NEVER paste a markdown/pipe table into the answer text.
@@ -246,22 +257,41 @@ def _pick_result(results, chart):
     return results[-1] if results else None
 
 
+_AUDITOR_SYS = """You are a STRICT data auditor for a hospital supply-chain analyst. You get the user's question, the exact SQL queries that ran (with their results and stated purpose), and a proposed answer. Catch answers that are WRONG or MISLEADING before they reach the user. Judge whether each number is correct FOR WHAT IT IS LABELLED AS — not whether it is the user's first-choice metric.
+
+FAIL the answer (ok=false) if ANY of these hold:
+1. NUMBER MISMATCH — a figure in the answer is not supported by the query results.
+2. WRONG SCOPE — the answer attributes a figure to a specific entity (item/brand/category/hospital/vendor/department/plant), but the SQL that produced it did NOT GROUP BY or filter to that entity (e.g. it is actually a company-wide or different-entity total presented as that entity's). This is the most important check.
+3. MISLABELLED METRIC/SOURCE — a number is presented as something it is NOT, in a way that changes its meaning: e.g. purchase or consumption figures called "sales" (or vice-versa); an aggregate over the wrong grain (a broader table's total shown as a narrower breakdown); a grand total taken from a table that only partially covers it; a MEAN value reported when the rule requires a MEDIAN. (NOT a defect: calling a correctly-computed MEDIAN "average" or "typical" in prose — the value is the right median, the word choice is colloquial. Only fail if the actual NUMBER is a mean when it should be a median.)
+4. UNSUPPORTED CLAIM — a trend/insight/comparison the results don't actually show.
+5. DODGES — answers a different question than asked with no explanation.
+
+PASS (ok=true) when the numbers are SUPPORTED, correctly SCOPED, and correctly LABELLED for what they claim to be. Only fail for a DEFECT THAT MAKES A NUMBER WRONG OR MISLEADING (categories 1–5). Do NOT fail an otherwise-correct answer for any of these — they are all PASS:
+  • wording/tone/brevity/rounding; describing a correctly-computed median or typical value as "on average" / "typically";
+  • a missing caveat or context (e.g. not noting that top items are non-clinical) — desirable, but its absence is not an error;
+  • being incomplete but correct (top N instead of all; one lens of several);
+  • an HONEST "this exact breakdown/metric/granularity isn't available" that offers the closest correct, clearly-labelled alternative (e.g. "monthly sales isn't available at item level; here are the item's monthly purchases").
+When unsure whether it's a real defect or just imperfect phrasing, PASS. Reserve ok=false for numbers that are actually wrong, mis-scoped, or mislabelled in a way that changes their meaning.
+
+Reply ONLY JSON: {"ok": true|false, "issue": "<empty if ok; else the SPECIFIC defect that makes a number wrong/misleading>", "fix": "<empty if ok; else a concrete instruction: which table/filter/metric/grain to use instead>"}."""
+
+
 def _verify(client, query, results, answer):
-    """Strict auditor: does every figure in the answer match the query results?"""
+    """Strict auditor: numbers supported AND correctly scoped/sourced. Returns (ok, issue, fix)."""
     payload = {"question": query, "answer": answer,
-               "queries": [{"sql": r["sql"], "result": _format_result(r, 15)} for r in results]}
+               "queries": [{"sql": r["sql"], "purpose": r.get("purpose"), "result": _format_result(r, 15)} for r in results]}
     try:
         resp = client.chat.completions.create(
             model=AZURE_DEPLOYMENT, temperature=0,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "You are a strict data auditor. Given a question, the SQL query results, and a proposed answer, verify that EVERY number and claim in the answer is supported by the query results and actually answers the question. Reply ONLY JSON: {\"ok\": true|false, \"issue\": \"<empty if ok, else the specific problem>\"}."},
-                {"role": "user", "content": json.dumps(payload)[:12000]},
+                {"role": "system", "content": _AUDITOR_SYS},
+                {"role": "user", "content": json.dumps(payload)[:14000]},
             ])
         out = json.loads(resp.choices[0].message.content or "{}")
-        return bool(out.get("ok", True)), str(out.get("issue", ""))
+        return bool(out.get("ok", True)), str(out.get("issue", "")), str(out.get("fix", ""))
     except Exception:
-        return True, ""  # never block on a verifier failure
+        return True, "", ""  # never block on a verifier failure
 
 
 def answer(query: str, history: list | None = None):
@@ -285,6 +315,8 @@ def answer(query: str, history: list | None = None):
     yield {"type": "step", "text": "Understanding your question"}
     results: list[dict] = []
     present_args = None
+    verified = None
+    present_attempts = 0
 
     for _ in range(MAX_SQL_STEPS):
         try:
@@ -304,7 +336,7 @@ def answer(query: str, history: list | None = None):
                          "tool_calls": [{"id": tc.id, "type": "function",
                                          "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                                         for tc in msg.tool_calls]})
-        stop = False
+        pending_present = None   # collected during the batch, verified AFTER all calls are acked
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
@@ -316,16 +348,14 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "done"}
                 return
             if tc.function.name == "present":
-                present_args = args
+                pending_present = args
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "ok"})
-                stop = True
                 continue
             if tc.function.name == "lookup_item":
                 name = (args.get("name") or "").strip()
                 yield {"type": "step", "text": f"Locating “{name}” across all tables"}
                 try:
                     fp = warehouse.item_footprint(name)
-                    hit = ", ".join(fp["tables_with_data"][:6]) or "no tables"
                     yield {"type": "sql", "purpose": f"footprint of “{name}”", "sql": f"-- lookup_item('{name}')", "rows": fp["match_count"]}
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(fp)[:5000]})
                 except Exception as e:
@@ -347,8 +377,29 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "step", "text": "Refining the query"}
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
-        if stop:
-            break
+
+        # All tool calls in this batch are now acked. If the model asked to present,
+        # AUDIT it before accepting — and on a real problem, send it back to re-query.
+        if pending_present is not None:
+            cand_ans = (pending_present.get("answer") or "").strip()
+            ok, issue, fix = True, "", ""
+            if results and cand_ans:
+                yield {"type": "step", "text": "Cross-checking the answer against the data"}
+                ok, issue, fix = _verify(client, query, results, cand_ans)
+            if ok or present_attempts >= MAX_AUDIT_RETRIES:
+                present_args = pending_present
+                verified = ("corrected" if present_attempts > 0 else "ok") if (results and cand_ans) else None
+                if not ok:
+                    verified = "flagged"   # auditor still unhappy after retries → no green badge
+                break
+            # audit failed and we have a retry left → feed the problem back, let it fix
+            present_attempts += 1
+            yield {"type": "step", "text": "Correcting the analysis"}
+            messages.append({"role": "user", "content":
+                "AUDIT FAILED — your last answer was not accepted, do NOT repeat it. Problem: "
+                + (issue or "the answer was not correctly supported/scoped.")
+                + (" Fix: " + fix if fix else "")
+                + " Re-run the correct query (right table, filtered to the exact entity/scope the user asked about, right metric) and call present again with corrected numbers. If the data genuinely cannot answer it, say so honestly instead."})
 
     if not present_args:
         yield {"type": "answer", "text": "I couldn't resolve that into a query — try rephrasing, or ask about revenue, inventory, procurement, expiry, or forecasts."}
@@ -362,27 +413,12 @@ def answer(query: str, history: list | None = None):
         chart_specs = [single] if single else []
     chart_specs = [c for c in chart_specs if c]
 
-    # VERIFY (only when we actually queried data)
-    verified = None
-    if results and ans:
-        yield {"type": "step", "text": "Verifying the numbers"}
-        ok, issue = _verify(client, query, results, ans)
-        if not ok and issue:
-            # one correction pass
-            try:
-                fix = client.chat.completions.create(
-                    model=AZURE_DEPLOYMENT, temperature=0,
-                    messages=[
-                        {"role": "system", "content": "Rewrite the answer to fix the auditor's issue, using ONLY the query results provided. Keep it concise. Reply with just the corrected answer text."},
-                        {"role": "user", "content": json.dumps({"question": query, "answer": ans, "issue": issue,
-                                                                 "queries": [{"sql": r["sql"], "result": _format_result(r, 15)} for r in results]})[:12000]},
-                    ])
-                ans = (fix.choices[0].message.content or ans).strip()
-                verified = "corrected"
-            except Exception:
-                verified = "flagged"
-        else:
-            verified = "ok"
+    # If the answer came back as plain content (model didn't call present), it was never
+    # audited inline — audit it now so EVERY data-backed answer gets the same gate.
+    if verified is None and results and ans:
+        yield {"type": "step", "text": "Cross-checking the answer against the data"}
+        ok, _issue, _fix = _verify(client, query, results, ans)
+        verified = "ok" if ok else "flagged"
 
     yield {"type": "answer", "text": ans, "verified": verified}
 
