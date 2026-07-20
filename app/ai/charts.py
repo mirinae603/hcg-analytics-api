@@ -11,6 +11,7 @@ Quality rules baked in:
 """
 from __future__ import annotations
 import math
+import re
 
 PALETTE = ["#3b5bdb", "#12b886", "#e0992f", "#e8604a", "#7048e8", "#0ea5e9",
            "#0ca678", "#d9663e", "#748ffc", "#f06595", "#22b8cf", "#82c91e"]
@@ -73,6 +74,27 @@ def _label(v, kind):
     return f"{v:,.0f}"
 
 
+_CAT_MAXLEN = 34  # display cap for a category-axis label (full text still shown on hover)
+
+
+def _truncate_label(s, maxlen: int = _CAT_MAXLEN) -> str:
+    s = "" if s is None else str(s)
+    return s if len(s) <= maxlen else s[: maxlen - 1].rstrip() + "…"
+
+
+def _hbar_geometry(labels: list[str]) -> tuple[int, int]:
+    """Horizontal bar charts size their own plot height from row count, and their
+    left margin from label width — a FIXED height/margin (the old behaviour) breaks
+    down once there are many rows and/or long labels: Plotly's automargin can't
+    converge and the category axis renders unreadable/garbled. Sizing this from the
+    actual data makes every horizontal bar chart safe regardless of row count."""
+    n = max(len(labels), 1)
+    height = int(min(760, max(320, 54 + n * 36)))
+    maxlen = max((len(_truncate_label(l)) for l in labels), default=0)
+    margin_l = int(min(280, max(70, 20 + maxlen * 6.6)))
+    return height, margin_l
+
+
 def _value_axis(vals, kind, title=None):
     nums = [abs(v) for v in vals if v is not None]
     m = max(nums) if nums else 1.0
@@ -114,9 +136,102 @@ def _base_layout(title):
     }
 
 
+# A code/id column should never BE the chart — it's for joins, not display. Two
+# defenses, since the agent may alias its readable column to anything (material_desc,
+# item, name, …) — a fixed name map alone isn't enough:
+#  1. known code names (by NAME) swap straight to their conventional sibling if present.
+#  2. DATA-DRIVEN fallback: if a field's actual values are ALL bare numeric-looking
+#     codes (e.g. material '928036') and one other, unused row column holds real text,
+#     use that instead — this catches the swap regardless of what the model aliased
+#     the readable column to. This is what stops a code from becoming a garbled
+#     numeric axis instead of the item's name.
+_CODE_TO_DESC = {"material": "material_desc", "material_id": "material_desc",
+                 "vendor_code": "vendor_name", "plant": "plant_name"}
+_ID_NAME_RE = re.compile(r"(^material(_id)?$|_code$|_id$|^plant$|^cost_ctr$)", re.I)
+
+
+def _looks_like_bare_code(vals) -> bool:
+    """True if every non-null value is a pure numeric-looking string/number —
+    i.e. an identifier, not a human label (a real name always has letters)."""
+    seen = False
+    for v in vals:
+        if v is None or v == "":
+            continue
+        seen = True
+        s = str(v)
+        if not s.replace(".", "", 1).replace("-", "", 1).isdigit():
+            return False
+    return seen
+
+
+def _find_text_sibling(field, rows, used: set) -> str | None:
+    """A column, other than `field` and anything already claimed by the spec, whose
+    values are genuine text (contain letters) rather than bare numeric codes."""
+    if not rows:
+        return None
+    for col in rows[0].keys():
+        if col == field or col in used:
+            continue
+        sample = [r.get(col) for r in rows[:20]]
+        if any(v is not None and v != "" for v in sample) and not _looks_like_bare_code(sample):
+            return col
+    return None
+
+
+def _prefer_desc(field, rows, used: set, is_label: bool) -> str:
+    """is_label: True for encodings that are ALWAYS a category/label (x, color) —
+    only those may be data-driven-detected as 'this looks like a bare code'. A y/size
+    value is a MEASURE by definition and is expected to look numeric — applying the
+    bare-code heuristic there would misfire on any large numeric measure (e.g. a
+    price-impact figure like 28900000.0 also reads as 'all digits') and swap the real
+    value column for a text one, breaking every bar. Only the exact name map
+    (_CODE_TO_DESC) is safe to apply regardless of position."""
+    if not field:
+        return field
+    sib = _CODE_TO_DESC.get(field)
+    if sib and rows and sib in rows[0]:
+        return sib
+    if not is_label:
+        return field
+    is_idish = _ID_NAME_RE.search(field) is not None
+    if (is_idish or _looks_like_bare_code([r.get(field) for r in rows[:20]])) and rows:
+        alt = _find_text_sibling(field, rows, used)
+        if alt:
+            return alt
+    return field
+
+
+# Chart types whose x-axis is a CATEGORY/label (safe for the data-driven bare-code
+# check). Anything else (scatter/bubble/histogram/box) treats x as a genuine
+# continuous measure — the same numbers-are-fine rule as y.
+_X_IS_LABEL_TYPES = {"bar", "line", "area", "combo", "pie", "donut", "treemap",
+                     "sunburst", "funnel", "waterfall"}
+
+
+def _normalize_spec(spec: dict, rows: list[dict]) -> dict:
+    """Rewrite spec IN PLACE (a copy) so every sub-builder — whether it reads
+    individual x/y/color/size args or the whole spec dict (scatter/heatmap/sunburst/
+    indicator all do) — sees a code column swapped for its readable sibling."""
+    out = dict(spec)
+    t = (out.get("type") or "bar").lower().strip()
+    x_is_label = t in _X_IS_LABEL_TYPES
+    used = {c for c in (out.get("y") if isinstance(out.get("y"), list) else [out.get("y")]) if c}
+    used |= {out.get(k) for k in ("color", "size") if out.get(k)}
+    for k, is_label in (("x", x_is_label), ("color", True), ("size", False)):
+        if out.get(k):
+            out[k] = _prefer_desc(out[k], rows, used - {out[k]}, is_label)
+    y = out.get("y")
+    if isinstance(y, list):
+        out["y"] = [_prefer_desc(c, rows, used - {c}, False) for c in y]
+    elif y:
+        out["y"] = _prefer_desc(y, rows, used - {y}, False)
+    return out
+
+
 def build(rows: list[dict], spec: dict) -> dict | None:
     if not rows or not spec:
         return None
+    spec = _normalize_spec(spec, rows)
     t = (spec.get("type") or "bar").lower().strip()
     title = spec.get("title") or ""
     kind = (spec.get("value_format") or "num").lower()
@@ -159,7 +274,10 @@ def build(rows: list[dict], spec: dict) -> dict | None:
 
 
 def _bar(rows, x, ys, title, kind, horizontal, stack):
-    xs = _rows_get(rows, x)
+    xs_full = _rows_get(rows, x)
+    # Category labels are truncated for the AXIS (long labels break Plotly's automargin
+    # on a horizontal bar — see _hbar_geometry) but the full name always shows on hover.
+    xs = [_truncate_label(v) if horizontal else v for v in xs_full]
     allvals = []
     data = []
     single = len(ys) == 1
@@ -170,12 +288,13 @@ def _bar(rows, x, ys, title, kind, horizontal, stack):
         trace = {
             "type": "bar", "name": yc, "orientation": "h" if horizontal else "v",
             "marker": {"color": PALETTE[i % len(PALETTE)], "line": {"width": 0}, "cornerradius": 7},
-            "customdata": labels,
+            "customdata": list(zip(labels, xs_full)) if horizontal else labels,
             "text": labels if single else None,
             "textposition": "outside" if single else "none",
             "textfont": {"size": 10.5, "color": INK, "family": FONT},
             "cliponaxis": False,
-            "hovertemplate": (f"%{{y}}<br><b>%{{customdata}}</b><extra>{yc}</extra>" if horizontal else f"%{{x}}<br><b>%{{customdata}}</b><extra>{yc}</extra>"),
+            "hovertemplate": (f"%{{customdata[1]}}<br><b>%{{customdata[0]}}</b><extra>{yc}</extra>" if horizontal
+                               else f"%{{x}}<br><b>%{{customdata}}</b><extra>{yc}</extra>"),
         }
         if horizontal:
             trace["x"] = vals; trace["y"] = xs
@@ -188,6 +307,10 @@ def _bar(rows, x, ys, title, kind, horizontal, stack):
     if horizontal:
         lay["xaxis"] = {**lay["xaxis"], **vax, "gridcolor": GRID}
         lay["yaxis"]["autorange"] = "reversed"
+        lay["yaxis"]["type"] = "category"   # never let Plotly infer/guess the axis type
+        height, margin_l = _hbar_geometry(xs)
+        lay["height"] = height
+        lay["margin"]["l"] = margin_l
     else:
         lay["yaxis"] = {**lay["yaxis"], **vax}
     if len(ys) > 1:

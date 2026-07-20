@@ -92,6 +92,8 @@ def _fmt(v, kind):
             return f"₹{n/1e5:.2f} L"
         if a >= 1e3:
             return f"₹{n/1e3:.1f} K"
+        if 0 < a < 1:
+            return f"₹{n:.2f}"   # a nonzero paisa-level value must never round to "₹0" — indistinguishable from a true zero
         return f"₹{n:.0f}"
     if kind == "pct":
         return f"{n:.1f}%"
@@ -123,13 +125,14 @@ HOW YOU WORK — like a sharp, friendly human analyst:
 • BEFORE you write a query, check the DIMENSIONAL MODEL above for the table you're about to use: you may only GROUP BY / filter on a dimension in its "slice by" list, and may only show a time trend if its "time axis" isn't NONE. If the cut the user wants (a dimension × a time axis, or two dimensions) doesn't exist together in any one table, that exact breakdown is NOT available — give the closest correct cut and say so. Never take a broader table's numbers and label them as a narrower entity/period.
 • Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
 • Every number in your final answer MUST come from a query you actually ran.
+• SCOPE YOUR CLAIMS TO WHAT YOU ACTUALLY QUERIED — never generalize a narrow or empty result into a broader absolute statement. If a filter applied to one specific list/subset returns nothing, say exactly that ("none of these particular items are X"), never the broader, unverified claim ("there are no X in the dataset") — the broader claim requires its OWN query against the full data, not an inference from a narrower one. Getting this wrong means confidently contradicting yourself the moment the user asks the broader question directly next.
 • When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep it TIGHT — 2–4 sentences: the headline number(s) + the one insight that matters. Do NOT enumerate long lists item-by-item in the prose (the chart AND the data table below already show every row) — mention the top 1–2 and summarise the rest. No filler sign-offs like "let me know if you'd like…". NEVER paste a markdown/pipe table into the answer text.
    – ALWAYS chart a ranking, breakdown, trend, comparison or share.
    – If the user asks for "two charts", "different charts", "a pie and a bar", etc., or if two views genuinely illuminate the data, put MULTIPLE specs in `charts` (e.g. a ranking bar AND a share donut).
    – bar=rankings, line=time trend, donut=shares, combo (percentage on y2)=two different scales, heatmap=matrix, scatter/bubble=correlation, treemap/sunburst=hierarchy, waterfall=build-up.
    – Only omit charts for a pure single-number answer.
 • Money is already formatted (₹Cr/₹L) in results — quote those strings verbatim, never recompute units.
-• Be genuinely analytical: lead with the answer, then add the insight that matters (a concentration, a trend, a risk, a surprise) and, when useful, a short takeaway or suggested next question. Respect caveats in the schema notes (e.g. manufacturer-of-purchases coverage).
+• Be genuinely analytical: lead with the answer, then add the insight that matters (a concentration, a trend, a risk, a surprise). Respect caveats in the schema notes (e.g. manufacturer-of-purchases coverage). Put next-question ideas in follow_ups (clickable chips), not as a trailing question in the prose.
 • If the data truly can't answer it, say so plainly and suggest the closest thing you CAN answer."""
 
 
@@ -144,7 +147,7 @@ RUN_SQL_TOOL = {
 _CHART_SPEC = {
     "type": "object", "description": "One visualization.", "properties": {
         "type": {"type": "string", "enum": ["bar", "grouped_bar", "stacked_bar", "line", "area", "combo", "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "sunburst", "funnel", "waterfall", "histogram", "box", "indicator"]},
-        "x": {"type": "string", "description": "Result column for the category / x-axis / labels."},
+        "x": {"type": "string", "description": "Result column for the category / x-axis / labels. NEVER a raw code/id column (material, vendor_code, plant) — use the readable sibling (material_desc, vendor_name, plant_name) whenever the query selected it."},
         "y": {"description": "Result column (or list of columns) for values.", "type": ["string", "array"], "items": {"type": "string"}},
         "color": {"type": "string", "description": "Optional grouping column (scatter/heatmap/sunburst)."},
         "size": {"type": "string", "description": "Optional bubble-size column."},
@@ -159,9 +162,10 @@ PRESENT_TOOL = {
         "name": "present",
         "description": "Deliver the final answer + chart(s). Call this once you have the data.",
         "parameters": {"type": "object", "required": ["answer"], "properties": {
-            "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly."},
+            "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly. Do NOT end with a trailing rhetorical question ('would you like to explore...?') — put real next-question suggestions in follow_ups instead, which renders as clickable chips."},
             "charts": {"type": "array", "description": "One or MORE charts. If the user asks for multiple/different charts, or two views genuinely help (e.g. a ranking bar AND a share donut), include several. Empty for a single-number answer.", "items": _CHART_SPEC},
-            "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'.")}}},
+            "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'."),
+            "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "OPTIONAL 2-3 short, concrete drill-down questions a user would naturally ask next about THIS answer (e.g. 'Break this down by hospital', 'Show the monthly trend'). Rendered as clickable chips — clicking one sends it as the next question. Only include ones that are genuinely answerable from this data; omit entirely for a simple/closed answer that doesn't invite a drill-down."}}}},
 }
 LOOKUP_TOOL = {
     "type": "function", "function": {
@@ -420,7 +424,8 @@ def answer(query: str, history: list | None = None):
         ok, _issue, _fix = _verify(client, query, results, ans)
         verified = "ok" if ok else "flagged"
 
-    yield {"type": "answer", "text": ans, "verified": verified}
+    follow_ups = [str(f).strip() for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]
+    yield {"type": "answer", "text": ans, "verified": verified, "options": follow_ups}
 
     # CHARTS — use the model's spec(s), else auto-build one if the data is chartable
     if not chart_specs and results:
