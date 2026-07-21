@@ -25,7 +25,7 @@ AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 MAX_SQL_STEPS = 9
-MAX_AUDIT_RETRIES = 2   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
+MAX_AUDIT_RETRIES = 3   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
 
 
 def has_key() -> bool:
@@ -265,7 +265,7 @@ _AUDITOR_SYS = """You are a STRICT data auditor for a hospital supply-chain anal
 
 FAIL the answer (ok=false) if ANY of these hold:
 1. NUMBER MISMATCH — a figure in the answer is not supported by the query results.
-2. WRONG SCOPE — the answer attributes a figure to a specific entity (item/brand/category/hospital/vendor/department/plant), but the SQL that produced it did NOT GROUP BY or filter to that entity (e.g. it is actually a company-wide or different-entity total presented as that entity's). This is the most important check.
+2. WRONG SCOPE — the answer attributes a figure to a specific entity (item/brand/category/hospital/vendor/department/plant), but the SQL that produced it did NOT GROUP BY or filter to that entity (e.g. it is actually a company-wide or different-entity total presented as that entity's). This is the most important check. ALSO check `prior_conversation`: if an earlier turn established a scope (a category/type/entity filter — e.g. "pharma injection items") and the CURRENT question is a refinement of that same thing ("remove X", "exclude Y", "excluding zero ones"), the current SQL must still carry that same scope. If the SQL dropped it (e.g. now scans everything instead of just that category) and the answer presents unrelated results (hardware/equipment showing up in what was a drug-only list) as if it were still the same scoped analysis, that is a WRONG SCOPE failure — regardless of whether the current question's SQL alone looks internally consistent.
 3. MISLABELLED METRIC/SOURCE — a number is presented as something it is NOT, in a way that changes its meaning: e.g. purchase or consumption figures called "sales" (or vice-versa); an aggregate over the wrong grain (a broader table's total shown as a narrower breakdown); a grand total taken from a table that only partially covers it; a MEAN value reported when the rule requires a MEDIAN. (NOT a defect: calling a correctly-computed MEDIAN "average" or "typical" in prose — the value is the right median, the word choice is colloquial. Only fail if the actual NUMBER is a mean when it should be a median.)
 4. UNSUPPORTED CLAIM — a trend/insight/comparison the results don't actually show.
 5. DODGES — answers a different question than asked with no explanation.
@@ -281,9 +281,12 @@ When unsure whether it's a real defect or just imperfect phrasing, PASS. Reserve
 Reply ONLY JSON: {"ok": true|false, "issue": "<empty if ok; else the SPECIFIC defect that makes a number wrong/misleading>", "fix": "<empty if ok; else a concrete instruction: which table/filter/metric/grain to use instead>"}."""
 
 
-def _verify(client, query, results, answer):
-    """Strict auditor: numbers supported AND correctly scoped/sourced. Returns (ok, issue, fix)."""
+def _verify(client, query, results, answer, history=None):
+    """Strict auditor: numbers supported AND correctly scoped/sourced. Returns (ok, issue, fix).
+    `history` (prior turns) lets it catch a follow-up that silently drops a scope/filter
+    established earlier — invisible from the current turn's query text alone."""
     payload = {"question": query, "answer": answer,
+               "prior_conversation": [{"role": h.get("role"), "content": str(h.get("content"))[:400]} for h in (history or [])[-6:]],
                "queries": [{"sql": r["sql"], "purpose": r.get("purpose"), "result": _format_result(r, 15)} for r in results]}
     try:
         resp = client.chat.completions.create(
@@ -390,7 +393,7 @@ def answer(query: str, history: list | None = None):
             ok, issue, fix = True, "", ""
             if results and cand_ans:
                 yield {"type": "step", "text": "Cross-checking the answer against the data"}
-                ok, issue, fix = _verify(client, query, results, cand_ans)
+                ok, issue, fix = _verify(client, query, results, cand_ans, history)
             if ok or present_attempts >= MAX_AUDIT_RETRIES:
                 present_args = pending_present
                 verified = ("corrected" if present_attempts > 0 else "ok") if (results and cand_ans) else None
@@ -404,6 +407,7 @@ def answer(query: str, history: list | None = None):
                 "AUDIT FAILED — your last answer was not accepted, do NOT repeat it. Problem: "
                 + (issue or "the answer was not correctly supported/scoped.")
                 + (" Fix: " + fix if fix else "")
+                + " If this is a WRONG SCOPE issue on a follow-up ('remove X', 'exclude Y', etc.): find your MOST RECENT run_sql call earlier in this conversation that established the scope (its WHERE/JOIN conditions for category, item type, entity…) and COPY those same conditions into the new query verbatim, adding only the new exclusion — do not rebuild from an unfiltered base."
                 + " Re-run the correct query (right table, filtered to the exact entity/scope the user asked about, right metric) and call present again with corrected numbers. If the data genuinely cannot answer it, say so honestly instead."})
 
     if not present_args:
@@ -422,7 +426,7 @@ def answer(query: str, history: list | None = None):
     # audited inline — audit it now so EVERY data-backed answer gets the same gate.
     if verified is None and results and ans:
         yield {"type": "step", "text": "Cross-checking the answer against the data"}
-        ok, _issue, _fix = _verify(client, query, results, ans)
+        ok, _issue, _fix = _verify(client, query, results, ans, history)
         verified = "ok" if ok else "flagged"
 
     follow_ups = [str(f).strip() for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]

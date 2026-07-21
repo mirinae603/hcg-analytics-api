@@ -106,10 +106,15 @@ def _coerce(v):
     if v is None:
         return None
     if isinstance(v, Decimal):
-        return float(v)
+        v = float(v)
     if isinstance(v, (_dt.date, _dt.datetime)):
         return v.isoformat()[:10]
     if isinstance(v, float):
+        # A 0/0 ratio (e.g. margin_pct for a manufacturer with zero revenue AND zero
+        # cost) produces NaN/Infinity — a raw float artifact, not a real number. Never
+        # let it reach the model or the answer as "NaN%"; treat it as "not computable".
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
         return round(v, 4)
     return v
 
