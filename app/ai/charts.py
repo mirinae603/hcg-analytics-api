@@ -95,6 +95,65 @@ def _hbar_geometry(labels: list[str]) -> tuple[int, int]:
     return height, margin_l
 
 
+# ── cardinality defense: cap categories so a "by plant/vendor/material" breakdown
+# with 50-25,000 distinct values never renders as an unreadable wall of hairline
+# bars/slices. Per-type caps (pies get unreadable fastest; treemaps hold the most).
+# This is deterministic and lives in the chart layer so it protects EVERY chart
+# regardless of what SQL the model wrote or which column it picked.
+_CAT_CAPS = {"bar": 14, "grouped_bar": 12, "stacked_bar": 12, "pie": 8, "donut": 8, "treemap": 18}
+
+
+def _sorted_desc(rows, prim):
+    return sorted(rows, key=lambda r: (_num(r.get(prim)) is not None, _num(r.get(prim)) or 0), reverse=True)
+
+
+def _maybe_condense(rows, t, x, ys, kind, ranking=False):
+    """If a category chart has more rows than its type's cap, keep the top (cap-1) by
+    value and fold the rest. Returns (rows, title_suffix).
+      • additive metric (₹ / count): the tail collapses into ONE labelled bucket
+        'Other (N more)' whose value is the honest SUM of the hidden rows — never a
+        silent drop; the full list still appears in the data table below the chart.
+      • non-additive metric (%, days — you cannot sum an average lead time or a rate):
+        show the top `cap` by value and note 'top N of M' in the title instead.
+    `ranking` (set for horizontal bars — the many/long-label case, which is virtually
+    always a top-N ranking) also sorts the kept rows descending so the chart reads as a
+    proper ranking even when under the cap. Ordered buckets (expiry/aging months) stay
+    VERTICAL, so they arrive with ranking=False and their natural order is preserved.
+    Time/scatter/box/etc. never reach here (not in _CAT_CAPS)."""
+    cap = _CAT_CAPS.get(t)
+    if not x or not ys:
+        return rows, ""
+    prim = ys[0]
+    if not cap or len(rows) <= cap:
+        return (_sorted_desc(rows, prim) if ranking else rows), ""
+    ordered = _sorted_desc(rows, prim)
+    if kind in ("inr", "num"):
+        keep, rest = ordered[:cap - 1], ordered[cap - 1:]
+        if len(rest) < 2:            # only one over the cap — just show cap, nothing to bucket
+            return ordered[:cap], ""
+        other = {x: f"Other ({len(rest)} more)"}
+        for y in ys:
+            other[y] = sum(v for v in (_num(r.get(y)) for r in rest) if v is not None)
+        return keep + [other], ""
+    return ordered[:cap], f"  ·  top {cap} of {len(rows)}"
+
+
+def _wants_horizontal(t, rows, x, spec) -> bool:
+    """Orientation decision. Long entity names (vendor/material/department) and long
+    lists read FAR better as horizontal bars than as cramped or rotated vertical ticks.
+    We honour an explicit model 'h', and OVERRIDE a model 'v' when the labels would
+    overflow vertically (many categories or long names) — the exact failure mode behind
+    the 'Reorder Quantities by Plant' overflow. Non-bar types keep the model's choice."""
+    if t not in ("bar", "grouped_bar", "stacked_bar"):
+        return (spec.get("orientation") or "v") == "h"
+    if spec.get("orientation") == "h":
+        return True
+    labels = [str(v) for v in _rows_get(rows, x)] if x else []
+    n = len(labels)
+    maxlen = max((len(l) for l in labels), default=0)
+    return n > 8 or maxlen > 14
+
+
 def _value_axis(vals, kind, title=None):
     nums = [abs(v) for v in vals if v is not None]
     m = max(nums) if nums else 1.0
@@ -208,6 +267,25 @@ _X_IS_LABEL_TYPES = {"bar", "line", "area", "combo", "pie", "donut", "treemap",
                      "sunburst", "funnel", "waterfall"}
 
 
+# A model title sometimes echoes the raw code/id column name ("Closing Stock by
+# material id") even though the axis itself is swapped to the readable sibling — leaving
+# the title lying about what's on screen. Clean the few exact raw-column tokens out of
+# the title string (only the unambiguous id/code leaks — never touches 'material group',
+# 'by material', or any real word).
+_TITLE_CLEAN = [
+    (re.compile(r"\bmaterial[_ ]?id\b", re.I), "item"),
+    (re.compile(r"\bvendor[_ ]?code\b", re.I), "vendor"),
+    (re.compile(r"\bcost[_ ]?ctr\b", re.I), "cost centre"),
+    (re.compile(r"\bplant[_ ]?name\b", re.I), "plant"),
+]
+
+
+def _clean_title(title: str) -> str:
+    for rx, repl in _TITLE_CLEAN:
+        title = rx.sub(repl, title)
+    return title
+
+
 def _normalize_spec(spec: dict, rows: list[dict]) -> dict:
     """Rewrite spec IN PLACE (a copy) so every sub-builder — whether it reads
     individual x/y/color/size args or the whole spec dict (scatter/heatmap/sunburst/
@@ -233,12 +311,16 @@ def build(rows: list[dict], spec: dict) -> dict | None:
         return None
     spec = _normalize_spec(spec, rows)
     t = (spec.get("type") or "bar").lower().strip()
-    title = spec.get("title") or ""
+    title = _clean_title(spec.get("title") or "")
     kind = (spec.get("value_format") or "num").lower()
     x = spec.get("x")
     y = spec.get("y")
     ys = y if isinstance(y, list) else ([y] if y else [])
-    horizontal = (spec.get("orientation") or ("h" if t == "bar" and len(rows) > 8 else "v")) == "h"
+    # Orientation is decided on the ORIGINAL rows (stable across condensing: a 51-row set
+    # is horizontal, and so is its 14-row condensed form — both have >8 categories).
+    horizontal = _wants_horizontal(t, rows, x, spec)
+    rows, _title_suffix = _maybe_condense(rows, t, x, ys, kind, ranking=horizontal and t in ("bar", "grouped_bar", "stacked_bar"))
+    title = (title + _title_suffix) if _title_suffix else title
     try:
         if t == "indicator":
             return _indicator(rows, spec, kind, title)

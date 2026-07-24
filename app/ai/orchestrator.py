@@ -291,6 +291,47 @@ def _has_data(res) -> bool:
     return any(v is not None for row in res["rows"] for v in row.values())
 
 
+def _nonzero_frac(col, rows) -> float:
+    nums = [r.get(col) for r in rows if isinstance(r.get(col), (int, float))]
+    if not nums:
+        return 0.0
+    return sum(1 for v in nums if v != 0) / len(nums)
+
+
+def _better_chart_metric(res, spec, answer):
+    """SAFETY GUARD (never touches a healthy chart): the model can pick a chart y-column
+    that is mostly zero/empty while its OWN answer prose is clearly about a different,
+    healthy metric in the same result (e.g. charts `closing_stock` — near-zero for items
+    that need reordering *because* stock is empty — while the answer is about
+    `replenishment_quantity`). Only when the charted column is weak (<50% non-zero) AND a
+    DIFFERENT numeric column is both (a) named in the answer text and (b) healthy, swap to
+    it. Returns the replacement column name, or None to leave the chart exactly as-is."""
+    y = spec.get("y")
+    if isinstance(y, list):
+        if len(y) != 1:
+            return None            # multi-series — don't second-guess
+        y = y[0]
+    if not y or not res.get("rows"):
+        return None
+    rows = res["rows"]
+    if _nonzero_frac(y, rows) >= 0.5:
+        return None                # current chart is fine — hands off
+    ans = (answer or "").lower()
+    cands = [c for c in res["columns"]
+             if c != y and c.replace("_", " ").lower() in ans
+             and _nonzero_frac(c, rows) >= 0.5 and infer_kind(c) not in ("year",)]
+    if not cands:
+        return None
+    cands.sort(key=lambda c: _nonzero_frac(c, rows), reverse=True)
+    return cands[0]
+
+
+def _humanize_col(c: str) -> str:
+    clean = {"material": "item", "material_id": "item", "vendor_code": "vendor",
+             "plant": "plant", "cost_ctr": "cost centre"}.get(c.lower())
+    return clean or c.replace("_", " ").strip().title()
+
+
 def _pick_result(results, chart):
     """Find the query result whose columns cover the chart's referenced columns (prefer most recent)."""
     if not chart:
@@ -663,6 +704,18 @@ def answer(query: str, history: list | None = None):
         res = _pick_result(results, spec)
         if not res or not res["rows"]:
             continue
+        # Degenerate-metric guard: if the chosen column is mostly-zero but the answer is
+        # about a healthier one in the same result, chart that instead (and retitle to
+        # name it). Fail-open — any hiccup leaves the model's original spec untouched.
+        try:
+            better = _better_chart_metric(res, spec, ans)
+            if better:
+                spec["y"] = better
+                spec["value_format"] = infer_kind(better)
+                xh = _humanize_col(spec.get("x") or "")
+                spec["title"] = f"{_humanize_col(better)} by {xh}" if xh else _humanize_col(better)
+        except Exception:
+            pass
         if not spec.get("value_format") and spec.get("y"):
             yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
             spec["value_format"] = infer_kind(str(yk))
