@@ -23,10 +23,14 @@ GRID = "rgba(150,160,180,0.13)"
 
 
 def _num(v):
+    # NaN / ±Inf (from a 0/0 rate, log of a non-positive, etc.) are treated as MISSING, not
+    # plotted: they otherwise reach _nice_ceil()/_value_axis() and raise, which used to crash
+    # the whole build() — silently dropping an otherwise-valid, correctly-labelled chart.
     try:
-        return float(v) if v is not None else None
+        f = float(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+    return f if (f is None or math.isfinite(f)) else None
 
 
 def _rows_get(rows, key):
@@ -80,6 +84,70 @@ _CAT_MAXLEN = 34  # display cap for a category-axis label (full text still shown
 def _truncate_label(s, maxlen: int = _CAT_MAXLEN) -> str:
     s = "" if s is None else str(s)
     return s if len(s) <= maxlen else s[: maxlen - 1].rstrip() + "…"
+
+
+# ── CHART-INTEGRITY GATE ─────────────────────────────────────────────────────
+# A category chart (bar/line/pie/…) only means something if its x-axis is a real
+# CATEGORY — a label the rows are grouped by — not a second copy of a measure. When a
+# query returns only measures (e.g. revenue/cost/margin, with the grouping column never
+# SELECTed), there is nothing valid to put on the x-axis; rendering it anyway is exactly
+# what produced "Revenue by revenue" on a −0.2B…1B axis. Rather than special-casing each
+# way this shows up, we enforce one invariant for every category chart and, when it can't
+# be met, draw NOTHING (the data table alone is honest and clear).
+# The gate must run for the EFFECTIVE rendered type, not an exact whitelist: the dispatcher
+# defaults every unrecognized type string to a vertical bar (a category chart), so a spec
+# whose type is "column"/"col"/"line_chart"/a typo/anything off-enum would otherwise slip a
+# measure onto the category axis with the gate never applied. So we gate everything EXCEPT
+# the types that legitimately use numeric or multi-column axes.
+_EXEMPT_TYPES = {"scatter", "bubble", "histogram", "box", "heatmap", "sunburst", "indicator"}
+_CATEGORY_TYPES = {"bar", "grouped_bar", "stacked_bar", "line", "area", "combo",
+                   "pie", "donut", "treemap", "funnel", "waterfall"}
+
+
+def _is_category_col(col, rows) -> bool:
+    """True if `col` holds genuine category LABELS, not a numeric measure. The reliable
+    signal is the value's Python type as it comes back from DuckDB: labels are strings
+    (even all-digit codes like a cost-centre '1080101005', or dashed months '2026-02'),
+    while measures are int/float (revenue 7.5e8, a rate, a count). A column whose values
+    are numbers can never be a sensible category axis."""
+    if not col:
+        return False
+    seen = False
+    for r in rows:
+        v = r.get(col)
+        if v is None or v == "":
+            continue
+        seen = True
+        if not isinstance(v, str):
+            return False          # a numeric value present → this is a measure, not a label
+    return seen                   # had values, all strings → a real category
+
+
+def _category_x(x, ys, rows):
+    """Resolve a VALID category column for the x-axis, or None if the result has none.
+    x is accepted as-is when it exists, isn't one of the measures being plotted, and holds
+    real labels. When x is NOT a usable category we only auto-substitute another column in
+    the clear-cut cases — x is a plotted measure (the "revenue by revenue" recovery) or x is
+    missing/nonexistent. If instead the user explicitly named a real column that just isn't a
+    string category (e.g. an integer 'year'), we do NOT silently swap in an unrelated column
+    (that mislabels the chart, e.g. plotting 'quarter' under a "by year" title) — we suppress
+    and let the table stand."""
+    yset = {c for c in ys if c}
+    if x and x not in yset and _is_category_col(x, rows):
+        return x                       # x is already a valid category — trust it as given
+    if not rows:
+        return None
+    # x is not a usable category. Substitute a genuine category column, but ONLY a
+    # DISTINCT-valued one, so we never recover onto a column with repeated labels (which
+    # would silently merge/double-count rows — e.g. two undistinguished '2026-Q1' bars). If
+    # no distinct category column exists, there is no honest chart — suppress.
+    for c in rows[0].keys():
+        if c in yset or not _is_category_col(c, rows):
+            continue
+        vals = [str(r.get(c)) for r in rows if r.get(c) is not None]
+        if len(vals) == len(set(vals)):
+            return c
+    return None
 
 
 def _needs_category_axis(xs) -> bool:
@@ -169,7 +237,7 @@ def _wants_horizontal(t, rows, x, spec) -> bool:
 
 
 def _value_axis(vals, kind, title=None):
-    nums = [abs(v) for v in vals if v is not None]
+    nums = [abs(v) for v in vals if v is not None and math.isfinite(v)]  # non-finite → skipped, never crashes _nice_ceil
     m = max(nums) if nums else 1.0
     ax = {"gridcolor": GRID, "zerolinecolor": GRID, "automargin": True, "tickfont": {"size": 10.5, "color": MUT},
           "showline": False, "rangemode": "tozero"}
@@ -224,29 +292,38 @@ _ID_NAME_RE = re.compile(r"(^material(_id)?$|_code$|_id$|^plant$|^cost_ctr$)", r
 
 
 def _looks_like_bare_code(vals) -> bool:
-    """True if every non-null value is a pure numeric-looking string/number —
-    i.e. an identifier, not a human label (a real name always has letters)."""
+    """True if every non-null value is a digit-only STRING — an aliased identifier like a
+    material code '928036', not a human label. Values must be strings: a genuine code column
+    comes back from DuckDB as text, whereas a numeric int/float (a measure, or an integer
+    dimension like a year 2025) is NOT a code and must NOT be swapped to some unrelated text
+    sibling (that mislabels the chart, e.g. plotting 'quarter' under a 'by year' title).
+    True numeric ID columns named like ids (material/*_id/*_code/plant) are still handled by
+    the name map + _ID_NAME_RE in _prefer_desc; this data-driven path is strings-only."""
     seen = False
     for v in vals:
         if v is None or v == "":
             continue
         seen = True
-        s = str(v)
-        if not s.replace(".", "", 1).replace("-", "", 1).isdigit():
+        if not isinstance(v, str):
+            return False
+        if not v.replace(".", "", 1).replace("-", "", 1).isdigit():
             return False
     return seen
 
 
 def _find_text_sibling(field, rows, used: set) -> str | None:
-    """A column, other than `field` and anything already claimed by the spec, whose
-    values are genuine text (contain letters) rather than bare numeric codes."""
+    """A column, other than `field` and anything already claimed by the spec, whose values
+    are GENUINE human text — string values containing letters (a name like 'PARACETAMOL',
+    'IP'). Must be tested positively (has letters), NOT merely 'not a bare code': a numeric
+    measure such as margin_pct [40,10] is neither a code nor a readable label, and must never
+    be picked as a category's text sibling."""
     if not rows:
         return None
     for col in rows[0].keys():
         if col == field or col in used:
             continue
         sample = [r.get(col) for r in rows[:20]]
-        if any(v is not None and v != "" for v in sample) and not _looks_like_bare_code(sample):
+        if any(isinstance(v, str) and any(ch.isalpha() for ch in v) for v in sample):
             return col
     return None
 
@@ -330,6 +407,17 @@ def build(rows: list[dict], spec: dict) -> dict | None:
     x = spec.get("x")
     y = spec.get("y")
     ys = y if isinstance(y, list) else ([y] if y else [])
+    # INTEGRITY GATE: for any chart that renders as a category chart (everything except the
+    # exempt numeric/multi-column types — and that INCLUDES unrecognized type strings, which
+    # the dispatcher renders as a bar), the x-axis must be a real category. If x is a measure
+    # (or equals a plotted measure — "revenue by revenue"), swap in a genuine category
+    # column; if the result has none at all, there is no honest chart to draw, so return None
+    # and let the data table speak for itself.
+    if t not in _EXEMPT_TYPES:
+        gx = _category_x(x, ys, rows)
+        if gx is None:
+            return None
+        x = spec["x"] = gx
     # Orientation is decided on the ORIGINAL rows (stable across condensing: a 51-row set
     # is horizontal, and so is its 14-row condensed form — both have >8 categories).
     horizontal = _wants_horizontal(t, rows, x, spec)

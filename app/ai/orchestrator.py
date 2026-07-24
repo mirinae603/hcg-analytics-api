@@ -249,7 +249,13 @@ def _auto_chart(res: dict) -> dict | None:
     numeric = [c for c in cols if all(isinstance(r.get(c), (int, float)) or r.get(c) is None for r in rows) and any(isinstance(r.get(c), (int, float)) for r in rows)]
     if not numeric:
         return None
-    label = next((c for c in cols if c not in numeric), cols[0])
+    # The x-axis needs a real category (a non-measure column). If the result is ALL
+    # measures (e.g. revenue/cost/margin — the grouping column was never SELECTed), there
+    # is no honest label to chart by, so don't invent one from a measure ("Revenue by
+    # revenue"). No auto-chart; the answer + data table stand on their own.
+    label = next((c for c in cols if c not in numeric), None)
+    if label is None:
+        return None
     xs = [str(r.get(label)) for r in rows]
     is_time = sum(1 for v in xs if _MONTHISH.search(v)) >= max(2, len(xs) // 2)
     inr_cols = [c for c in numeric if infer_kind(c) == "inr"]
