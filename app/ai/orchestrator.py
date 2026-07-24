@@ -32,6 +32,9 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 MINI_DEPLOYMENT = os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT", "gpt-4o-mini")
 MAX_SQL_STEPS = 9
 MAX_AUDIT_RETRIES = 3   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
+# Rotating filler shown before each tool-calling round after the first — that round is a
+# full, non-streamed model completion (several real seconds) with no other visible progress.
+_THINKING_STEPS = ["Thinking it through", "Working out the next step", "Putting the analysis together", "Digging a little deeper"]
 # How many prior messages of conversation the model (and auditor) can see. Was 6 (3 exchanges)
 # — too short: a callback to anything ~4+ turns back fell outside the window and the model
 # confidently hallucinated a substitute. gpt-4o has a 128K context and answers are short, so a
@@ -518,6 +521,11 @@ def answer(query: str, history: list | None = None):
         yield {"type": "error", "text": f"AI service unavailable: {e}"}
         return
 
+    # Fire the first visible progress step IMMEDIATELY, before any network call (routing's
+    # embedding call, then the model itself) — every one of those is a real few-seconds
+    # wait with nothing to show otherwise, and users read a long instant silence as "stuck".
+    yield {"type": "step", "text": "Understanding your question"}
+
     messages = [{"role": "system", "content": SYSTEM.format(context=ctx)}]
     for h in (history or [])[-HISTORY_MESSAGES:]:
         if h.get("role") in ("user", "assistant") and h.get("content"):
@@ -544,7 +552,6 @@ def answer(query: str, history: list | None = None):
     hint = routing.hints_for(client, query, allow_locks=not prior_scope)
     messages.append({"role": "user", "content": (hint + "\n\n" + query) if hint else query})
 
-    yield {"type": "step", "text": "Understanding your question"}
     results: list[dict] = []
     present_args = None
     present_from_content = False
@@ -552,7 +559,13 @@ def answer(query: str, history: list | None = None):
     present_attempts = 0
 
     any_sql_failed = False
-    for _ in range(MAX_SQL_STEPS):
+    for step_idx in range(MAX_SQL_STEPS):
+        if step_idx > 0:
+            # Every iteration's first move is a full, non-streamed model round-trip that
+            # decides "run another query" vs "write the final answer" — genuinely a few
+            # seconds with nothing else to show. A rotating, honest-sounding line here fills
+            # that gap without claiming anything specific hasn't happened yet.
+            yield {"type": "step", "text": _THINKING_STEPS[(step_idx - 1) % len(_THINKING_STEPS)]}
         try:
             resp = _chat(client,
                 model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
