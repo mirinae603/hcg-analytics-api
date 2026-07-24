@@ -18,14 +18,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
-from app.ai import warehouse, semantics, charts
+from app.ai import warehouse, semantics, charts, routing
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 MAX_SQL_STEPS = 9
 MAX_AUDIT_RETRIES = 3   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
+# How many prior messages of conversation the model (and auditor) can see. Was 6 (3 exchanges)
+# — too short: a callback to anything ~4+ turns back fell outside the window and the model
+# confidently hallucinated a substitute. gpt-4o has a 128K context and answers are short, so a
+# generous window is cheap and covers realistic working sessions. Kept in sync with the frontend.
+HISTORY_MESSAGES = 24
 
 
 def has_key() -> bool:
@@ -38,6 +44,40 @@ def _client():
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
     return AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=key, api_version=AZURE_API_VERSION)
+
+
+# A single transient Azure hiccup (429 rate-limit, or a 500/502/503/504) used to
+# abandon a whole turn — often AFTER real, correct query results had already been
+# gathered — surfacing only a raw error (or worse, the model fabricating a
+# "permissions issue" excuse). Retry transient failures a few times with short
+# exponential backoff before giving up. Only retriable statuses are retried; a
+# genuine 400 (bad request) fails fast.
+_RETRIABLE_STATUS = {429, 500, 502, 503, 504}
+_MAX_LLM_RETRIES = 4
+
+
+def _is_retriable(e: Exception) -> bool:
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    if status in _RETRIABLE_STATUS:
+        return True
+    name = type(e).__name__.lower()
+    return any(k in name for k in ("ratelimit", "timeout", "connection", "apiconnection", "internalserver"))
+
+
+def _chat(client, **kwargs):
+    """client.chat.completions.create with retry+backoff on transient Azure errors."""
+    delay = 2.0
+    last = None
+    for attempt in range(_MAX_LLM_RETRIES):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:  # noqa: BLE001 — we re-raise below if not retriable / out of attempts
+            last = e
+            if not _is_retriable(e) or attempt == _MAX_LLM_RETRIES - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.2, 20.0)
+    raise last  # unreachable, but keeps type-checkers happy
 
 
 # ── number pre-formatting so the model can't mis-convert units ───────────────
@@ -133,6 +173,8 @@ HOW YOU WORK — like a sharp, friendly human analyst:
    – Only omit charts for a pure single-number answer.
 • Money is already formatted (₹Cr/₹L) in results — quote those strings verbatim, never recompute units.
 • Be genuinely analytical: lead with the answer, then add the insight that matters (a concentration, a trend, a risk, a surprise). Respect caveats in the schema notes (e.g. manufacturer-of-purchases coverage). Put next-question ideas in follow_ups (clickable chips), not as a trailing question in the prose.
+• When your answer is scoped to a specific thing (a category, item, vendor, plant, or a ranked subset), ALWAYS fill present()'s `scope` field with the exact filters you used — this lets a terse follow-up ('which is cheapest', 'and their lead times') correctly inherit your scope instead of resetting to the whole company.
+• ⛔ MEMORY HONESTY: you only see the recent part of the conversation. If the user refers back to something "earlier" / "we found before" / "that item/number/figure" and it is NOT actually present in the conversation you can see (nor in the ACTIVE SCOPE), do NOT invent a plausible substitute and label it as the earlier finding — that is a confident hallucination. Instead say briefly that you don't have that earlier turn in view and ask them to restate it (offer to just re-run the analysis fresh). Running a NEW global query and presenting its result as "the one we found earlier" is a serious error.
 • If the data truly can't answer it, say so plainly and suggest the closest thing you CAN answer."""
 
 
@@ -165,7 +207,8 @@ PRESENT_TOOL = {
             "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly. Do NOT end with a trailing rhetorical question ('would you like to explore...?') — put real next-question suggestions in follow_ups instead, which renders as clickable chips."},
             "charts": {"type": "array", "description": "One or MORE charts. If the user asks for multiple/different charts, or two views genuinely help (e.g. a ranking bar AND a share donut), include several. Empty for a single-number answer.", "items": _CHART_SPEC},
             "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'."),
-            "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "OPTIONAL 2-3 short, concrete drill-down questions a user would naturally ask next about THIS answer (e.g. 'Break this down by hospital', 'Show the monthly trend'). Rendered as clickable chips — clicking one sends it as the next question. Only include ones that are genuinely answerable from this data; omit entirely for a simple/closed answer that doesn't invite a drill-down."}}}},
+            "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "OPTIONAL 2-3 short, concrete drill-down questions a user would naturally ask next about THIS answer (e.g. 'Break this down by hospital', 'Show the monthly trend'). Rendered as clickable chips — clicking one sends it as the next question. Only include ones that are genuinely answerable from this data; omit entirely for a simple/closed answer that doesn't invite a drill-down."},
+            "scope": {"type": "string", "description": "OPTIONAL but IMPORTANT for follow-ups: a SHORT machine-usable description of the exact filters THIS answer applied, so a terse next question ('which is cheapest', 'and their lead times', 'just the injection ones', 'the worst one') can inherit them. Include the real filter values you used — e.g. 'category = M065-INJECTIONS (injection drugs)', 'vendor = Vardhman Health Specialities', 'material 101313 KEYTRUDA'. For a RANKING/top-N answer, ALWAYS name the #1 entity so a follow-up like 'the worst/top/first one' resolves to it — e.g. 'vendors ranked by price inconsistency; #1 = D.Vijay Pharma Pvt Ltd', 'top-10 vendors by spend; #1 = Vardhman'. Omit only for a broad, unscoped, whole-company answer."}}}},
 }
 LOOKUP_TOOL = {
     "type": "function", "function": {
@@ -286,10 +329,10 @@ def _verify(client, query, results, answer, history=None):
     `history` (prior turns) lets it catch a follow-up that silently drops a scope/filter
     established earlier — invisible from the current turn's query text alone."""
     payload = {"question": query, "answer": answer,
-               "prior_conversation": [{"role": h.get("role"), "content": str(h.get("content"))[:400]} for h in (history or [])[-6:]],
+               "prior_conversation": [{"role": h.get("role"), "content": str(h.get("content"))[:400]} for h in (history or [])[-HISTORY_MESSAGES:]],
                "queries": [{"sql": r["sql"], "purpose": r.get("purpose"), "result": _format_result(r, 15)} for r in results]}
     try:
-        resp = client.chat.completions.create(
+        resp = _chat(client,
             model=AZURE_DEPLOYMENT, temperature=0,
             response_format={"type": "json_object"},
             messages=[
@@ -299,7 +342,62 @@ def _verify(client, query, results, answer, history=None):
         out = json.loads(resp.choices[0].message.content or "{}")
         return bool(out.get("ok", True)), str(out.get("issue", "")), str(out.get("fix", ""))
     except Exception:
-        return True, "", ""  # never block on a verifier failure
+        return True, "", ""  # never block on a verifier failure (already retried inside _chat)
+
+
+_SCOPE_MARK = re.compile(r"\[active scope:\s*(.+?)\s*\]", re.I | re.S)
+_WHERE_RE = re.compile(r"\bwhere\b(.+?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)", re.I | re.S)
+# Refinement cues: a terse follow-up that leans on the PRIOR turn's scope. We only inject
+# the prior scope for these — a full, self-contained new question (topic change) must NOT
+# inherit stale filters (that bled procurement context into inventory questions).
+_REFINE_START = re.compile(r"^\s*(and|also|now|just|only|then|but|what about|how about|excluding|exclude|without|remove|drop|instead|same|of (these|those)|for (these|those|that|it|them))\b", re.I)
+_DEICTIC = re.compile(r"\b(that|those|these|this|them|they|it|its|their|there|the (top|cheapest|worst|best|same|first|last|one)|the ones)\b", re.I)
+
+
+def _is_refinement(query: str) -> bool:
+    """True when the query reads as a follow-up leaning on prior scope (terse, or starting
+    with a refinement conjunction, or using a back-reference like 'those'/'them'/'it')."""
+    q = (query or "").strip()
+    if not q:
+        return False
+    words = q.split()
+    if len(words) <= 6:
+        return True
+    if _REFINE_START.match(q):
+        return True
+    # a short-ish question that back-references the prior answer
+    if len(words) <= 14 and _DEICTIC.search(q):
+        return True
+    return False
+
+
+def _derive_scope(results: list[dict]) -> str:
+    """Deterministic fallback when the model doesn't self-declare a scope: summarise the
+    LAST successful query's FROM table + WHERE filters, so a terse follow-up still inherits
+    the concrete context. Not perfect SQL parsing — just enough signal for the next turn."""
+    for res in reversed(results or []):
+        sql = (res.get("sql") or "").strip()
+        if not sql:
+            continue
+        m = _WHERE_RE.search(sql)
+        if not m:
+            continue
+        where = " ".join(m.group(1).split())[:220]
+        fm = re.search(r"\bfrom\s+([a-z_][a-z0-9_]*)", sql, re.I)
+        tbl = fm.group(1) if fm else ""
+        return (f"previous query used {tbl} filtered on: {where}" if tbl else f"previous filters: {where}")
+    return ""
+
+
+def _latest_scope(history: list | None) -> str:
+    """Pull the most recent '[active scope: …]' marker an assistant turn carried
+    (the frontend appends it to the assistant content it echoes back). '' if none."""
+    for h in reversed(history or []):
+        if h.get("role") == "assistant" and h.get("content"):
+            m = _SCOPE_MARK.search(str(h["content"]))
+            if m:
+                return m.group(1).strip()[:300]
+    return ""
 
 
 def answer(query: str, history: list | None = None):
@@ -315,29 +413,56 @@ def answer(query: str, history: list | None = None):
         return
 
     messages = [{"role": "system", "content": SYSTEM.format(context=ctx)}]
-    for h in (history or [])[-6:]:
+    for h in (history or [])[-HISTORY_MESSAGES:]:
         if h.get("role") in ("user", "assistant") and h.get("content"):
             messages.append({"role": h["role"], "content": str(h["content"])[:1500]})
-    messages.append({"role": "user", "content": query})
+    # SCOPE THREADING: the last answer may carry an "[active scope: …]" marker (echoed
+    # back by the frontend). A terse follow-up must INHERIT that scope, not silently reset
+    # to the whole company — this is the multi-turn failure mode live testing kept hitting.
+    # Only thread prior scope when THIS question actually reads as a refinement — a full,
+    # self-contained new-topic question must not inherit stale filters.
+    prior_scope = _latest_scope(history) if _is_refinement(query) else ""
+    if prior_scope:
+        messages.append({"role": "system", "content":
+            f"ACTIVE SCOPE from the previous answer: {prior_scope}. "
+            "This new question looks like a refinement/terse follow-up, so re-apply that same "
+            "scope/filters and only add the new twist — do NOT rebuild from an unfiltered, "
+            "whole-company base. If the user refers to 'the worst/top/first/that one', resolve it "
+            "to the specific named entity in that scope and FILTER your query to that entity "
+            "(e.g. WHERE vendor_name = '<that vendor>'). (If you judge the user has in fact "
+            "changed topic, ignore this.)"})
+
+    # Embedding-based routing hint (fail-open: '' on any error → static examples carry it).
+    # When a prior scope is active (a refinement), suppress hard intent-locks so they can't
+    # override the vendor/item/category the user is drilling into.
+    hint = routing.hints_for(client, query, allow_locks=not prior_scope)
+    messages.append({"role": "user", "content": (hint + "\n\n" + query) if hint else query})
 
     yield {"type": "step", "text": "Understanding your question"}
     results: list[dict] = []
     present_args = None
+    present_from_content = False
     verified = None
     present_attempts = 0
 
+    any_sql_failed = False
     for _ in range(MAX_SQL_STEPS):
         try:
-            resp = client.chat.completions.create(
+            resp = _chat(client,
                 model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
                 tools=[RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
         except Exception as e:
-            yield {"type": "error", "text": f"AI request failed: {e}"}
+            # Only reached after _chat exhausted its retries. If we already gathered real
+            # results, hand those back honestly rather than throwing the whole turn away.
+            if results:
+                break
+            yield {"type": "error", "text": "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."}
             return
         msg = resp.choices[0].message
         if not msg.tool_calls:
             if msg.content:
                 present_args = {"answer": msg.content}
+                present_from_content = True
             break
 
         messages.append({"role": "assistant", "content": msg.content or None,
@@ -382,6 +507,7 @@ def answer(query: str, history: list | None = None):
             except Exception as e:
                 # Keep internal self-corrections invisible: feed the error back to the model
                 # so it fixes the query, but don't surface a scary errored query to the user.
+                any_sql_failed = True
                 yield {"type": "step", "text": "Refining the query"}
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
@@ -416,6 +542,19 @@ def answer(query: str, history: list | None = None):
         return
 
     ans = (present_args.get("answer") or "").strip()
+
+    # HONEST FAILURE: if the model gave up as free-text (no present() call) having gathered
+    # ZERO successful query results after a SQL error, its prose is an ungrounded excuse —
+    # this is where it used to fabricate a plausible "permissions / file access" reason. Do
+    # not ship that; say plainly that the query didn't run. (A legitimate "no data" answer
+    # always comes through present() WITH results, so this never suppresses a real answer.)
+    if present_from_content and not results and (any_sql_failed or not ans):
+        yield {"type": "answer",
+               "text": "I ran into a repeated error building the query for that and couldn't complete it — please try rephrasing, or ask it a slightly different way.",
+               "verified": None, "options": []}
+        yield {"type": "done"}
+        return
+
     chart_specs = present_args.get("charts")
     if not chart_specs:
         single = present_args.get("chart")
@@ -429,8 +568,19 @@ def answer(query: str, history: list | None = None):
         ok, _issue, _fix = _verify(client, query, results, ans, history)
         verified = "ok" if ok else "flagged"
 
+    # FLAGGED = the auditor could not confirm the numbers after its retries. Don't let that
+    # ship looking identical to a clean answer (the frontend badge alone was proven unreliable):
+    # bake an explicit caveat into the answer TEXT so the user always sees it.
+    if verified == "flagged" and ans and not ans.lstrip().startswith("⚠️"):
+        ans = ("⚠️ _I couldn't fully verify these figures against the data — treat them as "
+               "indicative and double-check before acting on them._\n\n") + ans
+
     follow_ups = [str(f).strip() for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]
-    yield {"type": "answer", "text": ans, "verified": verified, "options": follow_ups}
+    # Scope chain: prefer the model's own declaration, else derive from the last query. If BOTH
+    # are empty (e.g. a turn that answered from prior data with no new SQL), carry the PRIOR
+    # scope forward so a chain of refinements doesn't get severed by one no-query turn.
+    scope = str(present_args.get("scope") or "").strip()[:300] or _derive_scope(results) or _latest_scope(history)
+    yield {"type": "answer", "text": ans, "verified": verified, "options": follow_ups, "scope": scope}
 
     # CHARTS — use the model's spec(s), else auto-build one if the data is chartable
     if not chart_specs and results:

@@ -89,11 +89,158 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
+# Confirmed source-data defect: these 3 sales_by_material* views store the SAME
+# product under TWO material-key formats ('218766' and '218766.0') as fully
+# separate rows, splitting its revenue/cost/qty across them — 33-45% of distinct
+# materials, up to 85% of total revenue by value in sales_by_material. Verified
+# by direct inspection: whenever a duplicate pair exists, the '.0'-suffixed row
+# is always the one missing material_group (blank) — never a genuine second SKU
+# or a real category conflict (0 cases of two different non-blank groups/descs
+# for the same normalized material across all three views). Fixed once here, at
+# the view layer, so every consumer (agent SQL, entity picker, deterministic KPI
+# code) sees one correct row per product no matter how the question is phrased,
+# instead of depending on every query remembering to re-aggregate by material.
+_MATERIAL_DUP_VIEWS = {
+    "sales_by_material": [],
+    "sales_by_material_hospital": ["hospital"],
+    "sales_by_material_mfr": ["manufacturer"],
+}
+
+
+def _fix_material_duplicate_keys(con: duckdb.DuckDBPyConnection) -> None:
+    for name, extra_dims in _MATERIAL_DUP_VIEWS.items():
+        path = _tables.get(name)
+        if not path:
+            continue
+        cols = "".join(f'"{d}", ' for d in extra_dims)
+        con.execute(f"""
+            CREATE OR REPLACE VIEW {name} AS
+            SELECT {cols}
+                   mat_norm AS material,
+                   arg_max("desc", length("desc")) AS material_desc,
+                   COALESCE(max(NULLIF("group", '')), '') AS material_group,
+                   sum(revenue) AS revenue, sum(cost) AS cost, sum(qty) AS qty, sum(lines) AS lines
+            FROM (
+                SELECT *, CASE WHEN material LIKE '%.0' THEN LEFT(material, LENGTH(material) - 2)
+                               ELSE material END AS mat_norm
+                FROM read_parquet('{path}')
+            )
+            GROUP BY {cols}mat_norm
+        """)
+
+
+# ── Dedicated CHATBOT MART (procurement / pricing / vendor) ──────────────────
+# Many confirmed AI-analyst bugs in this domain were NOT reasoning failures — they
+# were the model having to re-derive the same cleaning/joins from scratch every turn
+# and doing it inconsistently: skipping the outlier-clean two-pass on a price ranking,
+# comparing raw SUM(spend) across plants that hold different quantities, mis-joining
+# item→vendor lead time (kpi_vendor_lead_time has NO material column), or reading the
+# raw messy category. This mart bakes ALL of that in as DATA so the model just reads
+# one already-correct column:
+#   • outlier-cleaned median price per material (net_price>=10, drop rows outside an
+#     8x band of the material's own median — gotcha #15's rule, computed ONCE) + the
+#     sample size backing it, so "is this price stable enough to rank?" is a column.
+#   • canonical category (dim_material.material_group), never the raw messy field.
+#   • is_capex_or_service flag (material NULL) so a construction/service line can't be
+#     surfaced as "the top item purchased".
+#   • unit_price per line so cross-plant/vendor price comparison is per-UNIT by default.
+#   • vendor lead time pre-joined onto every line (removes the 2-hop join the model
+#     kept getting wrong).
+# The two small stat tables are MATERIALIZED (the median computation runs once, a few
+# MB total); the big line-level view stays a zero-memory VIEW that joins to them — so
+# nothing here meaningfully grows RSS against the 512MB tier.
+_MART_NAMES = ("mart_material_price_stats", "mart_material_vendor_price_stats", "mart_procurement")
+
+
+def _build_procurement_mart(con: duckdb.DuckDBPyConnection) -> None:
+    # 1. material-grain clean price stats (materialized — the outlier-clean two-pass, once)
+    con.execute("""
+        CREATE OR REPLACE TABLE mart_material_price_stats AS
+        WITH raw AS (
+            SELECT material, net_price FROM fact_grn
+            WHERE material IS NOT NULL AND net_price >= 10 AND gr_qty > 0
+        ),
+        p1 AS (SELECT material, median(net_price) AS m1 FROM raw GROUP BY 1),
+        clean AS (
+            SELECT r.material, r.net_price FROM raw r JOIN p1 p USING(material)
+            WHERE r.net_price BETWEEN p.m1 / 8.0 AND p.m1 * 8.0
+        ),
+        rawstat AS (SELECT material, count(*) AS raw_n, min(net_price) AS raw_min_price,
+                           max(net_price) AS raw_max_price FROM raw GROUP BY 1),
+        cleanstat AS (SELECT material, median(net_price) AS clean_median_price,
+                             count(*) AS clean_n, min(net_price) AS clean_min_price,
+                             max(net_price) AS clean_max_price FROM clean GROUP BY 1)
+        SELECT a.material, dm.material_desc, dm.material_group AS category,
+               cs.clean_median_price, COALESCE(cs.clean_n, 0) AS clean_n,
+               cs.clean_min_price, cs.clean_max_price,
+               -- genuine price dispersion within the clean band (real over/under-pay signal,
+               -- NOT the raw transposition noise). Use THIS for "are we overpaying", not the
+               -- 20x has_price_outlier flag (that catches only gross data-entry errors).
+               (cs.clean_max_price - cs.clean_min_price) AS clean_price_spread,
+               a.raw_n, a.raw_min_price, a.raw_max_price,
+               (a.raw_max_price > a.raw_min_price * 20) AS has_price_outlier,
+               (COALESCE(cs.clean_n, 0) >= 5) AS price_is_stable
+        FROM rawstat a
+        LEFT JOIN cleanstat cs USING(material)
+        LEFT JOIN dim_material dm ON a.material = dm.material
+    """)
+    # 2. material x vendor clean price stats (materialized) — "who is cheapest for item X"
+    con.execute("""
+        CREATE OR REPLACE TABLE mart_material_vendor_price_stats AS
+        WITH raw AS (
+            SELECT material, vendor_name, net_price, gr_qty, total_amount_wo_tax FROM fact_grn
+            WHERE material IS NOT NULL AND net_price >= 10 AND gr_qty > 0
+        ),
+        p1 AS (SELECT material, vendor_name, median(net_price) AS m1 FROM raw GROUP BY 1, 2),
+        clean AS (
+            SELECT r.* FROM raw r JOIN p1 p ON r.material = p.material AND r.vendor_name = p.vendor_name
+            WHERE r.net_price BETWEEN p.m1 / 8.0 AND p.m1 * 8.0
+        ),
+        st AS (
+            SELECT material, vendor_name, median(net_price) AS clean_median_price, count(*) AS clean_n,
+                   sum(gr_qty) AS total_qty, sum(total_amount_wo_tax) AS total_value
+            FROM clean GROUP BY 1, 2
+        )
+        SELECT st.material, dm.material_desc, dm.material_group AS category,
+               st.vendor_name, st.clean_median_price, st.clean_n,
+               st.total_qty, st.total_value, (st.clean_n >= 5) AS price_is_stable
+        FROM st LEFT JOIN dim_material dm ON st.material = dm.material
+    """)
+    # 3. line-grain enriched procurement view (zero extra memory — joins the small tables above)
+    con.execute("""
+        CREATE OR REPLACE VIEW mart_procurement AS
+        SELECT g.plant, g.material, g.material_desc,
+               dm.material_group AS category, dm.material_type, dm.manufacturer_desc, dm.generic_name,
+               g.vendor_code, g.vendor_name, g.po_no, g.gr_no,
+               g.gr_qty AS qty,
+               g.net_price AS unit_price,
+               g.unit_mrp,
+               g.total_amount_wo_tax AS line_value,
+               (g.material IS NULL) AS is_capex_or_service,
+               ps.clean_median_price AS material_median_price,
+               ps.clean_n AS material_price_sample_n,
+               (ps.clean_median_price IS NOT NULL
+                 AND (g.net_price < ps.clean_median_price / 8.0 OR g.net_price > ps.clean_median_price * 8.0)
+               ) AS is_price_outlier,
+               lt.avg_lead_time_days AS vendor_avg_lead_time_days,
+               lt.median_lead_time_days AS vendor_median_lead_time_days,
+               g.gr_date, g.expiry_date, g.year, g.month_num, g.month
+        FROM fact_grn g
+        LEFT JOIN dim_material dm ON g.material = dm.material
+        LEFT JOIN mart_material_price_stats ps ON g.material = ps.material
+        LEFT JOIN kpi_vendor_lead_time lt ON g.vendor_name = lt.vendor_name
+    """)
+    for name in _MART_NAMES:
+        _tables[name] = ""   # register so schema_text()/grain_text() expose them to the model
+
+
 def con() -> duckdb.DuckDBPyConnection:
     global _con
     with _lock:
         if _con is None:
             _con = _connect()
+            _fix_material_duplicate_keys(_con)
+            _build_procurement_mart(_con)
     return _con
 
 
@@ -360,6 +507,8 @@ def item_footprint(name: str, limit: int = 8) -> dict:
         if codes:
             ph = ",".join(["?"] * len(codes))
             for name_ in sorted(_tables.keys()):
+                if name_.startswith("mart_"):
+                    continue   # marts are derived from base facts — don't double-count the footprint
                 try:
                     info = c.execute(f"DESCRIBE {name_}").fetchall()
                     mcol = _material_col([r[0] for r in info])
