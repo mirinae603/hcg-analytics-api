@@ -82,6 +82,20 @@ def _truncate_label(s, maxlen: int = _CAT_MAXLEN) -> str:
     return s if len(s) <= maxlen else s[: maxlen - 1].rstrip() + "…"
 
 
+def _needs_category_axis(xs) -> bool:
+    """Plotly auto-detects a 'date' axis type whenever x-axis strings look date-like
+    (e.g. '2026-02') — normally harmless, it's exactly what turns a real monthly trend's
+    raw values into nice 'Dec 2025' tick labels. But if the SAME x value repeats (e.g. two
+    rows for one month because the query returned an IP/OP split without a column to tell
+    them apart), Plotly's date auto-range collapses to a near-zero span and renders a
+    nonsensical microsecond-precision axis — a real, reproduced bug (a "revenue in Feb
+    2026" follow-up whose two rows were both x='2026-02'). Forcing a plain category axis
+    ONLY in that duplicate-x case sidesteps it without touching the correct date
+    formatting on genuinely distinct time-series data."""
+    vals = [v for v in xs if v is not None]
+    return len(vals) != len(set(str(v) for v in vals))
+
+
 def _hbar_geometry(labels: list[str]) -> tuple[int, int]:
     """Horizontal bar charts size their own plot height from row count, and their
     left margin from label width — a FIXED height/margin (the old behaviour) breaks
@@ -395,6 +409,8 @@ def _bar(rows, x, ys, title, kind, horizontal, stack):
         lay["margin"]["l"] = margin_l
     else:
         lay["yaxis"] = {**lay["yaxis"], **vax}
+        if _needs_category_axis(xs):
+            lay["xaxis"]["type"] = "category"
     if len(ys) > 1:
         lay["showlegend"] = True
         lay["barmode"] = "stack" if stack else "group"
@@ -423,6 +439,8 @@ def _line(rows, x, ys, title, kind, area):
     lay = _base_layout(title)
     lay["yaxis"] = {**lay["yaxis"], **_value_axis(allvals, kind)}
     lay["xaxis"]["gridcolor"] = "rgba(0,0,0,0)"
+    if _needs_category_axis(xs):
+        lay["xaxis"]["type"] = "category"
     if len(ys) > 1:
         lay["showlegend"] = True
         lay["legend"] = {"orientation": "h", "y": -0.18, "x": 0.5, "xanchor": "center", "font": {"size": 10.5}}
@@ -449,6 +467,8 @@ def _combo(rows, x, ys, y2, title, kind, y2_format=None):
     lay = _base_layout(title)
     lay["yaxis"] = {**lay["yaxis"], **_value_axis(primvals, kind)}
     lay["xaxis"]["gridcolor"] = "rgba(0,0,0,0)"
+    if _needs_category_axis(xs):
+        lay["xaxis"]["type"] = "category"
     lay["showlegend"] = True
     lay["legend"] = {"orientation": "h", "y": -0.18, "x": 0.5, "xanchor": "center", "font": {"size": 10.5}}
     if y2:
