@@ -25,6 +25,11 @@ from app.ai import warehouse, semantics, charts, routing
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+# Follow-up-question suggestions are a lightweight phrasing task, not analytical SQL
+# reasoning — gpt-4o is overkill for it. A cheaper, dedicated model call handles this so
+# every answer reliably gets 2-3 GENUINELY relevant suggestions (grounded in the actual
+# entities/numbers just discussed) instead of depending on the main model remembering to.
+MINI_DEPLOYMENT = os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT", "gpt-4o-mini")
 MAX_SQL_STEPS = 9
 MAX_AUDIT_RETRIES = 3   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
 # How many prior messages of conversation the model (and auditor) can see. Was 6 (3 exchanges)
@@ -345,6 +350,66 @@ def _verify(client, query, results, answer, history=None):
         return True, "", ""  # never block on a verifier failure (already retried inside _chat)
 
 
+_FOLLOWUP_SYS = """You suggest 2-3 short follow-up questions a hospital supply-chain operator would naturally ask right after getting the answer shown to you. This is a pure phrasing task — you are NOT analyzing data, just proposing what to ask next.
+
+You are given a GRAIN MAP: for each table, exactly which dimensions it can be sliced by and whether it has a time axis. This is ground truth — do NOT suggest a breakdown or trend that isn't actually supported by some table's real dimensions/time axis (e.g. never suggest "by department" for a revenue/sales question if no sales-side table lists a department/cost-centre dimension; never suggest "the trend over N months" for a table whose time axis is NONE). When unsure whether something is really sliceable, prefer a SAFER suggestion instead: a top-N variant, a comparison to a specific already-named entity, an outlier/consistency check, or a breakdown by a dimension you can actually see listed for a relevant table.
+
+Rules:
+1. Ground every suggestion in a SPECIFIC entity, number, or comparison that is actually named in the answer (a real item, vendor, manufacturer, category, plant, month, or metric mentioned there) — never a vague "would you like to explore further?" or "let me know if you want more details".
+2. Only suggest something genuinely answerable given the GRAIN MAP below. Never suggest anything outside the hospital supply-chain domain (no patient records, staff, org chart, external/competitor data).
+3. Keep each suggestion short (under ~9 words), phrased as a natural next question or a concrete drill-down instruction — e.g. "Break this down by hospital", "Which vendor supplies that item?", "Show the monthly trend", "Compare it to last month".
+4. Do not repeat the question that was just asked, and do not suggest something the answer already fully covered.
+5. If the answer is a simple closed fact with little to drill into, still offer a grounded next angle consistent with the GRAIN MAP — always return AT LEAST 1 suggestion, never an empty list, unless the answer is a decline/out-of-scope message with nothing to build on (then return an empty list).
+6. Specific traps to never fall into (these are the mistakes a generic BI assistant makes by default — do NOT make them here): sales/revenue data has NO vendor dimension (vendor only exists on the procurement side — never suggest "which vendor contributes to revenue" or similar) and NO cost-centre/department dimension (that's consumption-side only) and NO plant/region column at all (sales is hospital-based only). This whole dataset covers only a 6-month window — NEVER suggest a year-over-year / "vs last year" / 12-month-trend comparison; a "trend" suggestion must stay within the 6-month window (e.g. "month over month" is fine, "vs last year" is not).
+
+Reply ONLY JSON: {"follow_ups": ["...", "...", "..."]}"""
+
+
+# Deterministic backstop for the one cross-domain trap the mini model still fell into
+# non-deterministically even with an explicit instruction not to (revenue/sales has no
+# vendor or cost-centre dimension in this schema — this is a permanent, hard schema fact,
+# not a judgment call, so it's cheaper and more reliable to filter it in code than to hope
+# a temperature>0 model always remembers the rule).
+_REVENUE_WORDS = re.compile(r"\b(revenue|sales|margin)\b", re.I)
+_INVALID_CROSS_DOMAIN = re.compile(r"\b(vendor|cost.?cent(er|re)|department|plant)\b", re.I)
+
+
+def _drop_invalid_cross_domain(suggestions: list[str], query: str, answer: str) -> list[str]:
+    if not _REVENUE_WORDS.search(query or "") and not _REVENUE_WORDS.search(answer or ""):
+        return suggestions
+    return [s for s in suggestions if not _INVALID_CROSS_DOMAIN.search(s)]
+
+
+def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None) -> list[str]:
+    """Cheap, dedicated follow-up-question generator on gpt-4o-mini (not gpt-4o — this is
+    a lightweight wording task, not analytical SQL reasoning). Runs on every real answer so
+    suggestions are reliably present and grounded in what was just discussed, rather than
+    depending on the main model remembering to propose good ones. The grain map (which
+    dimensions/time axis each table really supports) is included so it can't invent an
+    unsupported breakdown (e.g. "by department" for revenue, which has no such dimension).
+    Fail-open: any error or empty response returns [] and the caller falls back to the main
+    model's own follow_ups."""
+    if not answer:
+        return []
+    try:
+        queries = [{"purpose": r.get("purpose"), "sql": r.get("sql")} for r in (results or []) if r.get("purpose")][:5]
+        payload = {"question": query, "answer": answer[:1200], "queries_run": queries,
+                   "grain_map": warehouse.grain_text()}
+        resp = _chat(client,
+            model=MINI_DEPLOYMENT, temperature=0.1, max_tokens=200,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _FOLLOWUP_SYS},
+                {"role": "user", "content": json.dumps(payload)[:10000]},
+            ])
+        out = json.loads(resp.choices[0].message.content or "{}")
+        ups = [str(f).strip() for f in (out.get("follow_ups") or []) if str(f).strip()]
+        ups = _drop_invalid_cross_domain(ups, query, answer)
+        return ups[:3]
+    except Exception:
+        return []
+
+
 _SCOPE_MARK = re.compile(r"\[active scope:\s*(.+?)\s*\]", re.I | re.S)
 _WHERE_RE = re.compile(r"\bwhere\b(.+?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)", re.I | re.S)
 # Refinement cues: a terse follow-up that leans on the PRIOR turn's scope. We only inject
@@ -575,6 +640,11 @@ def answer(query: str, history: list | None = None):
         ans = ("⚠️ _I couldn't fully verify these figures against the data — treat them as "
                "indicative and double-check before acting on them._\n\n") + ans
 
+    # Ship the answer with gpt-4o's own follow_ups (if any) immediately — do NOT block the
+    # answer on the dedicated follow-up call below. The better, grounded follow-ups from the
+    # mini-model are generated AFTER everything else has already reached the user (see the
+    # "followups" patch event near the end) so this feature adds ZERO perceived latency to
+    # the answer itself.
     follow_ups = [str(f).strip() for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]
     # Scope chain: prefer the model's own declaration, else derive from the last query. If BOTH
     # are empty (e.g. a turn that answered from prior data with no new SQL), carry the PRIOR
@@ -609,5 +679,13 @@ def answer(query: str, history: list | None = None):
                                           "columns": [{"key": c, "label": c, "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
                                           "rows": table_res["rows"][:50]},
                "note": ("Showing top 50 of %d rows." % table_res["row_count"]) if table_res.get("truncated") or table_res["row_count"] > 50 else ""}
+
+    # Better, grounded follow-ups (dedicated cheap-model call) computed only NOW — after the
+    # answer/chart/table have already reached the user — so the extra ~1-2s never delays the
+    # answer itself. Patches onto the same message once ready; if it's empty/errors, the
+    # gpt-4o-sourced chips already shown (possibly none) simply stay as they are.
+    better_follow_ups = _gen_follow_ups(client, query, ans, results)
+    if better_follow_ups and better_follow_ups != follow_ups:
+        yield {"type": "followups", "options": better_follow_ups}
 
     yield {"type": "done"}
