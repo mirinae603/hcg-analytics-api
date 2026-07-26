@@ -98,8 +98,21 @@ def _table(table, plant, params, colmap, rename):
 @router.get("/kpi/stock-change")
 def stock_change(Plant: str = Query(None), Material: str = Query(None),
                  MaterialGroup: str = Query(None), Frequency: str = Query("Monthly")):
+    # Dedicated aggregation (NOT the shared _monthly() helper, which 3 other endpoints also
+    # call and whose Title-Case-key / keep-group-by-default behaviour they still rely on).
+    # The frontend registry (kpiRegistry.ts "stock-change") expects a genuine ~6-point
+    # monthly series with LOWERCASE keys month/inflow/outflow/stock_change -- the previous
+    # code returned "Month"/"Stock Change" (wrong casing, so every value read as undefined
+    # -> 0 on the frontend) AND kept material_group in the groupby (exploding ~6 real months
+    # into ~1,302 month*category rows) AND never summed inflow/outflow at all, only the net.
     df = _filt(da.load("kpi_stock_change"), Plant, Material, MaterialGroup)
-    return _monthly(df, "stock_change", "Stock Change")
+    g = df.groupby(["year", "month"], as_index=False, observed=True)[
+        ["inflow", "outflow", "stock_change"]].sum()
+    g["_mk"] = g["month"].map({m: i for i, m in enumerate(MONTH_ORDER)})
+    g = g.sort_values(["year", "_mk"]).drop(columns="_mk")
+    return [{"year": int(r["year"]) if pd.notna(r["year"]) else None, "month": r["month"],
+             "inflow": float(r["inflow"]), "outflow": float(r["outflow"]),
+             "stock_change": float(r["stock_change"])} for _, r in g.iterrows()]
 
 
 @router.get("/kpi/stock-change-table")
@@ -114,9 +127,16 @@ def stock_change_table(request: Request, Plant: str = Query(None)):
 
 # ---------------- INVENTORY VALUATION (KPI_2) — snapshot proxy ----------------
 @router.get("/kpi/inventory-valuation")
-def inventory_valuation(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None)):
+def inventory_valuation(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
+                        top: int = Query(None)):
     df = _filt(da.load("kpi_stock_value"), Plant, Material, MaterialGroup)
     g = df.groupby("material_group", as_index=False)["stock_value_cost"].sum()
+    g = g.sort_values("stock_value_cost", ascending=False)
+    # `top` is OPTIONAL and defaults to returning every group unchanged (identical to the
+    # prior behaviour) -- only the registry-driven chart on /inventory sends it (kpiRegistry
+    # "inventory-valuation" declares top:12); every other existing caller is unaffected.
+    if top:
+        g = g.head(top)
     return [{"Year": 2026, "Month": "May", "Period": "May", "Material Group": r["material_group"],
              "Inventory Valuation": float(r["stock_value_cost"])} for _, r in g.iterrows()]
 
@@ -210,11 +230,25 @@ def itr_insights(Plant: str = Query(None)):
 
 # ---------------- INVENTORY TURNOVER (KPI_3) — snapshot proxy ----------------
 @router.get("/kpi/inventory-turnover-ratio")
-def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None)):
+def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
+        top: int = Query(None)):
     df = _filt(da.load("kpi_health_score"), Plant, Material, MaterialGroup)
-    g = df.groupby("material_group", as_index=False)["turnover_annualized"].mean()
+    # Weighted SUM(consumption)/SUM(inventory) per group, matching the bespoke ITR
+    # drill-down's own `itr` formula below -- a mean of each material's own
+    # turnover_annualized lets one near-zero-inventory SKU post a ratio in the tens of
+    # thousands and drag the whole group's average with it (live: 84.67x/66.32x/28.97x
+    # against a stated 6x "healthy" target). This endpoint feeds the same quick chart
+    # the exec-summary category breakdown reads, so it must agree with the drill-down.
+    g = df.groupby("material_group", as_index=False).agg(
+        cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"))
+    g["ITR"] = np.where(g["inv"] > 0, g["cogs"] * 2.0 / g["inv"], 0.0)
+    g = g.sort_values("ITR", ascending=False)
+    # OPTIONAL, defaults to every group (unchanged prior behaviour) -- only the registry
+    # chart (kpiRegistry "inventory-turnover-ratio" declares top:12) sends this.
+    if top:
+        g = g.head(top)
     return [{"Year": 2026, "Month": "May", "Period": "May", "Material Group": r["material_group"],
-             "ITR": round(float(r["turnover_annualized"]), 2)} for _, r in g.iterrows()]
+             "ITR": round(float(r["ITR"]), 2)} for _, r in g.iterrows()]
 
 
 @router.get("/kpi/inventory-turnover-ratio-table")

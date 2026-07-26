@@ -44,8 +44,24 @@ def dashboard_all(region: Optional[str] = Query(None)):
     # MRP-proxy revenue & margin (flagged as proxy in workbook)
     revenue_proxy = stock_mrp
     margin = round((1 - (stock_value / stock_mrp)) * 100, 1) if stock_mrp else 0.0
-    avg_doh = float(doh["doh_days"].replace([np.inf, -np.inf], np.nan).dropna().mean() or 0)
-    avg_itr = float(health["turnover_annualized"].replace([np.inf, -np.inf], np.nan).dropna().mean() or 0)
+    # MEDIAN, not mean: a handful of near-zero-consumption SKUs (e.g. 1 unit consumed all
+    # window against thousands in stock) produce a finite but astronomical doh_days (895,950
+    # in one real case) that a plain mean can't shrug off — it dragged the portfolio figure
+    # to 1445 days against a stated 30-90 day target. Median matches the bespoke DOH
+    # drill-down's own `median_doh` (legacy_kpi.py /kpi/days-on-hand/insights) so this tile
+    # and that page now agree, instead of showing two different DOH numbers on one visit.
+    avg_doh = float(doh["doh_days"].replace([np.inf, -np.inf], np.nan).dropna().median() or 0)
+    # Portfolio-level SUM(consumption)/SUM(inventory), annualized -- NOT a mean of each
+    # material's own turnover ratio. A mean-of-ratios lets a handful of near-zero-inventory
+    # SKUs (a rounding-error's worth of stock value) post ratios in the tens of thousands and
+    # pull the average far above any plant's real turnover. This is the identical
+    # "portfolio_itr" formula the bespoke Inventory Turnover Ratio drill-down already uses
+    # (legacy_kpi.py's `itr_insights`), so this tile now matches that page instead of showing
+    # 2.4x here vs 0.66x there for the same underlying data.
+    _cogs6 = float(health["consumption_cost"].sum())
+    _inv6 = float(health["closing_stock_value"].sum())
+    ANN = 2.0  # 6 months of data -> annualized
+    avg_itr = (_cogs6 * ANN) / _inv6 if _inv6 else 0.0
 
     loc = "All Plants" if not plant else plant
 
@@ -63,21 +79,28 @@ def dashboard_all(region: Optional[str] = Query(None)):
             "lowStockThreshold": 1000, "location": loc, "supplier": "—",
             "lastUpdated": "31 May 2026",
         },
+        # "trend" is omitted (None) on all three cards below, not a fabricated 0% -- none
+        # of kpi_doh / kpi_health_score / the return-rate proxy carry a month dimension in
+        # the source data, so there is no real prior-period figure to compare against. A
+        # literal "0% vs last month" copy-pasted across all three read as three independent
+        # zero-change results when it was really "we never computed this" -- every card
+        # component here already renders nothing when trend is falsy, so omitting it is a
+        # pure UI no-op, never a broken card.
         "returnRate": {  # no returns in data -> zero/proxy (see gap log)
             "currentReturnRate": 0.0,
             "historicalData": {"thirtyDaysAgo": 0.0, "sixtyDaysAgo": 0.0, "ninetyDaysAgo": 0.0},
-            "trend": {"direction": "stable", "percentage": 0, "period": "vs last month"},
+            "trend": None,
             "targetReturnRate": 2.0, "industryAverage": 3.0,
         },
         "daysOnHand": {
             "daysOnHand": round(avg_doh, 1),
-            "trend": {"direction": "stable", "percentage": 0, "period": "vs last month"},
+            "trend": None,
             "criticalThreshold": 15, "optimalRange": {"min": 30, "max": 90},
             "category": "All", "location": loc, "lastCalculated": "31 May 2026",
         },
         "inventoryTurnover": {
             "currentITR": round(avg_itr, 2), "label": "Inventory Turnover",
-            "trend": {"direction": "stable", "percentage": 0, "period": "vs last month"},
+            "trend": None,
             "targetITR": 6.0, "industryAverage": 4.0,
         },
         # extra block consumed by the rebuilt hcg-analytics-ui exec summary
