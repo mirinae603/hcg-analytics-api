@@ -426,6 +426,11 @@ def stockchange_insights(Plant: str = Query(None)):
 @router.get("/kpi/non-moving-inventory/insights")
 def nonmoving_insights(Plant: str = Query(None)):
     df = da.filter_plant(da.load("kpi_non_moving"), _plant(Plant)).copy()
+    # Denominator for the hero's "% of stock lines". kpi_non_moving is a strict row
+    # subset of kpi_stock_value (both keyed plant+material, no dupes), so
+    # blocked_skus / total_stock_lines is exact — and, unlike the literal it replaces,
+    # correct per plant (it ranges 30%-89% across plants, not a flat 78%).
+    total_lines = int(len(da.filter_plant(da.load("kpi_stock_value"), _plant(Plant))))
 
     def band(a):
         if a < 90: return "≤90d"
@@ -445,6 +450,7 @@ def nonmoving_insights(Plant: str = Query(None)):
     aging = [{"label": l, "value": float(ag.loc[l, "value"]) if l in ag.index else 0.0,
               "count": int(ag.loc[l, "count"]) if l in ag.index else 0} for l in order]
     return {"totals": {"blocked_value": float(df["closing_stock_value"].sum()), "blocked_skus": int(len(df)),
+                       "total_stock_lines": total_lines,
                        "qty": float(df["closing_stock_quantity"].sum())},
             "reasons": reasons, "categories": cats, "aging": aging}
 
@@ -872,12 +878,23 @@ def lead_insights(Plant: str = Query(None)):
 @router.get("/kpi/fill-rate/insights")
 def fill_insights(Plant: str = Query(None)):
     fr = da.filter_plant(da.load("kpi_fill_rate"), _plant(Plant)).copy()
+    # kpi_fill_rate carries no line count, so gate on kpi_purchase_by_location.po_lines —
+    # the row count of the identical fact_po groupby that produced ordered_qty (1:1 on
+    # plant). Gating on ordered_qty instead would be a no-op: the smallest plant already
+    # has 25 units, so no plant would ever be filtered.
+    fr = fr.merge(da.load("kpi_purchase_by_location")[["plant", "po_lines"]], on="plant", how="left")
+    fr["po_lines"] = fr["po_lines"].fillna(0)
     ordered = float(fr["ordered_qty"].sum()); openq = float(fr["open_qty"].sum())
     overall = (max(0.0, min(1.0, 1 - openq / ordered)) * 100) if ordered else 0.0
     fr["comp"] = (1 - fr["open_qty"] / fr["ordered_qty"]).clip(0, 1) * 100
-    worst_df = fr.sort_values("comp")
+    fr_sig = fr[fr["po_lines"] >= 20]  # drop tiny-sample plants that skew the ranking
+    fr_sig = fr_sig if len(fr_sig) else fr  # single-plant view must not blank the card
+    # kind="stable" matters: seven plants tie at exactly 100%, and pandas' default
+    # quicksort picked a different winner across pandas builds (requirements.txt pins
+    # no version, so every image rebuild could reorder them).
+    worst_df = fr_sig.sort_values("comp", kind="stable")
     worst = [{"plant": str(r["plant"]), "comp": float(r["comp"]), "ordered": float(r["ordered_qty"]), "open": float(max(r["open_qty"], 0.0))} for _, r in worst_df.head(12).iterrows()]
-    best = [{"plant": str(r["plant"]), "comp": float(r["comp"])} for _, r in fr.sort_values("comp", ascending=False).head(8).iterrows()]
+    best = [{"plant": str(r["plant"]), "comp": float(r["comp"])} for _, r in fr_sig.sort_values("comp", ascending=False, kind="stable").head(8).iterrows()]
     # every plant with real order volume — powers the priority scatter
     frv = fr[fr["ordered_qty"] > 0]
     plants = [{"plant": str(r["plant"]), "comp": float(r["comp"]), "ordered": float(r["ordered_qty"]), "open": float(max(r["open_qty"], 0.0))}
@@ -1148,7 +1165,10 @@ def forecasting_overview(Plant: str = Query(None)):
 @_cache
 def _forecasting_overview_cached(pl):
     fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
-    rp = da.filter_plant(da.load("stock_replenishment_and_aging_risk"), pl).copy()
+    # _replen_frame does the same load plus numeric coercion, cover, reorder_value and
+    # status — needed here so this page's "reorder" tile can use the same narrow,
+    # urgent definition the Reorder & Stock Risk page uses, instead of a 17x wider one.
+    rp = _replen_frame(pl)
     rd = da.filter_plant(da.load("kpi_stock_radar"), pl).copy()
     ar = da.filter_plant(da.load("kpi_aging_risk_forecast"), pl).copy()
     acc = da.load("forecast_accuracy")
@@ -1172,8 +1192,10 @@ def _forecasting_overview_cached(pl):
                 for _, r in g.iterrows() if float(r["cf"]) > 0]
 
     need = rp[rp["replenishment_quantity"] > 0].copy()
-    need["val"] = need["replenishment_quantity"] * need["unit_cost"]
+    need["val"] = need["reorder_value"]
     replen_skus = int(len(need)); replen_qty = float(need["replenishment_quantity"].sum()); replen_value = float(need["val"].sum())
+    _rn = rp[rp["status"] == "Reorder now"]
+    replen_now_skus = int(len(_rn)); replen_now_value = float(_rn["reorder_value"].sum())
     top = need.sort_values("val", ascending=False).head(8)
     top_reorder = [{"material": str(r["material_id"]), "desc": str(r.get("material_desc", "")), "qty": float(r["replenishment_quantity"]),
                     "value": float(r["val"]), "cover": float(r.get("demand_monthly", 0))} for _, r in top.iterrows()]
@@ -1184,7 +1206,7 @@ def _forecasting_overview_cached(pl):
     cards = {
         "expected-demand": {"value": fcr[0]["forecast"] if fcr else 0.0, "kind": "num", "sub": "next-month units"},
         "cash-flow-forecast": {"value": cashflow[0]["forecast"] if cashflow else 0.0, "kind": "inr", "sub": "next-month spend"},
-        "stock-replenishment": {"value": float(replen_skus), "kind": "num", "sub": "SKUs to reorder"},
+        "stock-replenishment": {"value": float(replen_now_skus), "kind": "num", "sub": "items under 1 month cover"},
         "fulfillment-rate": {"value": accd.get("Aggregate Forecast Accuracy %", 0.0), "kind": "pct", "sub": "forecast accuracy"},
         "stock-radar": {"value": float(sum(x["count"] for x in radar if x["status"] == "Stock-Out Risk")), "kind": "num", "sub": "stock-out risk SKUs"},
         "aging-risk-forecast": {"value": float(sum(x["count"] for x in aging if x["status"] == "Rising")), "kind": "num", "sub": "rising-risk SKUs"},
@@ -1193,6 +1215,7 @@ def _forecasting_overview_cached(pl):
                        "accuracy": accd.get("Aggregate Forecast Accuracy %", 0.0), "weighted_acc": accd.get("Weighted Forecast Accuracy %", 0.0),
                        "mape": accd.get("Weighted MAPE %", 0.0), "series": int(accd.get("Series count", 0)),
                        "replen_skus": replen_skus, "replen_qty": replen_qty, "replen_value": replen_value,
+                       "replen_now_skus": replen_now_skus, "replen_now_value": replen_now_value,
                        "cashflow_next": cashflow[0]["forecast"] if cashflow else 0.0, "horizon": len(fcr)},
             "timeline": timeline, "cashflow": cashflow, "radar": radar, "aging": aging, "top_reorder": top_reorder, "cards": cards}
 
@@ -1323,6 +1346,7 @@ def cashflow_insights(Plant: str = Query(None)):
             "top_items": top_items, "by_category": by_category}
 
 
+@_cache
 def _replen_frame(pl):
     rp = da.filter_plant(da.load("stock_replenishment_and_aging_risk"), pl).copy()
     for c in ["closing_stock", "closing_stock_value", "demand_forecast", "demand_monthly",
@@ -1389,9 +1413,18 @@ def replenishment_insights(Plant: str = Query(None)):
                     "reorder_count": int(r["reorder_count"]), "aging_value": float(r["aging_value"])}
                    for _, r in by.iterrows()]
 
+    _rn = rp[rp["status"] == "Reorder now"]
     totals = {"reorder_skus": int((rp["replenishment_quantity"] > 0).sum()),
               "reorder_value": float(rp["reorder_value"].sum()),
               "reorder_qty": float(rp["replenishment_quantity"].sum()),
+              # The narrow, urgent, *priced* band: stock still on hand but under one
+              # month of cover. `reorder_skus` above is the whole suggested-requisition
+              # file — 83% of it is stock-out lines that carry no unit cost, so it can
+              # never honestly be paired with a rupee figure. Keep the two separate.
+              "reorder_now_skus": int(len(_rn)),
+              "reorder_now_value": float(_rn["reorder_value"].sum()),
+              "reorder_now_qty": float(_rn["replenishment_quantity"].sum()),
+              "reorder_priced_skus": int(((rp["replenishment_quantity"] > 0) & (rp["unit_cost"] > 0)).sum()),
               "stockout_skus": int((rp["status"] == "Stock-out").sum()),
               "aging_skus": int((rp["aging_days"] > 180).sum()),
               "aging_value": float(rp[rp["aging_days"] > 180]["closing_stock_value"].sum()),

@@ -30,11 +30,34 @@ MONTH_ORDER = ["January", "February", "March", "April", "May", "June",
 _BIG_TABLES = {"fact_grn", "fact_po", "fact_inventory", "fact_consumption", "forecast_sales"}
 
 
+# ── Post-load corrections for defects baked into committed parquet ────────────
+# kpi_near_expiry.expiry_bucket was written by an ETL `pd.cut(..., [-9999, 0, 30,
+# 90, 180])` whose right-closed first bin (-9999, 0] swept days_to_expiry == 0
+# into "Expired". A batch whose expiry date IS the snapshot date has not expired —
+# it is dispensable through today and is the most urgent RECOVERABLE line, so it
+# belongs in "0-30d" (a bucket whose label was otherwise a lie: it held only 1-30d).
+# legacy_kpi.py's expiry ladder and the risk matrix's eb() both already treat
+# days_to_expiry < 0 as "Expired"; this realigns the baked column with them for
+# every consumer at once, without regenerating (and re-committing) the parquet.
+# transforms.py is fixed to match, so this becomes a no-op once the ETL next runs.
+_NEAR_EXPIRY_BINS = [-10**12, -1, 30, 90, 180]
+_NEAR_EXPIRY_LABELS = ["Expired", "0-30d", "31-90d", "91-180d"]
+
+
+def _normalize(table: str, df: pd.DataFrame) -> pd.DataFrame:
+    if table == "kpi_near_expiry" and {"days_to_expiry", "expiry_bucket"} <= set(df.columns):
+        dtype = df["expiry_bucket"].dtype
+        df["expiry_bucket"] = pd.cut(df["days_to_expiry"], _NEAR_EXPIRY_BINS,
+                                     labels=_NEAR_EXPIRY_LABELS,
+                                     right=True).astype(str).astype(dtype)
+    return df
+
+
 def _read_parquet(table: str) -> pd.DataFrame:
     for base in (KPI, CURATED):
         p = base / f"{table}.parquet"
         if p.exists():
-            return pd.read_parquet(p)
+            return _normalize(table, pd.read_parquet(p))
     raise FileNotFoundError(f"parquet not found: {table}")
 
 

@@ -137,7 +137,12 @@ def build_inventory_kpis(inv: pd.DataFrame, cons: pd.DataFrame, dim_material: pd
     e1 = inv[inv["expiry_date"].notna()].copy()
     e1["days_to_expiry"] = (e1["expiry_date"] - snapshot).dt.days
     e1 = e1[e1["days_to_expiry"] <= 180]
-    e1["expiry_bucket"] = pd.cut(e1["days_to_expiry"], [-9999, 0, 30, 90, 180],
+    # "Expired" = strictly past the expiry date (days_to_expiry < 0). A batch whose
+    # expiry date IS the snapshot date is still dispensable today, so it belongs in
+    # "0-30d" — matching the expiry ladder in legacy_kpi.py and the risk matrix's eb().
+    # The old first bin (-9999, 0] wrongly swept day 0 into "Expired"; the -9999
+    # sentinel also dropped anything expired >27 years ago into a "nan" bucket.
+    e1["expiry_bucket"] = pd.cut(e1["days_to_expiry"], [-10**12, -1, 30, 90, 180],
                                  labels=["Expired", "0-30d", "31-90d", "91-180d"]).astype(str)
     e1 = e1[["plant", "material", "material_desc", "material_group", "batch",
              "expiry_date", "days_to_expiry", "expiry_bucket", "qty", "total_cost", "total_mrp"]]
