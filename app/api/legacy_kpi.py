@@ -575,6 +575,61 @@ def nearexp_items(slab: str = Query(None), Plant: str = Query(None),
             "asof": (snap.strftime("%d %b %Y") if snap is not None else None)}
 
 
+# ---------------- WASTAGE % (expired-stock value & qty vs total stock) ----------------
+@_cache
+def _wastage_frame(pl):
+    """Expired-stock wastage %, reconciled to the Near-Expiry page's own totals.
+
+    Reuses da.load('kpi_near_expiry') (which already carries the days_to_expiry==0
+    boundary fix applied in data_access._normalize) and da.load('kpi_stock_value')
+    exactly as nearexp_insights() above does — no re-derivation of the expiry-bucket
+    binning — so 'expired_value' here is GUARANTEED to match that page's own
+    totals.expired_value rather than silently drifting into the "same label, two
+    numbers" class of bug this whole audit exists to prevent.
+    """
+    ne = da.filter_plant(da.load("kpi_near_expiry"), pl)
+    sv = da.filter_plant(da.load("kpi_stock_value"), pl)
+    exp = ne[ne["expiry_bucket"] == "Expired"]
+
+    expired_value = float(exp["total_cost"].sum())
+    expired_qty = float(exp["qty"].sum())
+    total_stock_value = float(sv["stock_value_cost"].sum())
+    total_stock_qty = float(sv["stock_qty"].sum())
+
+    by_plant_exp = exp.groupby("plant", observed=True)["total_cost"].sum()
+    by_plant_stock = sv.groupby("plant", observed=True)["stock_value_cost"].sum()
+    plants = []
+    for p in sorted(set(by_plant_stock.index) | set(by_plant_exp.index)):
+        stock_v = float(by_plant_stock.get(p, 0.0))
+        exp_v = float(by_plant_exp.get(p, 0.0))
+        # 0% is a real, meaningful answer for a plant with stock but no expired lines —
+        # only a plant with NO stock value at all (no denominator) gets None (gotcha #17:
+        # never let a 0/0 ratio masquerade as a real number, but never hide a genuine 0 either).
+        plants.append({"plant": p, "expired_value": exp_v, "stock_value": stock_v,
+                       "wastage_pct": round(exp_v / stock_v * 100, 2) if stock_v > 0 else None})
+    plants.sort(key=lambda r: (r["wastage_pct"] if r["wastage_pct"] is not None else -1), reverse=True)
+
+    return {
+        "totals": {
+            "expired_value": expired_value, "expired_qty": expired_qty,
+            "total_stock_value": total_stock_value, "total_stock_qty": total_stock_qty,
+            "wastage_pct_value": round(expired_value / total_stock_value * 100, 3) if total_stock_value > 0 else None,
+            "wastage_pct_qty": round(expired_qty / total_stock_qty * 100, 3) if total_stock_qty > 0 else None,
+        },
+        "by_plant": plants,
+    }
+
+
+@router.get("/kpi/wastage-rate/insights")
+def wastage_rate_insights(Plant: str = Query(None)):
+    """Wastage % (E-series companion to near-expiry): headline value-basis figure
+    (expired stock value / total stock value) + a secondary qty-basis figure + the
+    per-plant breakdown, plus the raw expired_value/total_stock_value so the frontend
+    can show its work / let a user cross-reference against /kpi/near-expiry/insights'
+    totals.expired_value (must always match exactly — same source computation)."""
+    return _wastage_frame(_plant(Plant))
+
+
 # ---------------- INVENTORY AGING (KPI_5 / Chart_KPI_5) ----------------
 @router.get("/kpi/inventory-aging")
 def inventory_aging(Plant: str = Query(None)):
@@ -648,13 +703,15 @@ def _procurement_overview_cached(pl):
     n_plants = int(loc["plant"].nunique())
 
     # MRP-based procurement margin proxy (client #12: "add Margin % to the card").
-    # Only rows where BOTH MRP and cost are recorded (unit_mrp is sparse in GRN, so
-    # summing over all rows would count cost without its matching MRP → false negative).
+    # Reuses _vendor_margin's own outlier-clean rows (net_price/unit_mrp floor >=10,
+    # per-material 8x median band) rather than a separate naive >0 floor — the two used
+    # to disagree wildly (73.7% here vs 39.8% on the Vendor Margin detail page, because
+    # fact_grn's placeholder/transposed-price rows inflate an unfiltered mrp_val ~2.7x).
+    # Sharing _clean_grn_rows guarantees this card and that page can never drift apart.
     try:
-        grn = da.filter_plant(da.load("fact_grn"), pl)
-        g2 = grn[(grn["unit_mrp"] > 0) & (grn["net_price"] > 0) & (grn["gr_qty"] > 0)]
-        mrp_val = float((g2["gr_qty"] * g2["unit_mrp"]).sum())
-        cost_val = float((g2["gr_qty"] * g2["net_price"]).sum())
+        clean = _clean_grn_rows(da.filter_plant(da.load("fact_grn"), pl))
+        mrp_val = float(clean["mrp_value"].sum())
+        cost_val = float(clean["cost_value"].sum())
     except Exception:
         mrp_val = cost_val = 0.0
     margin_val = mrp_val - cost_val
@@ -669,6 +726,7 @@ def _procurement_overview_cached(pl):
         "procurement-cycle-time": {"value": avg_po_gr, "kind": "days", "sub": "PO→GR"},
         "vendor-lead-time": {"value": med_lead, "kind": "days", "sub": "median lead"},
         "fill-rate": {"value": completion, "kind": "pct", "sub": "order completion"},
+        "vendor-volume-vs-margin": {"value": margin_pct, "kind": "pct", "sub": "MRP-proxy margin, cleaned"},
     }
 
     # Open POs — undelivered order value by category (client #12: category + number + value).
@@ -986,30 +1044,99 @@ def monthly_purchase_value_table(request: Request, Plant: str = Query(None)):
 
 
 # ---------------- VENDOR VOLUME vs MARGIN (KPI_7) — from GRN ----------------
+def _clean_grn_rows(grn):
+    """The single source of truth for MRP-proxy margin's outlier-clean fact_grn rows.
+
+    fact_grn has severe data-entry outliers (placeholder prices, price/qty
+    transposition, unit-of-measure errors — net_price/unit_mrp max out around 1.1-1.2e8)
+    that make an unfiltered mrp_value/cost_value swing wildly (an earlier version of the
+    Procurement Overview's margin card, filtered only at >0, showed 73.7% — 1.85x the
+    correct 39.8% — purely from these rows). Apply the same clean-band methodology as
+    mart_material_price_stats (app/ai/warehouse.py _build_procurement_mart) / semantics.py
+    gotcha #15, extended to unit_mrp per that same gotcha's own note ("unit_mrp is exactly
+    as prone to the same errors as net_price"): floor both price columns at 10, take each
+    MATERIAL's own median net_price/unit_mrp, keep only rows within an 8x band of that
+    median. Every caller that needs an MRP-proxy margin number MUST go through this one
+    function — that is what keeps the Vendor Margin detail page and the Procurement
+    Overview's summary card from ever being able to drift apart again.
+
+    Returns the cleaned rows with mrp_value/cost_value columns added (gr_qty*unit_mrp,
+    gr_qty*net_price); does not aggregate — callers group/sum as needed.
+    """
+    raw = grn[grn["material"].notna() & (grn["net_price"] >= 10) & (grn["unit_mrp"] >= 10)
+              & (grn["gr_qty"] > 0)].copy()
+    if raw.empty:
+        raw["mrp_value"] = raw.get("mrp_value", pd.Series(dtype=float))
+        raw["cost_value"] = raw.get("cost_value", pd.Series(dtype=float))
+        return raw
+
+    m1_price = raw.groupby("material")["net_price"].transform("median")
+    m1_mrp = raw.groupby("material")["unit_mrp"].transform("median")
+    clean = raw[raw["net_price"].between(m1_price / 8, m1_price * 8)
+                & raw["unit_mrp"].between(m1_mrp / 8, m1_mrp * 8)].copy()
+    clean["mrp_value"] = clean["gr_qty"] * clean["unit_mrp"]
+    clean["cost_value"] = clean["gr_qty"] * clean["net_price"]
+    return clean
+
+
 def _vendor_margin(plant):
-    grn = da.filter_plant(da.load("fact_grn"), _plant(plant)).copy()
-    g = grn.groupby(["vendor_name", "year", "month"], as_index=False, observed=True).agg(
-        grn_volume=("gr_qty", "sum"), unit_cost=("net_price", "mean"), unit_mrp=("unit_mrp", "mean"))
-    g["margin"] = np.where(g["unit_mrp"] > 0, (g["unit_mrp"] - g["unit_cost"]) / g["unit_mrp"] * 100, 0)
-    return g
+    """MRP-proxy margin per vendor-month — see _clean_grn_rows for the outlier-clean
+    methodology. Aggregates a VALUE-WEIGHTED margin_pct = (mrp_value-cost_value)/mrp_value
+    — never a mean of per-line ratios (semantics.py gotcha #15/#17 — denominator is always
+    mrp_value, and a 0 denominator must yield None, not a fake 0%).
+    """
+    cols = ["vendor_name", "year", "month", "grn_volume", "unit_cost", "unit_mrp",
+            "margin", "clean_n", "is_stable"]
+    grn = da.filter_plant(da.load("fact_grn"), _plant(plant))
+    clean = _clean_grn_rows(grn)
+    if clean.empty:
+        return pd.DataFrame(columns=cols)
+
+    g = clean.groupby(["vendor_name", "year", "month"], as_index=False, observed=True).agg(
+        grn_volume=("gr_qty", "sum"), mrp_value=("mrp_value", "sum"),
+        cost_value=("cost_value", "sum"), clean_n=("gr_qty", "count"))
+    # margin_pct denominator is ALWAYS mrp_value; a non-positive denominator yields None
+    # (never 0 — a 0 reads as "no margin", not "undefined"; gotcha #17).
+    g["margin"] = np.where(g["mrp_value"] > 0, (g["mrp_value"] - g["cost_value"]) / g["mrp_value"] * 100, np.nan)
+    # Display prices are volume-weighted averages over the CLEAN rows, not a raw mean.
+    g["unit_cost"] = np.where(g["grn_volume"] > 0, g["cost_value"] / g["grn_volume"], np.nan)
+    g["unit_mrp"] = np.where(g["grn_volume"] > 0, g["mrp_value"] / g["grn_volume"], np.nan)
+    # Sample-size / stability signal (same "never hide, just disclose" convention as
+    # mart_material_price_stats.price_is_stable) — many vendor-months are thin-sample;
+    # surface clean_n so the UI can flag them without hiding the row.
+    g["is_stable"] = g["clean_n"] >= 5
+    return g[cols]
+
+
+def _num_or_none(v):
+    return None if pd.isna(v) else float(v)
 
 
 @router.get("/kpi/vendor-volume-vs-margin")
 def vendor_margin(Plant: str = Query(None)):
     g = _vendor_margin(Plant)
     g = g.sort_values("grn_volume", ascending=False).head(200)
-    return [{"Year": int(r["year"]) if pd.notna(r["year"]) else None, "Month": r["month"], "Vendor Name": r["vendor_name"],
-             "GRN Volume": float(r["grn_volume"]), "Unit Purchase Price": round(float(r["unit_cost"]), 2),
-             "Unit MRP Price": round(float(r["unit_mrp"]), 2), "Margin (%)": round(float(r["margin"]), 1),
-             "Margin": round(float(r["margin"]), 1)} for _, r in g.iterrows()]
+    out = []
+    for _, r in g.iterrows():
+        cost = _num_or_none(r["unit_cost"]); mrp = _num_or_none(r["unit_mrp"]); mgn = _num_or_none(r["margin"])
+        out.append({"Year": int(r["year"]) if pd.notna(r["year"]) else None, "Month": r["month"],
+                    "Vendor Name": r["vendor_name"], "GRN Volume": float(r["grn_volume"]),
+                    "Unit Purchase Price": round(cost, 2) if cost is not None else None,
+                    "Unit MRP Price": round(mrp, 2) if mrp is not None else None,
+                    "Margin (%)": round(mgn, 1) if mgn is not None else None,
+                    "Margin": round(mgn, 1) if mgn is not None else None,
+                    "Sample Size": int(r["clean_n"]), "Stable": bool(r["is_stable"])})
+    return out
 
 
 @router.get("/kpi/vendor-volume-vs-margin-table")
 def vendor_margin_table(request: Request, Plant: str = Query(None)):
     g = _vendor_margin(Plant)
-    return _paginate_df(g, request, ["year", "month", "vendor_name", "grn_volume", "unit_cost", "unit_mrp", "margin"],
+    return _paginate_df(g, request,
+        ["year", "month", "vendor_name", "grn_volume", "unit_cost", "unit_mrp", "margin", "clean_n", "is_stable"],
         {"year": "year", "month": "period", "vendor_name": "vendorName", "grn_volume": "grnVolume",
-         "unit_cost": "averageUnitCost", "unit_mrp": "sellingPrice", "margin": "margin"})
+         "unit_cost": "averageUnitCost", "unit_mrp": "sellingPrice", "margin": "margin",
+         "clean_n": "sampleSize", "is_stable": "isStable"})
 
 
 # ---------------- UNITS CONSUMED (KPI_8) ----------------
