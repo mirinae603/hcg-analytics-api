@@ -18,3 +18,9 @@ venv/
 
 # local user store (seeded at runtime)
 app/data/users.json
+
+# local SQLite DB (users, chat sessions/messages) — seeded/migrated at runtime
+app/data/app.db
+app/data/app.db-journal
+app/data/*.db
+app/data/*.db-journal

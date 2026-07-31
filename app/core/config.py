@@ -22,5 +22,20 @@ class Settings(BaseSettings):
     # --- Admin ---------------------------------------------------------------
     ADMIN_REFRESH_TOKEN: str = "change-me"
 
+    # --- Database (SQLite via SQLAlchemy — users, chat sessions/messages) ----
+    # A local file next to the old users.json, same gitignored-local-store convention.
+    # Override via env DATABASE_URL (e.g. to point at Postgres later) if ever needed.
+    DATABASE_URL: str = "sqlite:///" + str(
+        Path(__file__).resolve().parents[1] / "data" / "app.db"
+    )
+
+    # --- Auth (JWT) ------------------------------------------------------------
+    # DEV-ONLY DEFAULT — a real deployment MUST set JWT_SECRET_KEY via env to a long
+    # random secret. Left with a fallback so local dev works out of the box; the
+    # fallback must never be relied on in production.
+    JWT_SECRET_KEY: str = "dev-only-insecure-default-secret-CHANGE-ME-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 720  # 12 hours
+
 
 settings = Settings()

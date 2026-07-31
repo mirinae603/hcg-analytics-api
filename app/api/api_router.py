@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from app.api import kpi_generic, sales_forecast_kpi, replenishment_and_aging_risk
-from app.api import dashboard_summary, legacy_kpi, authenticate
+from app.api import dashboard_summary, legacy_kpi, authenticate, chat
 from app.ai import router as ai_router
 
 api_router = APIRouter()
@@ -28,3 +28,6 @@ api_router.include_router(authenticate.router, tags=["Auth"])
 
 # AI Analyst — Azure OpenAI tool-calling over the deterministic analytics catalog (SSE).
 api_router.include_router(ai_router.router, tags=["AI Analyst"])
+
+# AI Analyst chat persistence — sessions/messages, common/shared across all logged-in users.
+api_router.include_router(chat.router, tags=["AI Chat Sessions"])

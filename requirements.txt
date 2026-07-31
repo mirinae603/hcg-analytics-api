@@ -12,3 +12,17 @@ email-validator
 openai>=1.30.0
 python-dotenv>=1.0.0
 duckdb>=1.0.0
+
+# --- Auth / chat persistence (SQLite via SQLAlchemy) ---
+sqlalchemy>=2.0
+passlib[bcrypt]
+# Pinned: passlib 1.7.4's bcrypt backend hard-crashes on bcrypt>=4.1 (removed the
+# `__about__` shim passlib probes, and changed long-password handling). 4.0.1 is the
+# last release that works cleanly with passlib 1.7.4 — do not bump without re-testing.
+bcrypt==4.0.1
+PyJWT>=2.8
+
+# --- Tests ---
+pytest>=8.0
+httpx
+pytest-asyncio

@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,7 +14,21 @@ except Exception:
 from app.api.api_router import api_router
 from app.core.config import settings
 
-app = FastAPI(title=settings.PROJECT_NAME)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Creates tables on first boot and migrates app/data/users.json (re-seeding
+    # admin@hcg.com fresh with a bcrypt hash of "admin123"). Idempotent — safe on
+    # every restart. Deliberately NOT run at import time so importing `app` (e.g. in
+    # tests, which override the DB dependency with an isolated test DB) never touches
+    # the real on-disk app.db as a side effect — it only runs when the app's lifespan
+    # actually starts (a real uvicorn boot, or `with TestClient(app) as c:`).
+    from app.core.seed import seed_and_migrate
+    seed_and_migrate()
+    yield
+
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
