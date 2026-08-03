@@ -55,13 +55,17 @@ class DashboardResponse(BaseModel):
 def get_replenishment_dashboard_data(
     plant: Optional[str] = Query(None),
     material_id: Optional[str] = Query(None),
+    category: Optional[str] = Query(None, alias="Category"),
 ):
     try:
         df = da.load("stock_replenishment_and_aging_risk").copy()
         df = da.filter_plant(df, plant)
+        df = da.filter_category(df, category)
         filters_applied: Dict[str, Any] = {}
         if plant:
             filters_applied["plant"] = plant
+        if da.resolve_category(category):
+            filters_applied["category"] = da.resolve_category(category)
         if material_id:
             df = df[df["material_id"].astype(str).str.contains(material_id, case=False, na=False)]
             filters_applied["material_id"] = material_id
@@ -125,11 +129,13 @@ def get_available_weeks():
 def get_weekly_forecast_data(
     week: str = Query("week_1"),
     plant: Optional[str] = Query(None),
+    category: Optional[str] = Query(None, alias="Category"),
     limit: int = Query(250, ge=1, le=2000),
 ):
     try:
         df = da.load("stock_replenishment_and_aging_risk").copy()
         df = da.filter_plant(df, plant)
+        df = da.filter_category(df, category)
         df = df.fillna(0)
         if not len(df):
             return FilteredDataResponse(data=[], week_filter=week, plant_filter=plant, total_records=0)

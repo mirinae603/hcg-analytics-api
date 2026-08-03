@@ -16,9 +16,11 @@ router = APIRouter()
 
 
 def _series(plant: str, material: Optional[str], material_group: Optional[str],
-            qty_col: str, lo_col: str, fc_col: str, hi_col: str) -> List[Dict[str, Any]]:
+            qty_col: str, lo_col: str, fc_col: str, hi_col: str,
+            category: Optional[str] = None) -> List[Dict[str, Any]]:
     df = da.load("forecast_sales").copy()
     df = da.filter_plant(df, plant)
+    df = da.filter_category(df, category)
     if material and material != "All Items":
         df = df[df["material_id"].astype(str) == str(material)]
     elif material_group:
@@ -45,18 +47,22 @@ def _series(plant: str, material: Optional[str], material_group: Optional[str],
 
 @router.get("/forecast/sales-forecast")
 def sales_forecast(Plant: str = Query(...), Material: Optional[str] = Query(None),
-                   MaterialGroup: Optional[str] = Query(None)) -> List[Dict[str, Any]]:
+                   MaterialGroup: Optional[str] = Query(None),
+                   Category: Optional[str] = Query(None)) -> List[Dict[str, Any]]:
     return _series(Plant, Material, MaterialGroup,
                    "sales_quantity", "lower_bound_sales_quantity_forecast",
-                   "sales_quantity_forecast", "upper_bound_sales_quantity_forecast")
+                   "sales_quantity_forecast", "upper_bound_sales_quantity_forecast",
+                   category=Category)
 
 
 @router.get("/forecast/cashflow-forecast")
 def cashflow_forecast(Plant: str = Query(...), Material: Optional[str] = Query(None),
-                      MaterialGroup: Optional[str] = Query(None)) -> List[Dict[str, Any]]:
+                      MaterialGroup: Optional[str] = Query(None),
+                      Category: Optional[str] = Query(None)) -> List[Dict[str, Any]]:
     return _series(Plant, Material, MaterialGroup,
                    "sales_value", "lower_bound_cashflow_forecast",
-                   "cashflow_forecast", "upper_bound_cashflow_forecast")
+                   "cashflow_forecast", "upper_bound_cashflow_forecast",
+                   category=Category)
 
 
 @router.get("/forecast/accuracy")

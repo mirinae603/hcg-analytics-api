@@ -44,13 +44,128 @@ _NEAR_EXPIRY_BINS = [-10**12, -1, 30, 90, 180]
 _NEAR_EXPIRY_LABELS = ["Expired", "0-30d", "31-90d", "91-180d"]
 
 
+# ── Derived `category` dimension ──────────────────────────────────────────────
+# HCG's material taxonomy lives ONLY in dim_material.material_type (SAP material
+# types like "ZOC-Medical Onco Drugs"); no KPI aggregate carries it. Rather than
+# regenerate + re-commit every parquet, we derive a `category` column at the single
+# _read_parquet choke point, exactly as the near-expiry bucket fix above does — so
+# every consumer (charts, tables, insights, the AI analyst) gets it for free.
+#
+# The buckets are chosen for an ONCOLOGY hospital chain: the onco / non-onco drug
+# split is the single most decision-relevant cut, so it is NEVER collapsed into one
+# "Pharma". Verified shares of the Rs 60.47 Cr total stock value:
+#   Onco Drugs 41.67% | Consumables 36.44% | Other Drugs 17.03% | Non-Medical 3.49%
+#   | Lab 1.38% | Unclassified 0.00%
+# ~6,851 dim_material rows carry a null material_type, but they hold ZERO stock
+# value — so the filter is complete on value even though it is not on raw row count.
+# They (and any material absent from dim_material entirely) land in "Unclassified":
+# clearly labelled, never silently dropped and never silently folded into a real
+# bucket.
+CATEGORY_UNCLASSIFIED = "Unclassified"
+
+# SAP material-type code (the part before the first "-") -> reporting bucket.
+CATEGORY_CODE_MAP = {
+    "ZOC": "Onco Drugs",
+    "ZNOC": "Other Drugs",
+    "ZMC": "Consumables",
+    "ZLR": "Lab",
+    "ZLCL": "Lab",
+    "ZLCO": "Lab",
+    "ZNMC": "Non-Medical",
+    "ZNMA": "Non-Medical",
+    "ZMA": "Non-Medical",
+}
+
+# Display order the frontend should render (excluding the implicit "All" default).
+CATEGORIES = ["Onco Drugs", "Other Drugs", "Consumables", "Lab", "Non-Medical",
+              CATEGORY_UNCLASSIFIED]
+
+# Every string a caller may legitimately pass for a bucket, lowercased.
+_CATEGORY_ALIASES = {c.lower(): c for c in CATEGORIES}
+_CATEGORY_ALIASES.update({k.lower(): v for k, v in CATEGORY_CODE_MAP.items()})
+
+
+def category_of_material_type(mt) -> str:
+    """Map one raw dim_material.material_type value to its reporting bucket."""
+    s = "" if mt is None else str(mt).strip()
+    if not s or s.lower() in ("nan", "none", "<na>"):
+        return CATEGORY_UNCLASSIFIED
+    return CATEGORY_CODE_MAP.get(s.split("-", 1)[0].strip().upper(), CATEGORY_UNCLASSIFIED)
+
+
+@lru_cache(maxsize=1)
+def _material_category_map() -> dict:
+    """material -> category, built ONCE from dim_material.
+
+    Read straight off the parquet rather than through load()/_read_parquet: this is
+    called from inside _normalize, so going back through the normal read path would
+    recurse. dim_material is ~25k rows, so the one-off build is trivial and the
+    lru_cache means the per-table hook below is a single vectorised .map().
+    """
+    p = CURATED / "dim_material.parquet"
+    if not p.exists():
+        return {}
+    dm = pd.read_parquet(p, columns=["material", "material_type"])
+    return {str(m): category_of_material_type(t)
+            for m, t in zip(dm["material"], dm["material_type"])}
+
+
+def _material_key(df: pd.DataFrame) -> Optional[str]:
+    for c in ("material", "material_id"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _attach_category(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a `category` column to any frame that carries a material dimension.
+
+    Order of preference:
+      1. an existing `material_type` column (fact_inventory / dim_material carry
+         their own — use it directly, no join needed);
+      2. a material / material_id column, mapped through dim_material.
+    Frames with neither (kpi_purchase_value, kpi_vendor_volume, kpi_cycle_time,
+    kpi_aging_distribution, …) are left completely untouched — no column, no row
+    change — so a category cut can never be silently faked on a table that has no
+    material grain. A pre-existing `category` column (kpi_purchase_value's PO
+    category) is likewise never overwritten.
+    """
+    if "category" in df.columns:
+        return df
+
+    # This hook runs on EVERY table load, including the big fact tables that are
+    # deliberately not held resident and so reload per request — it has to stay cheap.
+    # Both branches below are a single vectorised .map() against a prebuilt dict; the
+    # material_type branch builds its lookup from that column's ~10 DISTINCT values
+    # rather than calling the classifier once per row (which cost ~50 ms on
+    # fact_inventory's 97k rows for no reason). astype() is skipped when the key
+    # column is already a string dtype, which it is in every committed parquet.
+    def _as_str(s):
+        return s if s.dtype == "str" or s.dtype == object else s.astype("str")
+
+    if "material_type" in df.columns:
+        uniq = df["material_type"].dropna().unique()
+        lut = {u: category_of_material_type(u) for u in uniq}
+        df["category"] = df["material_type"].map(lut).fillna(CATEGORY_UNCLASSIFIED).astype("str")
+        return df
+
+    key = _material_key(df)
+    if key is None:
+        return df
+    cmap = _material_category_map()
+    if not cmap:
+        return df
+    df["category"] = _as_str(df[key]).map(cmap).fillna(CATEGORY_UNCLASSIFIED).astype("str")
+    return df
+
+
 def _normalize(table: str, df: pd.DataFrame) -> pd.DataFrame:
     if table == "kpi_near_expiry" and {"days_to_expiry", "expiry_bucket"} <= set(df.columns):
         dtype = df["expiry_bucket"].dtype
         df["expiry_bucket"] = pd.cut(df["days_to_expiry"], _NEAR_EXPIRY_BINS,
                                      labels=_NEAR_EXPIRY_LABELS,
                                      right=True).astype(str).astype(dtype)
-    return df
+    return _attach_category(df)
 
 
 def _read_parquet(table: str) -> pd.DataFrame:
@@ -77,6 +192,7 @@ def load(table: str) -> pd.DataFrame:
 def refresh_cache() -> None:
     _load_cached.cache_clear()
     _name_to_code.cache_clear()
+    _material_category_map.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -101,6 +217,24 @@ def _month_sort_key(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.zeros(len(df)), index=df.index)
 
 
+def resolve_category(category: Optional[str]) -> Optional[str]:
+    """Accept a bucket name or a raw SAP material-type code; return the canonical
+    bucket (None => all categories, i.e. no filtering).
+
+    Sibling of resolve_plant, same conventions: empty / "All" => None. An
+    unrecognised value is returned unchanged rather than silently ignored, so
+    filter_category yields an EMPTY result instead of quietly handing back the
+    whole portfolio under a filter label the user believes is applied. Drive the
+    selector off GET /meta/categories and this branch never fires.
+    """
+    if not category:
+        return None
+    s = str(category).strip()
+    if not s or s.upper() in ("ALL", "ALL CATEGORIES", "ALL ITEMS"):
+        return None
+    return _CATEGORY_ALIASES.get(s.lower(), s)
+
+
 def filter_plant(df: pd.DataFrame, plant: Optional[str]) -> pd.DataFrame:
     code = resolve_plant(plant)
     if code and "plant" in df.columns:
@@ -108,12 +242,47 @@ def filter_plant(df: pd.DataFrame, plant: Optional[str]) -> pd.DataFrame:
     return df
 
 
+def _is_derived_category_col(df: pd.DataFrame) -> bool:
+    """True only when `category` is OUR material-category column, not a same-named
+    column that already existed in the source data.
+
+    kpi_purchase_value ships its own `category` — the PO taxonomy (ANTINEOPLASTIC,
+    CYTOTOXIC CHEMOTHERAPY, ~1,360 values). _attach_category correctly refuses to
+    overwrite it, but filtering on it anyway matched nothing and made
+    /kpi/purchase-value return Rs 0 under any category — while monthly-purchase-value
+    returned Rs 236.7 Cr for the same filter, so the two procurement money metrics
+    flatly contradicted each other. Checking the vocabulary is self-describing and
+    cannot go stale the way a hardcoded table list would.
+    """
+    vals = pd.Series(df["category"]).dropna().unique()
+    if len(vals) == 0:
+        return False
+    return set(map(str, vals)) <= set(CATEGORIES)
+
+
+def filter_category(df: pd.DataFrame, category: Optional[str]) -> pd.DataFrame:
+    """Sibling of filter_plant for the derived material-category dimension.
+
+    A no-op when no category is passed (the default) — every existing call site
+    and every number already on the dashboard is unchanged — a no-op on frames that
+    carry no `category` column at all (tables with no material grain), and a no-op
+    on frames whose `category` means something else entirely (see above), so a
+    material-category cut can never silently zero out an unrelated metric.
+    """
+    cat = resolve_category(category)
+    if cat and "category" in df.columns and _is_derived_category_col(df):
+        return df[df["category"].astype(str) == cat]
+    return df
+
+
 def query(table: str, plant: Optional[str] = None, material: Optional[str] = None,
           material_group: Optional[str] = None, material_col: str = "material",
-          group_col: str = "material_group", sort_chrono: bool = True) -> list[dict]:
-    """Chart-data query: filter by plant + (material | material_group), chrono sort."""
+          group_col: str = "material_group", sort_chrono: bool = True,
+          category: Optional[str] = None) -> list[dict]:
+    """Chart-data query: filter by plant + category + (material | material_group), chrono sort."""
     df = load(table)
     df = filter_plant(df, plant)
+    df = filter_category(df, category)
     if material and material != "All Items" and material_col in df.columns:
         mats = [m.strip() for m in str(material).split(",")]
         df = df[df[material_col].astype(str).isin(mats)]
@@ -126,10 +295,12 @@ def query(table: str, plant: Optional[str] = None, material: Optional[str] = Non
 
 def chart_series(table: str, plant=None, material=None, material_group=None,
                  group_by: Optional[str] = None, measures: Optional[str] = None,
-                 top: Optional[int] = None, row_cap: int = 5000) -> list[dict]:
+                 top: Optional[int] = None, row_cap: int = 5000,
+                 category: Optional[str] = None) -> list[dict]:
     """Chart data with optional server-side group-by aggregation (bounded payload)."""
     df = load(table)
     df = filter_plant(df, plant)
+    df = filter_category(df, category)
     if material and material != "All Items" and "material" in df.columns:
         mats = [m.strip() for m in str(material).split(",")]
         df = df[df["material"].astype(str).isin(mats)]
@@ -159,10 +330,12 @@ def chart_series(table: str, plant=None, material=None, material_group=None,
     return _clean_records(df.head(row_cap))
 
 
-def summarize(table: str, plant=None, material=None, material_group=None) -> dict:
+def summarize(table: str, plant=None, material=None, material_group=None,
+              category: Optional[str] = None) -> dict:
     """Correct, uncapped sum/mean/count + distinct counts over the filtered table."""
     df = load(table)
     df = filter_plant(df, plant)
+    df = filter_category(df, category)
     if material and material != "All Items" and "material" in df.columns:
         df = df[df["material"].astype(str).isin([m.strip() for m in str(material).split(",")])]
     elif material_group and "material_group" in df.columns:
@@ -210,10 +383,12 @@ def _apply_filter_protocol(df: pd.DataFrame, params: dict, col_map: dict) -> pd.
 
 
 def paginate(table: str, plant: Optional[str], params: dict, col_map: dict,
-             columns: Optional[list[str]] = None, rename: Optional[dict] = None) -> dict:
+             columns: Optional[list[str]] = None, rename: Optional[dict] = None,
+             category: Optional[str] = None) -> dict:
     """Server-side table: filter + sort + page. Returns {data, total}."""
     df = load(table)
     df = filter_plant(df, plant)
+    df = filter_category(df, category)
     df = _apply_filter_protocol(df, params, col_map)
 
     total = len(df)

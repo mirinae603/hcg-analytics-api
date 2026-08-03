@@ -38,11 +38,14 @@ def warmup() -> None:
     """Precompute the default (All-Plants) portfolio overviews so the FIRST request
     after a cold start hits a warm cache instead of loading fact_grn/fact_po live.
     Names resolve at call time (the cached fns are defined below)."""
+    # Arg tuples must match the endpoints' own call shape exactly — lru_cache keys on
+    # the literal args, so warming `f(None)` would NOT be hit by an endpoint calling
+    # `f(None, None)` and the cold-start load would happen anyway.
     for fn_name, args in (
         ("_procurement_overview_cached", (None,)),
         ("_procurement_savings_cached", (None, 12)),
-        ("_consumption_overview_cached", (None,)),
-        ("_forecasting_overview_cached", (None,)),
+        ("_consumption_overview_cached", (None, None)),
+        ("_forecasting_overview_cached", (None, None)),
     ):
         try:
             globals()[fn_name](*args)
@@ -63,13 +66,23 @@ def _plant(p: Optional[str]) -> Optional[str]:
     return da.resolve_plant(p)
 
 
-def _filt(df, plant, material, group):
+def _filt(df, plant, material, group, category=None):
+    """Shared plant + category + (material | material_group) filter.
+
+    `category` is OPTIONAL and defaults to None => da.filter_category is a no-op, so
+    every response is identical to before when the frontend sends no Category."""
     df = da.filter_plant(df, _plant(plant))
+    df = da.filter_category(df, category)
     if material and material != "All Items" and "material" in df.columns:
         df = df[df["material"].astype(str).isin([m.strip() for m in str(material).split(",")])]
     elif group and "material_group" in df.columns:
         df = df[df["material_group"].astype(str) == str(group)]
     return df
+
+
+def _pc(df, plant, category=None):
+    """Plant + category filter — the two global selectors, in one call."""
+    return da.filter_category(da.filter_plant(df, _plant(plant)), category)
 
 
 def _monthly(df, measure, label, keep_group=True):
@@ -97,7 +110,8 @@ def _table(table, plant, params, colmap, rename):
 # ---------------- STOCK CHANGE (KPI_1) ----------------
 @router.get("/kpi/stock-change")
 def stock_change(Plant: str = Query(None), Material: str = Query(None),
-                 MaterialGroup: str = Query(None), Frequency: str = Query("Monthly")):
+                 MaterialGroup: str = Query(None), Category: str = Query(None),
+                 Frequency: str = Query("Monthly")):
     # Dedicated aggregation (NOT the shared _monthly() helper, which 3 other endpoints also
     # call and whose Title-Case-key / keep-group-by-default behaviour they still rely on).
     # The frontend registry (kpiRegistry.ts "stock-change") expects a genuine ~6-point
@@ -105,7 +119,7 @@ def stock_change(Plant: str = Query(None), Material: str = Query(None),
     # code returned "Month"/"Stock Change" (wrong casing, so every value read as undefined
     # -> 0 on the frontend) AND kept material_group in the groupby (exploding ~6 real months
     # into ~1,302 month*category rows) AND never summed inflow/outflow at all, only the net.
-    df = _filt(da.load("kpi_stock_change"), Plant, Material, MaterialGroup)
+    df = _filt(da.load("kpi_stock_change"), Plant, Material, MaterialGroup, Category)
     g = df.groupby(["year", "month"], as_index=False, observed=True)[
         ["inflow", "outflow", "stock_change"]].sum()
     g["_mk"] = g["month"].map({m: i for i, m in enumerate(MONTH_ORDER)})
@@ -116,8 +130,8 @@ def stock_change(Plant: str = Query(None), Material: str = Query(None),
 
 
 @router.get("/kpi/stock-change-table")
-def stock_change_table(request: Request, Plant: str = Query(None)):
-    return da.paginate("kpi_stock_change", _plant(Plant), dict(request.query_params),
+def stock_change_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    return da.paginate("kpi_stock_change", _plant(Plant), dict(request.query_params), category=Category,
         col_map={"year": "year", "period": "month", "materialId": "material",
                  "materialName": "material_desc", "materialGroup": "material_group", "stockChange": "stock_change"},
         columns=["year", "month", "material", "material_desc", "material_group", "stock_change"],
@@ -128,8 +142,8 @@ def stock_change_table(request: Request, Plant: str = Query(None)):
 # ---------------- INVENTORY VALUATION (KPI_2) — snapshot proxy ----------------
 @router.get("/kpi/inventory-valuation")
 def inventory_valuation(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
-                        top: int = Query(None)):
-    df = _filt(da.load("kpi_stock_value"), Plant, Material, MaterialGroup)
+                        Category: str = Query(None), top: int = Query(None)):
+    df = _filt(da.load("kpi_stock_value"), Plant, Material, MaterialGroup, Category)
     g = df.groupby("material_group", as_index=False)["stock_value_cost"].sum()
     g = g.sort_values("stock_value_cost", ascending=False)
     # `top` is OPTIONAL and defaults to returning every group unchanged (identical to the
@@ -142,8 +156,8 @@ def inventory_valuation(Plant: str = Query(None), Material: str = Query(None), M
 
 
 @router.get("/kpi/inventory-valuation/insights")
-def valuation_insights(Plant: str = Query(None)):
-    inv = da.filter_plant(da.load("fact_inventory"), _plant(Plant)).copy()
+def valuation_insights(Plant: str = Query(None), Category: str = Query(None)):
+    inv = _pc(da.load("fact_inventory"), Plant, Category).copy()
     cost = float(inv["total_cost"].sum())
     mrp = float(inv["total_mrp"].sum())
     markup = mrp - cost
@@ -177,8 +191,8 @@ def valuation_insights(Plant: str = Query(None)):
 
 
 @router.get("/kpi/inventory-valuation-table")
-def inventory_valuation_table(request: Request, Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_stock_value"), _plant(Plant)).copy()
+def inventory_valuation_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_stock_value"), Plant, Category).copy()
     df["year"] = 2026; df["period"] = "May"
     return _paginate_df(df, request, ["year", "period", "material", "material_desc", "material_group", "stock_value_cost"],
         {"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
@@ -189,8 +203,8 @@ def inventory_valuation_table(request: Request, Plant: str = Query(None)):
 # ITR = annualized COGS / inventory value. COGS = 6-month consumption cost, so we
 # annualize (×2). Single snapshot ⇒ "average inventory" is the snapshot point (proxy).
 @router.get("/kpi/inventory-turnover-ratio/insights")
-def itr_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_health_score"), _plant(Plant)).copy()
+def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
     ANN = 2.0  # 6 months -> annual
     cogs6 = float(df["consumption_cost"].sum())
     inv = float(df["closing_stock_value"].sum())
@@ -216,7 +230,7 @@ def itr_insights(Plant: str = Query(None)):
         {"key": "fast", "label": "Fast (>4×)", **band(4, 1e12)},
     ]
     # monthly consumption-cost flow (the turnover engine) — smooth trend line
-    fc = da.filter_plant(da.load("fact_consumption"), _plant(Plant))
+    fc = _pc(da.load("fact_consumption"), Plant, Category)
     tl = fc.groupby(["year", "month_num", "month"], observed=True)["amount_lc"].sum().reset_index().sort_values(["year", "month_num"])
     timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "value": float(r["amount_lc"])} for _, r in tl.iterrows()]
 
@@ -231,8 +245,8 @@ def itr_insights(Plant: str = Query(None)):
 # ---------------- INVENTORY TURNOVER (KPI_3) — snapshot proxy ----------------
 @router.get("/kpi/inventory-turnover-ratio")
 def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
-        top: int = Query(None)):
-    df = _filt(da.load("kpi_health_score"), Plant, Material, MaterialGroup)
+        Category: str = Query(None), top: int = Query(None)):
+    df = _filt(da.load("kpi_health_score"), Plant, Material, MaterialGroup, Category)
     # Weighted SUM(consumption)/SUM(inventory) per group, matching the bespoke ITR
     # drill-down's own `itr` formula below -- a mean of each material's own
     # turnover_annualized lets one near-zero-inventory SKU post a ratio in the tens of
@@ -252,8 +266,8 @@ def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: st
 
 
 @router.get("/kpi/inventory-turnover-ratio-table")
-def itr_table(request: Request, Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_health_score"), _plant(Plant)).copy()
+def itr_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
     df["year"] = 2026; df["period"] = "May"
     return _paginate_df(df, request, ["year", "period", "material", "material_desc", "material_group", "consumption_cost", "closing_stock_value", "turnover_annualized"],
         {"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
@@ -262,8 +276,9 @@ def itr_table(request: Request, Plant: str = Query(None)):
 
 # ---------------- RETURN RATE (KPI_4) — no returns => zero proxy ----------------
 @router.get("/kpi/return-rate")
-def return_rate(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None)):
-    df = _filt(da.load("kpi_units_consumed"), Plant, Material, MaterialGroup)
+def return_rate(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
+                Category: str = Query(None)):
+    df = _filt(da.load("kpi_units_consumed"), Plant, Material, MaterialGroup, Category)
     rows = _monthly(df, "total_units", "Return Rate (%)")
     for r in rows:
         r["Return Rate (%)"] = 0.0
@@ -271,8 +286,8 @@ def return_rate(Plant: str = Query(None), Material: str = Query(None), MaterialG
 
 
 @router.get("/kpi/return-rate-table")
-def return_rate_table(request: Request, Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_units_consumed"), _plant(Plant)).copy()
+def return_rate_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
     df["returned"] = 0; df["rate"] = 0.0
     return _paginate_df(df, request, ["year", "month", "material", "material_desc", "material_group", "total_units", "returned", "rate"],
         {"year": "year", "month": "period", "material": "materialId", "material_desc": "materialName",
@@ -294,9 +309,9 @@ DOH_BANDS = [
 
 
 @router.get("/kpi/days-on-hand/insights")
-def doh_insights(Plant: str = Query(None)):
-    doh = da.filter_plant(da.load("kpi_doh"), _plant(Plant)).copy()
-    sv = da.filter_plant(da.load("kpi_stock_value"), _plant(Plant))[["plant", "material", "stock_value_cost"]]
+def doh_insights(Plant: str = Query(None), Category: str = Query(None)):
+    doh = _pc(da.load("kpi_doh"), Plant, Category).copy()
+    sv = _pc(da.load("kpi_stock_value"), Plant, Category)[["plant", "material", "stock_value_cost"]]
     doh = doh.merge(sv, on=["plant", "material"], how="left")
     doh["stock_value_cost"] = doh["stock_value_cost"].fillna(0.0)
     moving = doh[doh["doh_days"].notna()].copy()
@@ -353,8 +368,8 @@ HS_TIERS = ["Healthy", "Watch", "At Risk"]
 
 
 @router.get("/kpi/inventory-health-score/insights")
-def health_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_health_score"), _plant(Plant)).copy()
+def health_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
     df["moving"] = (df["consumption_cost"] > 0).astype(int)
     n = len(df)
     total_value = float(df["closing_stock_value"].sum())
@@ -401,8 +416,8 @@ def health_insights(Plant: str = Query(None)):
 
 # ---------------- STOCK LEVEL CHANGE OVER TIME — monthly flow (A6) ----------------
 @router.get("/kpi/stock-change/insights")
-def stockchange_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_stock_change"), _plant(Plant)).copy()
+def stockchange_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_stock_change"), Plant, Category).copy()
     m = df.groupby(["year", "month"], observed=True).agg(
         inflow=("inflow", "sum"), outflow=("outflow", "sum"), net=("stock_change", "sum")).reset_index()
     m["_k"] = m["month"].map({mm: i for i, mm in enumerate(MONTH_ORDER)})
@@ -424,13 +439,13 @@ def stockchange_insights(Plant: str = Query(None)):
 
 # ---------------- NON-MOVING INVENTORY — blocked capital (A9) ----------------
 @router.get("/kpi/non-moving-inventory/insights")
-def nonmoving_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_non_moving"), _plant(Plant)).copy()
+def nonmoving_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_non_moving"), Plant, Category).copy()
     # Denominator for the hero's "% of stock lines". kpi_non_moving is a strict row
     # subset of kpi_stock_value (both keyed plant+material, no dupes), so
     # blocked_skus / total_stock_lines is exact — and, unlike the literal it replaces,
     # correct per plant (it ranges 30%-89% across plants, not a flat 78%).
-    total_lines = int(len(da.filter_plant(da.load("kpi_stock_value"), _plant(Plant))))
+    total_lines = int(len(_pc(da.load("kpi_stock_value"), Plant, Category)))
 
     def band(a):
         if a < 90: return "≤90d"
@@ -457,8 +472,8 @@ def nonmoving_insights(Plant: str = Query(None)):
 
 # ---------------- INVENTORY RISK CLASSIFICATION — risk matrix (A10) ----------------
 @router.get("/kpi/inventory-risk/insights")
-def risk_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_risk_classification"), _plant(Plant)).copy()
+def risk_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_risk_classification"), Plant, Category).copy()
     tiers = [{"level": L, "count": int((df["risk_level"] == L).sum()),
               "value": float(df.loc[df["risk_level"] == L, "closing_stock_value"].sum())}
              for L in ["High", "Medium", "Low"]]
@@ -496,9 +511,9 @@ def risk_insights(Plant: str = Query(None)):
 _EXP_SLAB_ORDER = ["Expired", "0-30d", "31-90d", "91-180d", "181-365d", "365d+"]
 
 
-def _inv_expiry(pl):
-    """fact_inventory (plant-filtered, positive qty, known expiry) + days-to-expiry & slab."""
-    df = da.filter_plant(da.load("fact_inventory"), pl).copy()
+def _inv_expiry(pl, cat=None):
+    """fact_inventory (plant+category-filtered, positive qty, known expiry) + days-to-expiry & slab."""
+    df = da.filter_category(da.filter_plant(da.load("fact_inventory"), pl), cat).copy()
     df = df.dropna(subset=["expiry_date"])
     df = df[df["qty"] > 0]
     snap = pd.to_datetime(df["snapshot_date"], errors="coerce").max()
@@ -523,8 +538,8 @@ def _expiry_ladder(df):
 
 # ---------------- NEAR-EXPIRY — expiry timeline (E1) ----------------
 @router.get("/kpi/near-expiry/insights")
-def nearexp_insights(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_near_expiry"), _plant(Plant)).copy()
+def nearexp_insights(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_near_expiry"), Plant, Category).copy()
     buckets = [{"bucket": b, "count": int((df["expiry_bucket"] == b).sum()),
                 "value": float(df.loc[df["expiry_bucket"] == b, "total_cost"].sum()),
                 "mrp": float(df.loc[df["expiry_bucket"] == b, "total_mrp"].sum()),
@@ -539,7 +554,7 @@ def nearexp_insights(Plant: str = Query(None)):
     cats = [{"name": r["material_group"], "value": float(r["value"]), "skus": int(r["skus"])} for _, r in cat.iterrows()]
     # Full expiry ladder (all 6 slabs incl. 181-365 / 365+) from fact_inventory.
     try:
-        invdf, snap = _inv_expiry(_plant(Plant))
+        invdf, snap = _inv_expiry(_plant(Plant), Category)
         ladder = _expiry_ladder(invdf)
         ladder_asof = snap.strftime("%d %b %Y") if snap is not None else None
     except Exception:
@@ -553,10 +568,10 @@ def nearexp_insights(Plant: str = Query(None)):
 
 
 @router.get("/kpi/near-expiry/items")
-def nearexp_items(slab: str = Query(None), Plant: str = Query(None),
+def nearexp_items(slab: str = Query(None), Plant: str = Query(None), Category: str = Query(None),
                   q: str = Query(None), limit: int = Query(500)):
     """Drill: item lines for an expiry slab (client #3 — clickable slab → item list)."""
-    invdf, snap = _inv_expiry(_plant(Plant))
+    invdf, snap = _inv_expiry(_plant(Plant), Category)
     if slab:
         invdf = invdf[invdf["slab"].astype(str) == slab]
     if q:
@@ -577,7 +592,7 @@ def nearexp_items(slab: str = Query(None), Plant: str = Query(None),
 
 # ---------------- WASTAGE % (expired-stock value & qty vs total stock) ----------------
 @_cache
-def _wastage_frame(pl):
+def _wastage_frame(pl, cat=None):
     """Expired-stock wastage %, reconciled to the Near-Expiry page's own totals.
 
     Reuses da.load('kpi_near_expiry') (which already carries the days_to_expiry==0
@@ -587,8 +602,8 @@ def _wastage_frame(pl):
     totals.expired_value rather than silently drifting into the "same label, two
     numbers" class of bug this whole audit exists to prevent.
     """
-    ne = da.filter_plant(da.load("kpi_near_expiry"), pl)
-    sv = da.filter_plant(da.load("kpi_stock_value"), pl)
+    ne = da.filter_category(da.filter_plant(da.load("kpi_near_expiry"), pl), cat)
+    sv = da.filter_category(da.filter_plant(da.load("kpi_stock_value"), pl), cat)
     exp = ne[ne["expiry_bucket"] == "Expired"]
 
     expired_value = float(exp["total_cost"].sum())
@@ -621,19 +636,19 @@ def _wastage_frame(pl):
 
 
 @router.get("/kpi/wastage-rate/insights")
-def wastage_rate_insights(Plant: str = Query(None)):
+def wastage_rate_insights(Plant: str = Query(None), Category: str = Query(None)):
     """Wastage % (E-series companion to near-expiry): headline value-basis figure
     (expired stock value / total stock value) + a secondary qty-basis figure + the
     per-plant breakdown, plus the raw expired_value/total_stock_value so the frontend
     can show its work / let a user cross-reference against /kpi/near-expiry/insights'
     totals.expired_value (must always match exactly — same source computation)."""
-    return _wastage_frame(_plant(Plant))
+    return _wastage_frame(_plant(Plant), da.resolve_category(Category))
 
 
 # ---------------- INVENTORY AGING (KPI_5 / Chart_KPI_5) ----------------
 @router.get("/kpi/inventory-aging")
-def inventory_aging(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_inventory_aging"), _plant(Plant)).copy()
+def inventory_aging(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_inventory_aging"), Plant, Category).copy()
     df = df.sort_values("closing_stock_value", ascending=False).head(50).reset_index(drop=True)
     out = []
     for i, r in df.iterrows():
@@ -647,11 +662,60 @@ def inventory_aging(Plant: str = Query(None)):
 
 
 @router.get("/kpi/inventory-aging-table")
-def inventory_aging_table(request: Request, Plant: str = Query(None)):
-    return _paginate_df(da.filter_plant(da.load("kpi_inventory_aging"), _plant(Plant)), request,
+def inventory_aging_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    return _paginate_df(_pc(da.load("kpi_inventory_aging"), Plant, Category), request,
         ["material", "material_desc", "age_since_last_sale_days", "age_since_last_purchase_days", "aging_days"],
         {"material": "materialId", "material_desc": "materialName",
          "age_since_last_sale_days": "ageSinceLastSale", "age_since_last_purchase_days": "ageSinceLastPurchase", "aging_days": "aging"})
+
+
+# ---------------- AGING DISTRIBUTION — category-aware (A7) ----------------
+# kpi_aging_distribution is pre-aggregated to plant x material_group x aging_bucket
+# and carries NO material column, so it physically cannot be cut by material
+# category — and re-graining the committed parquet would change the row counts that
+# /kpi/aging-distribution/summary and /table already report. So the generic endpoint
+# is left exactly as it is, and this one recomputes the identical numbers straight
+# from fact_inventory (which carries material_type natively).
+#
+# VERIFIED: the recomputation below with no filters reproduces the committed
+# kpi_aging_distribution parquet EXACTLY — all 6,497 (plant, material_group,
+# aging_bucket) rows match on stock_value, stock_qty and sku_count with zero
+# difference, total Rs 60,46,79,341.20 either way. It is the same groupby the ETL
+# itself runs (app/etl/transforms.py build_inventory_kpis "A7"), not a re-derivation.
+_AGING_BINS = [-1, 30, 90, 180, 365, float("inf")]
+_AGING_LABELS = ["0-30", "31-90", "91-180", "181-365", "365+"]
+
+
+@router.get("/kpi/aging-distribution/insights")
+def aging_distribution_insights(Plant: str = Query(None), Category: str = Query(None)):
+    inv = _pc(da.load("fact_inventory"), Plant, Category).copy()
+    inv["aging_bucket"] = pd.cut(pd.to_numeric(inv["aging_days"], errors="coerce"),
+                                 bins=_AGING_BINS, labels=_AGING_LABELS)
+    total = float(inv["total_cost"].sum())
+    b = inv.groupby("aging_bucket", observed=True).agg(
+        value=("total_cost", "sum"), qty=("qty", "sum"), skus=("material", "nunique"),
+        lines=("material", "size")).reindex(_AGING_LABELS).fillna(0).reset_index()
+    buckets = [{"bucket": str(r["aging_bucket"]), "value": float(r["value"]), "qty": float(r["qty"]),
+                "skus": int(r["skus"]), "lines": int(r["lines"]),
+                "share_pct": round(float(r["value"]) / total * 100, 2) if total else 0.0}
+               for _, r in b.iterrows()]
+    g = inv.groupby("material_group", observed=True).agg(
+        value=("total_cost", "sum"), skus=("material", "nunique")).reset_index()
+    groups = [{"name": str(r["material_group"]), "value": float(r["value"]), "skus": int(r["skus"])}
+              for _, r in g.sort_values("value", ascending=False).head(12).iterrows()]
+    c = inv.groupby("category", observed=True).agg(
+        value=("total_cost", "sum"), skus=("material", "nunique")).reset_index()
+    categories = [{"name": str(r["category"]), "value": float(r["value"]), "skus": int(r["skus"]),
+                   "share_pct": round(float(r["value"]) / total * 100, 2) if total else 0.0}
+                  for _, r in c.sort_values("value", ascending=False).iterrows()]
+    bv = {x["bucket"]: x for x in buckets}
+    fresh = bv["0-30"]["value"] + bv["31-90"]["value"]
+    return {"totals": {"total_value": total, "total_qty": float(inv["qty"].sum()),
+                       "skus": int(inv["material"].nunique()), "lines": int(len(inv)),
+                       "fresh_value": fresh, "fresh_pct": round(fresh / total * 100, 2) if total else 0.0,
+                       "dead_value": bv["365+"]["value"],
+                       "dead_pct": round(bv["365+"]["value"] / total * 100, 2) if total else 0.0},
+            "buckets": buckets, "groups": groups, "categories": categories}
 
 
 # ---------------- PROCUREMENT OVERVIEW (portfolio dashboard) ----------------
@@ -1141,14 +1205,15 @@ def vendor_margin_table(request: Request, Plant: str = Query(None)):
 
 # ---------------- UNITS CONSUMED (KPI_8) ----------------
 @router.get("/kpi/unit-sold-per-sku")
-def units_sold(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None)):
-    df = _filt(da.load("kpi_units_consumed"), Plant, Material, MaterialGroup)
+def units_sold(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
+               Category: str = Query(None)):
+    df = _filt(da.load("kpi_units_consumed"), Plant, Material, MaterialGroup, Category)
     return _monthly(df, "total_units", "Total Units Sold")
 
 
 @router.get("/kpi/unit-sold-per-sku-table")
-def units_sold_table(request: Request, Plant: str = Query(None)):
-    return da.paginate("kpi_units_consumed", _plant(Plant), dict(request.query_params),
+def units_sold_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    return da.paginate("kpi_units_consumed", _plant(Plant), dict(request.query_params), category=Category,
         col_map={"year": "year", "period": "month", "materialId": "material", "materialName": "material_desc",
                  "materialGroup": "material_group", "totalUnitsSold": "total_units"},
         columns=["year", "month", "material", "material_desc", "material_group", "total_units"],
@@ -1158,8 +1223,8 @@ def units_sold_table(request: Request, Plant: str = Query(None)):
 
 # ---------------- REVENUE DISTRIBUTION (KPI_9) — MRP proxy ----------------
 @router.get("/kpi/revenue-distribution")
-def revenue_distribution(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_units_consumed"), _plant(Plant))
+def revenue_distribution(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_units_consumed"), Plant, Category)
     g = df.groupby(["year", "month"], as_index=False, observed=True)["consumption_cost"].sum()
     g["_mk"] = g["month"].map({m: i for i, m in enumerate(MONTH_ORDER)})
     g = g.sort_values(["year", "_mk"])
@@ -1168,8 +1233,8 @@ def revenue_distribution(Plant: str = Query(None)):
 
 
 @router.get("/kpi/revenue-distribution-table")
-def revenue_distribution_table(request: Request, Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_units_consumed"), _plant(Plant)).copy()
+def revenue_distribution_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
     g = df.groupby(["year", "month"], as_index=False, observed=True)["consumption_cost"].sum()
     g["op"] = 0.0; g["ip"] = 0.0
     return _paginate_df(g, request, ["year", "month", "op", "ip", "consumption_cost"],
@@ -1178,8 +1243,8 @@ def revenue_distribution_table(request: Request, Plant: str = Query(None)):
 
 # ---------------- REVENUE PER STORAGE LOCATION — proxy ----------------
 @router.get("/kpi/revenue-per-storage-location")
-def revenue_per_location(Plant: str = Query(None)):
-    df = da.filter_plant(da.load("kpi_units_consumed"), _plant(Plant))
+def revenue_per_location(Plant: str = Query(None), Category: str = Query(None)):
+    df = _pc(da.load("kpi_units_consumed"), Plant, Category)
     g = df.groupby(["year", "month"], as_index=False, observed=True)["consumption_cost"].sum()
     g["_mk"] = g["month"].map({m: i for i, m in enumerate(MONTH_ORDER)})
     g = g.sort_values(["year", "_mk"])
@@ -1198,13 +1263,17 @@ def _chrono_months(df):
 
 
 @router.get("/portfolio/consumption/overview")
-def consumption_overview(Plant: str = Query(None)):
-    return _consumption_overview_cached(_plant(Plant))
+def consumption_overview(Plant: str = Query(None), Category: str = Query(None)):
+    return _consumption_overview_cached(_plant(Plant), da.resolve_category(Category))
 
 
 @_cache
-def _consumption_overview_cached(pl):
-    uc = da.filter_plant(da.load("kpi_units_consumed"), pl).copy()
+def _consumption_overview_cached(pl, cat=None):
+    uc = da.filter_category(da.filter_plant(da.load("kpi_units_consumed"), pl), cat).copy()
+    # kpi_consumption_by_department has NO material dimension (plant x cost centre x
+    # month), so it CANNOT be cut by material category — filter_category is a no-op on
+    # it by design rather than a silent fake. When a category is selected the department
+    # block therefore stays portfolio-wide; `departments_category_scoped` says so.
     dp = da.filter_plant(da.load("kpi_consumption_by_department"), pl).copy()
     cost = float(uc["consumption_cost"].sum()); units = float(uc["total_units"].sum())
     m = _msort(uc.groupby(["year", "month"], observed=True).agg(cost=("consumption_cost", "sum"), units=("total_units", "sum")).reset_index())
@@ -1225,12 +1294,13 @@ def _consumption_overview_cached(pl):
     return {"totals": {"cost": cost, "units": units, "materials": int(uc["material"].nunique()),
                        "departments": int(dp["cost_ctr"].nunique()), "plants": int(uc["plant"].nunique()),
                        "avg_month": cost / max(len(timeline), 1), "last_mom": last_mom, "dept_top5": dept_top5},
-            "timeline": timeline, "categories": categories, "departments": departments, "skus": skus, "cards": cards}
+            "timeline": timeline, "categories": categories, "departments": departments, "skus": skus, "cards": cards,
+            "departments_category_scoped": False}
 
 
 @router.get("/kpi/unit-sold-per-sku/insights")
-def units_consumed_insights(Plant: str = Query(None)):
-    uc = da.filter_plant(da.load("kpi_units_consumed"), _plant(Plant)).copy()
+def units_consumed_insights(Plant: str = Query(None), Category: str = Query(None)):
+    uc = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
     units = float(uc["total_units"].sum()); cost = float(uc["consumption_cost"].sum())
     m = _msort(uc.groupby(["year", "month"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index())
     timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "units": float(r["units"]), "cost": float(r["cost"])} for _, r in m.iterrows()]
@@ -1285,19 +1355,19 @@ def dept_insights(Plant: str = Query(None)):
 
 # ================= FORECASTING portfolio overview (D1–D8) =================
 @router.get("/portfolio/forecasting/overview")
-def forecasting_overview(Plant: str = Query(None)):
-    return _forecasting_overview_cached(_plant(Plant))
+def forecasting_overview(Plant: str = Query(None), Category: str = Query(None)):
+    return _forecasting_overview_cached(_plant(Plant), da.resolve_category(Category))
 
 
 @_cache
-def _forecasting_overview_cached(pl):
-    fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
+def _forecasting_overview_cached(pl, cat=None):
+    fs = da.filter_category(da.filter_plant(da.load("forecast_sales"), pl), cat).copy()
     # _replen_frame does the same load plus numeric coercion, cover, reorder_value and
     # status — needed here so this page's "reorder" tile can use the same narrow,
     # urgent definition the Reorder & Stock Risk page uses, instead of a 17x wider one.
-    rp = _replen_frame(pl)
-    rd = da.filter_plant(da.load("kpi_stock_radar"), pl).copy()
-    ar = da.filter_plant(da.load("kpi_aging_risk_forecast"), pl).copy()
+    rp = da.filter_category(_replen_frame(pl), cat)
+    rd = da.filter_category(da.filter_plant(da.load("kpi_stock_radar"), pl), cat).copy()
+    ar = da.filter_category(da.filter_plant(da.load("kpi_aging_risk_forecast"), pl), cat).copy()
     acc = da.load("forecast_accuracy")
     accd = {str(r["metric"]): float(r["value"]) for _, r in acc.iterrows()}
 
@@ -1330,10 +1400,23 @@ def _forecasting_overview_cached(pl):
     radar = [{"status": str(k), "count": int(v)} for k, v in rd["radar_status"].value_counts().items()] if "radar_status" in rd else []
     aging = [{"status": str(k), "count": int(v)} for k, v in ar["aging_risk_forecast"].value_counts().items()] if "aging_risk_forecast" in ar else []
 
+    # Complete, prioritised reorder picture for this page's tile (NEW fields only).
+    need_all = _priority_sorted(rp)
+    reorder = _reorder_totals(rp, need_all)
+    priority = _priority_bands_summary(need_all)
+
     cards = {
         "expected-demand": {"value": fcr[0]["forecast"] if fcr else 0.0, "kind": "num", "sub": "next-month units"},
         "cash-flow-forecast": {"value": cashflow[0]["forecast"] if cashflow else 0.0, "kind": "inr", "sub": "next-month spend"},
-        "stock-replenishment": {"value": float(replen_now_skus), "kind": "num", "sub": "items under 1 month cover"},
+        # VALUE UNCHANGED (still status == "Reorder now"). Only the sub-label is
+        # corrected: it read "items under 1 month cover", which was factually wrong —
+        # the 15,878 stock-out lines have ZERO cover and were excluded from it. The
+        # complete count lives on the new "reorder-priority" card below, which is what
+        # the tile should switch to.
+        "stock-replenishment": {"value": float(replen_now_skus), "kind": "num",
+                                "sub": "in-stock items under 1 month cover"},
+        "reorder-priority": {"value": float(reorder["reorder_lines"]), "kind": "num",
+                             "sub": f"lines to order ({reorder['out_of_stock_lines']} already at zero)"},
         "fulfillment-rate": {"value": accd.get("Aggregate Forecast Accuracy %", 0.0), "kind": "pct", "sub": "forecast accuracy"},
         "stock-radar": {"value": float(sum(x["count"] for x in radar if x["status"] == "Stock-Out Risk")), "kind": "num", "sub": "stock-out risk SKUs"},
         "aging-risk-forecast": {"value": float(sum(x["count"] for x in aging if x["status"] == "Rising")), "kind": "num", "sub": "rising-risk SKUs"},
@@ -1344,7 +1427,10 @@ def _forecasting_overview_cached(pl):
                        "replen_skus": replen_skus, "replen_qty": replen_qty, "replen_value": replen_value,
                        "replen_now_skus": replen_now_skus, "replen_now_value": replen_now_value,
                        "cashflow_next": cashflow[0]["forecast"] if cashflow else 0.0, "horizon": len(fcr)},
-            "timeline": timeline, "cashflow": cashflow, "radar": radar, "aging": aging, "top_reorder": top_reorder, "cards": cards}
+            "timeline": timeline, "cashflow": cashflow, "radar": radar, "aging": aging,
+            "top_reorder": top_reorder, "cards": cards,
+            "reorder": reorder, "priority": priority,
+            "priority_queue": _queue_rows(need_all.head(10))}
 
 
 def _clean_group(g) -> str:
@@ -1356,12 +1442,12 @@ def _clean_group(g) -> str:
 
 
 @router.get("/forecast/demand-insights")
-def demand_insights(Plant: str = Query(None)):
+def demand_insights(Plant: str = Query(None), Category: str = Query(None)):
     """Rich demand-forecast insights for the bespoke Expected-Usage page:
     aggregate cone timeline, headline totals, top items by forecast demand and a
     per-category demand breakdown."""
     pl = _plant(Plant)
-    fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
+    fs = da.filter_category(da.filter_plant(da.load("forecast_sales"), pl), Category).copy()
     accd = {str(r["metric"]): float(r["value"]) for _, r in da.load("forecast_accuracy").iterrows()}
     dm = da.load("dim_material")[["material", "material_desc", "material_group"]].copy()
     dm["material"] = dm["material"].astype(str)
@@ -1413,13 +1499,13 @@ def demand_insights(Plant: str = Query(None)):
 
 
 @router.get("/forecast/cashflow-insights")
-def cashflow_insights(Plant: str = Query(None)):
+def cashflow_insights(Plant: str = Query(None), Category: str = Query(None)):
     """Rich procurement-budget (cash-flow) insights for the bespoke Cash-Flow page:
     monthly spend timeline (actual consumption cost -> forecast budget), headline
     rupee totals, biggest spend items and a per-category budget breakdown. Values
     are the forecast consumption cost (amount_lc) = the cash needed to restock."""
     pl = _plant(Plant)
-    fs = da.filter_plant(da.load("forecast_sales"), pl).copy()
+    fs = da.filter_category(da.filter_plant(da.load("forecast_sales"), pl), Category).copy()
     accd = {str(r["metric"]): float(r["value"]) for _, r in da.load("forecast_accuracy").iterrows()}
     dm = da.load("dim_material")[["material", "material_desc", "material_group"]].copy()
     dm["material"] = dm["material"].astype(str)
@@ -1473,6 +1559,44 @@ def cashflow_insights(Plant: str = Query(None)):
             "top_items": top_items, "by_category": by_category}
 
 
+# ---------------- REORDER PRIORITY ----------------
+# `status` below is a MUTUALLY-EXCLUSIVE DISPLAY LABEL: its if-chain is first-match-
+# wins, so every row gets exactly one of Stock-out / Dead stock / Reorder now /
+# Overstocked / Healthy. That is fine for a health spectrum and WRONG as a reorder
+# list, because "needs replenishing" is an independent PROPERTY, not one of those
+# five states. Verified over all 67,167 lines:
+#     replenishment_quantity > 0 ................. 19,014 lines genuinely need ordering
+#       labelled "Reorder now" ...................  1,107  (5.8% — the only ones a user
+#                                                            reading "the reorder list" saw)
+#       hidden under "Stock-out" ................. 15,878  (ALREADY AT ZERO STOCK — the
+#                                                            most urgent lines of all)
+#       hidden under "Healthy" ...................  1,700  (flatly contradictory)
+#       hidden under "Dead stock" ................    165
+#       hidden under "Overstocked" ...............    164  (self-contradictory)
+# The fix keeps `status` byte-identical (the spectrum, the drill-downs and the
+# frontend all still read it) and adds an ORTHOGONAL priority dimension alongside it,
+# so a line can be both "Stock-out" for display AND band 1 of the reorder queue.
+#
+# Bands are ordered the way a procurement officer actually works: something already
+# at zero with live demand beats something with 0.8 months of cover, which beats a
+# top-up that is merely below safe stock.
+_PRIORITY_BANDS = [
+    (1, "Out of stock", "Zero stock with live demand — order today"),
+    (2, "Critical", "Under 2 weeks of cover"),
+    (3, "Low", "Under 1 month of cover"),
+    (4, "Watch", "1–3 months of cover, still below safe stock"),
+    (5, "Planned", "Over 3 months of cover — top-up suggested"),
+]
+_BAND_LABEL = {b: lab for b, lab, _ in _PRIORITY_BANDS}
+_BAND_DESC = {b: d for b, _, d in _PRIORITY_BANDS}
+
+# Only 3,129 of the 19,014 lines needing replenishment carry a unit_cost > 0, so a
+# rupee total over this set prices ~16% of the lines (Rs 7.21 Cr over the priced
+# subset). That is a KNOWN, previously-disclosed source-data limitation — every
+# response that quotes a reorder rupee figure also quotes the coverage, never the
+# rupees alone.
+
+
 @_cache
 def _replen_frame(pl):
     rp = da.filter_plant(da.load("stock_replenishment_and_aging_risk"), pl).copy()
@@ -1496,16 +1620,152 @@ def _replen_frame(pl):
             return "Overstocked"
         return "Healthy"
     rp["status"] = rp.apply(_status, axis=1)
+
+    # ── orthogonal reorder-priority dimension (never overwrites `status`) ──
+    rp["needs_reorder"] = rp["replenishment_quantity"] > 0
+    rp["priced"] = rp["unit_cost"] > 0
+    band = np.select(
+        [rp["closing_stock"] <= 0, rp["cover"] < 0.5, rp["cover"] < 1.0, rp["cover"] < 3.0],
+        [1, 2, 3, 4], default=5)
+    # band 0 = "not on the reorder list at all", so the band column is meaningful on
+    # its own and a caller can never mistake a well-stocked line for a low-priority order.
+    rp["priority_band"] = np.where(rp["needs_reorder"], band, 0).astype(int)
+    rp["priority_label"] = rp["priority_band"].map(_BAND_LABEL).fillna("Not required")
     return rp
 
 
+def _priority_sorted(rp):
+    """The reorder queue, most urgent first, with a 1-based priority_rank.
+
+    Ordering: band (urgency of timing) → demand_monthly → replenishment_quantity.
+    Within a band the tie-break is DEMAND, not rupees, on purpose: unit_cost exists
+    on only ~16% of these lines, so a value sort would bury 84% of the queue at the
+    bottom with a fake Rs 0. reorder_value is still returned on every row so the UI
+    can offer a rupee sort explicitly, alongside the coverage disclosure.
+    """
+    need = rp[rp["needs_reorder"]].sort_values(
+        ["priority_band", "demand_monthly", "replenishment_quantity", "material_id"],
+        ascending=[True, False, False, True], kind="mergesort").copy()
+    need["priority_rank"] = np.arange(1, len(need) + 1)
+    return need
+
+
+def _priority_bands_summary(need):
+    out = []
+    for b, label, desc in _PRIORITY_BANDS:
+        seg = need[need["priority_band"] == b]
+        out.append({"band": b, "label": label, "desc": desc,
+                    "lines": int(len(seg)), "skus": int(seg["material_id"].nunique()),
+                    "qty": float(seg["replenishment_quantity"].sum()),
+                    "priced_lines": int(seg["priced"].sum()),
+                    "value_priced": float(seg["reorder_value"].sum())})
+    return out
+
+
+def _reorder_totals(rp, need):
+    priced = need[need["priced"]]
+    lines = int(len(need))
+    return {
+        "reorder_lines": lines,
+        "reorder_skus_all": int(need["material_id"].nunique()),
+        "reorder_qty": float(need["replenishment_quantity"].sum()),
+        "priced_lines": int(len(priced)),
+        "priced_share_pct": round(len(priced) / lines * 100, 1) if lines else 0.0,
+        "reorder_value_priced": float(priced["reorder_value"].sum()),
+        "unpriced_lines": lines - int(len(priced)),
+        "out_of_stock_lines": int((need["priority_band"] == 1).sum()),
+        "under_1mo_lines": int(need["priority_band"].isin([1, 2, 3]).sum()),
+        "value_disclosure": (
+            f"Rupee figures cover {len(priced)} of {lines} lines "
+            f"({round(len(priced) / lines * 100, 1) if lines else 0.0}%) — the rest carry "
+            "no unit cost in the source data. Line and quantity counts are complete."),
+    }
+
+
+def _queue_rows(sub):
+    """One reorder-queue row. Carries the DISPLAY status alongside the priority band,
+    so the context the old mutually-exclusive label provided is preserved, not
+    destroyed — a line can read "Stock-out" and "priority 1 / Out of stock" at once."""
+    return [{"material": str(r["material_id"]), "desc": str(r.get("material_desc", "")),
+             "group": _clean_group(r.get("material_group", "")),
+             "category": str(r.get("category", da.CATEGORY_UNCLASSIFIED)),
+             "plant": str(r.get("plant", "")),
+             "status": str(r["status"]),
+             "priority_rank": int(r["priority_rank"]), "priority_band": int(r["priority_band"]),
+             "priority_label": str(r["priority_label"]),
+             "stock": float(r["closing_stock"]), "cover": float(r["cover"]),
+             "demand_monthly": float(r["demand_monthly"]),
+             "reorder_qty": float(r["replenishment_quantity"]),
+             "unit_cost": float(r["unit_cost"]), "priced": bool(r["priced"]),
+             "reorder_value": float(r["reorder_value"]),
+             "aging_days": int(r["aging_days"])} for _, r in sub.iterrows()]
+
+
+@router.get("/forecast/reorder-priority")
+def reorder_priority(Plant: str = Query(None), Category: str = Query(None),
+                     band: int = Query(None, ge=1, le=5),
+                     status: str = Query(None), q: str = Query(None),
+                     sort: str = Query("priority"),
+                     limit: int = Query(100, ge=1, le=5000), offset: int = Query(0, ge=0)):
+    """THE reorder list — every line that needs replenishing, most urgent first.
+
+    Covers ALL lines with replenishment_quantity > 0 (19,014 portfolio-wide), not
+    just the 1,107 the mutually-exclusive `status` label happened to call "Reorder
+    now". The 15,878 lines already at zero stock — the most urgent of all — are
+    band 1, at the very top, instead of being excluded from the reorder view.
+
+    `totals` always ships the pricing-coverage disclosure alongside any rupee
+    figure: only ~16% of these lines carry a unit cost in the source data, so the
+    Rs total is real but partial, while line/qty counts are complete.
+    """
+    rp = da.filter_category(_replen_frame(_plant(Plant)), Category)
+    need = _priority_sorted(rp)
+
+    totals = _reorder_totals(rp, need)
+    bands = _priority_bands_summary(need)
+
+    sub = need
+    if band:
+        sub = sub[sub["priority_band"] == int(band)]
+    if status:
+        sub = sub[sub["status"] == str(status)]
+    if q:
+        ql = str(q).strip().lower()
+        sub = sub[sub["material_desc"].astype(str).str.lower().str.contains(ql, na=False)
+                  | sub["material_id"].astype(str).str.lower().str.contains(ql, na=False)]
+    if sort == "value":
+        sub = sub.sort_values("reorder_value", ascending=False, kind="mergesort")
+    elif sort == "qty":
+        sub = sub.sort_values("replenishment_quantity", ascending=False, kind="mergesort")
+    elif sort == "demand":
+        sub = sub.sort_values("demand_monthly", ascending=False, kind="mergesort")
+
+    count = int(len(sub))
+    page = sub.iloc[int(offset): int(offset) + int(limit)]
+    return {"totals": totals, "bands": bands,
+            "count": count, "returned": int(len(page)),
+            "offset": int(offset), "limit": int(limit), "sort": sort,
+            "filters": {"Plant": Plant, "Category": Category, "band": band,
+                        "status": status, "q": q},
+            "items": _queue_rows(page)}
+
+
 @router.get("/forecast/replenishment-insights")
-def replenishment_insights(Plant: str = Query(None)):
+def replenishment_insights(Plant: str = Query(None), Category: str = Query(None)):
     """Reorder & aging-risk action board: a stock-health spectrum (understock ->
     overstock), the biggest items to reorder now, the items sitting too long, and
-    a ladder of the cash locked in aging stock."""
+    a ladder of the cash locked in aging stock.
+
+    Every pre-existing field keeps its exact meaning. The complete, correctly
+    prioritised reorder picture is added as NEW fields — `priority` (the band
+    ladder), `priority_queue` (the true top of the queue) and `reorder` (totals with
+    the pricing-coverage disclosure) — plus `by_material_category`. Note that the
+    long-standing `by_category` key is a MATERIAL-GROUP breakdown, not the new
+    material-category dimension; it is left untouched so the existing chart keeps
+    rendering, and the new dimension gets its own key.
+    """
     pl = _plant(Plant)
-    rp = _replen_frame(pl)
+    rp = da.filter_category(_replen_frame(pl), Category)
     accd = {str(r["metric"]): float(r["value"]) for _, r in da.load("forecast_accuracy").iterrows()}
 
     ORDER = ["Stock-out", "Reorder now", "Healthy", "Overstocked", "Dead stock"]
@@ -1540,6 +1800,24 @@ def replenishment_insights(Plant: str = Query(None)):
                     "reorder_count": int(r["reorder_count"]), "aging_value": float(r["aging_value"])}
                    for _, r in by.iterrows()]
 
+    # ── complete, prioritised reorder picture (NEW — nothing above is redefined) ──
+    need_all = _priority_sorted(rp)
+    priority = _priority_bands_summary(need_all)
+    reorder = _reorder_totals(rp, need_all)
+    priority_queue = _queue_rows(need_all.head(10))
+    mcat = (rp[rp["needs_reorder"]].groupby("category", observed=True)
+              .agg(lines=("material_id", "size"), qty=("replenishment_quantity", "sum"),
+                   value_priced=("reorder_value", "sum"), priced_lines=("priced", "sum"))
+              .reset_index().sort_values("lines", ascending=False))
+    by_material_category = [{"category": str(r["category"]), "lines": int(r["lines"]),
+                             "qty": float(r["qty"]), "value_priced": float(r["value_priced"]),
+                             "priced_lines": int(r["priced_lines"])} for _, r in mcat.iterrows()]
+    # The honesty exhibit: which DISPLAY status each reorder line sits under. This is
+    # what makes the old 1,107-vs-19,014 gap visible instead of invisible.
+    reorder_by_status = [{"status": s, "lines": int((need_all["status"] == s).sum()),
+                          "qty": float(need_all[need_all["status"] == s]["replenishment_quantity"].sum())}
+                         for s in ORDER]
+
     _rn = rp[rp["status"] == "Reorder now"]
     totals = {"reorder_skus": int((rp["replenishment_quantity"] > 0).sum()),
               "reorder_value": float(rp["reorder_value"].sum()),
@@ -1559,7 +1837,10 @@ def replenishment_insights(Plant: str = Query(None)):
               "total_skus": int(len(rp)), "stock_value": float(rp["closing_stock_value"].sum()),
               "accuracy": accd.get("Aggregate Forecast Accuracy %", 0.0)}
     return {"totals": totals, "spectrum": spectrum, "by_category": by_category,
-            "order_now": order_now, "aging": aging, "ladder": ladder}
+            "order_now": order_now, "aging": aging, "ladder": ladder,
+            "reorder": reorder, "priority": priority, "priority_queue": priority_queue,
+            "reorder_by_status": reorder_by_status,
+            "by_material_category": by_material_category}
 
 
 @router.get("/revenue/items")
@@ -1597,12 +1878,24 @@ def revenue_items(group: str = Query(None), manufacturer: str = Query(None), hos
 
 
 @router.get("/forecast/risk-items")
-def risk_items(Plant: str = Query(None), status: str = Query(None), aging: str = Query(None),
-               kind: str = Query(None), limit: int = Query(200)):
+def risk_items(Plant: str = Query(None), Category: str = Query(None), status: str = Query(None),
+               aging: str = Query(None), kind: str = Query(None), band: int = Query(None, ge=1, le=5),
+               limit: int = Query(200)):
     """Full item list behind any reorder/aging cut — powers the drill-downs the
-    client asked for (click a status / bucket / 'see all' → the actual items)."""
-    rp = _replen_frame(_plant(Plant))
-    if status:
+    client asked for (click a status / bucket / 'see all' → the actual items).
+
+    `kind=priority` (and/or `band=`) selects the complete, correctly-prioritised
+    reorder queue; every other combination behaves exactly as before. Each row now
+    also carries priority_band / priority_label / priced (additive only)."""
+    rp = da.filter_category(_replen_frame(_plant(Plant)), Category)
+    priority_mode = bool(kind == "priority" or band)
+    if priority_mode:
+        sub = _priority_sorted(rp)
+        if band:
+            sub = sub[sub["priority_band"] == int(band)]
+        if status:
+            sub = sub[sub["status"] == status]
+    elif status:
         sub = rp[rp["status"] == status]
     elif aging:
         sub = rp[rp["aging_risk"] == aging]
@@ -1612,22 +1905,31 @@ def risk_items(Plant: str = Query(None), status: str = Query(None), aging: str =
         sub = rp[(rp["aging_days"] > 180) & (rp["closing_stock_value"] > 0)]
     else:
         sub = rp
-    reorder_sorted = bool(kind == "order_now" or status in ("Stock-out", "Reorder now"))
-    sortcol = "reorder_value" if reorder_sorted else "closing_stock_value"
     total = int(len(sub))
-    sub = sub.sort_values(sortcol, ascending=False).head(int(limit))
+    if priority_mode:
+        sub = sub.head(int(limit))   # already in priority order
+    else:
+        reorder_sorted = bool(kind == "order_now" or status in ("Stock-out", "Reorder now"))
+        sortcol = "reorder_value" if reorder_sorted else "closing_stock_value"
+        sub = sub.sort_values(sortcol, ascending=False).head(int(limit))
     items = [{"material": str(r["material_id"]), "desc": str(r.get("material_desc", "")),
               "group": _clean_group(r.get("material_group", "")), "status": str(r["status"]),
+              "category": str(r.get("category", da.CATEGORY_UNCLASSIFIED)),
               "stock": float(r["closing_stock"]), "stock_value": float(r["closing_stock_value"]),
               "demand_monthly": float(r["demand_monthly"]), "cover": float(r["cover"]),
               "reorder_qty": float(r["replenishment_quantity"]), "reorder_value": float(r["reorder_value"]),
+              "priced": bool(r["priced"]), "priority_band": int(r["priority_band"]),
+              "priority_label": str(r["priority_label"]),
               "aging_days": int(r["aging_days"])} for _, r in sub.iterrows()]
     return {"count": total, "returned": len(items), "items": items}
 
 
 @router.get("/forecast/item-risk")
 def item_risk(Plant: str = Query(None), Material: str = Query(...)):
-    """Single-SKU reorder & aging status for the 'check any item' panel."""
+    """Single-SKU reorder & aging status for the 'check any item' panel.
+
+    No Category param on purpose: the caller has already named the exact material,
+    so a category cut could only ever hide the very row that was asked for."""
     rp = _replen_frame(_plant(Plant))
     sub = rp[rp["material_id"] == str(Material)]
     if not len(sub):
@@ -1635,10 +1937,13 @@ def item_risk(Plant: str = Query(None), Material: str = Query(...)):
     r = sub.iloc[0]
     return {"found": True, "material": str(r["material_id"]), "desc": str(r.get("material_desc", "")),
             "group": _clean_group(r.get("material_group", "")), "status": str(r["status"]),
+            "category": str(r.get("category", da.CATEGORY_UNCLASSIFIED)),
             "stock": float(r["closing_stock"]), "stock_value": float(r["closing_stock_value"]),
             "demand_monthly": float(r["demand_monthly"]), "demand_forecast": float(r["demand_forecast"]),
             "cover": float(r["cover"]), "safe_stock": float(r["safe_stock"]),
             "reorder_qty": float(r["replenishment_quantity"]), "reorder_value": float(r["reorder_value"]),
+            "priority_band": int(r["priority_band"]), "priority_label": str(r["priority_label"]),
+            "priced": bool(r["priced"]),
             "aging_days": int(r["aging_days"]), "bucket": str(r["aging_risk"]), "unit_cost": float(r["unit_cost"])}
 
 

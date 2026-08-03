@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, Query
 from typing import Optional
 import numpy as np
+import pandas as pd
 
 from app.core import data_access as da
 from app.core.config import settings
@@ -20,18 +21,45 @@ def _resolve_plant(region: Optional[str]) -> Optional[str]:
     return da.resolve_plant(region)
 
 
+AGING_BINS = [-1, 30, 90, 180, 365, float("inf")]
+AGING_LABELS = ["0-30", "31-90", "91-180", "181-365", "365+"]
+
+
+def _aging_buckets(plant, category):
+    """Stock value per aging bucket.
+
+    Default path (no category) reads the committed kpi_aging_distribution parquet —
+    unchanged, byte-identical. When a category IS selected we recompute from
+    fact_inventory instead, because kpi_aging_distribution is pre-aggregated to
+    plant x material_group x aging_bucket and carries no material dimension, so a
+    category filter on it would be a silent no-op that shows portfolio-wide numbers
+    under a category label. The recomputation is the ETL's own A7 groupby and has
+    been verified to reproduce that parquet EXACTLY (all 6,497 rows, zero diff).
+    """
+    if not da.resolve_category(category):
+        ad = da.filter_plant(da.load("kpi_aging_distribution"), plant)
+        return ad.groupby("aging_bucket", observed=True)["stock_value"].sum()
+    inv = da.filter_category(da.filter_plant(da.load("fact_inventory"), plant), category).copy()
+    inv["aging_bucket"] = pd.cut(pd.to_numeric(inv["aging_days"], errors="coerce"),
+                                 bins=AGING_BINS, labels=AGING_LABELS)
+    return inv.groupby("aging_bucket", observed=True)["total_cost"].sum()
+
+
 @router.get("/api/dashboard/all")
-def dashboard_all(region: Optional[str] = Query(None)):
+def dashboard_all(region: Optional[str] = Query(None),
+                  category: Optional[str] = Query(None, alias="Category")):
     plant = _resolve_plant(region)
 
-    inv = da.filter_plant(da.load("kpi_stock_value"), plant)
-    agedist = da.filter_plant(da.load("kpi_aging_distribution"), plant)
-    doh = da.filter_plant(da.load("kpi_doh"), plant)
-    health = da.filter_plant(da.load("kpi_health_score"), plant)
-    units = da.filter_plant(da.load("kpi_units_consumed"), plant)
-    nonmoving = da.filter_plant(da.load("kpi_non_moving"), plant)
+    def _f(table):
+        return da.filter_category(da.filter_plant(da.load(table), plant), category)
 
-    bucket = agedist.groupby("aging_bucket", observed=True)["stock_value"].sum()
+    inv = _f("kpi_stock_value")
+    doh = _f("kpi_doh")
+    health = _f("kpi_health_score")
+    units = _f("kpi_units_consumed")
+    nonmoving = _f("kpi_non_moving")
+
+    bucket = _aging_buckets(plant, category)
     fresh = float(bucket.get("0-30", 0))
     aging = float(bucket.get("31-90", 0))
     problem = float(bucket.get("91-180", 0) + bucket.get("181-365", 0))
@@ -50,7 +78,12 @@ def dashboard_all(region: Optional[str] = Query(None)):
     # to 1445 days against a stated 30-90 day target. Median matches the bespoke DOH
     # drill-down's own `median_doh` (legacy_kpi.py /kpi/days-on-hand/insights) so this tile
     # and that page now agree, instead of showing two different DOH numbers on one visit.
-    avg_doh = float(doh["doh_days"].replace([np.inf, -np.inf], np.nan).dropna().median() or 0)
+    # `median() or 0` does NOT guard an empty frame: pd.Series([]).median() is nan and
+    # nan is TRUTHY in Python, so nan flowed straight into the response and FastAPI
+    # 500'd ("Out of range float values are not JSON compliant"). Unreachable before the
+    # Category param existed; trivially reachable now with a filter that yields no rows.
+    _med = doh["doh_days"].replace([np.inf, -np.inf], np.nan).dropna().median()
+    avg_doh = 0.0 if pd.isna(_med) else float(_med)
     # Portfolio-level SUM(consumption)/SUM(inventory), annualized -- NOT a mean of each
     # material's own turnover ratio. A mean-of-ratios lets a handful of near-zero-inventory
     # SKUs (a rounding-error's worth of stock value) post ratios in the tens of thousands and
@@ -96,7 +129,8 @@ def dashboard_all(region: Optional[str] = Query(None)):
             "daysOnHand": round(avg_doh, 1),
             "trend": None,
             "criticalThreshold": 15, "optimalRange": {"min": 30, "max": 90},
-            "category": "All", "location": loc, "lastCalculated": "31 May 2026",
+            "category": da.resolve_category(category) or "All",
+            "location": loc, "lastCalculated": "31 May 2026",
         },
         "inventoryTurnover": {
             "currentITR": round(avg_itr, 2), "label": "Inventory Turnover",
@@ -106,15 +140,23 @@ def dashboard_all(region: Optional[str] = Query(None)):
         # extra block consumed by the rebuilt hcg-analytics-ui exec summary
         "stockValue": {"currentStockValue": round(stock_value, 2), "stockMrpValue": round(stock_mrp, 2),
                        "skuCount": int(inv["material"].nunique())},
+        # Procurement & fill-rate are vendor/process metrics whose source tables carry
+        # no material dimension at all, so they are deliberately NOT category-scoped —
+        # `categoryScope` below says exactly which blocks the selector reaches.
         "procurement": {"purchaseValue": round(float(da.filter_plant(da.load("kpi_purchase_value"), plant)["purchase_value"].sum()), 2),
                         "vendorCount": int(da.filter_plant(da.load("kpi_purchase_value"), plant)["vendor_name"].nunique())},
         "consumption": {"unitsConsumed": float(units["total_units"].sum()), "consumptionCost": round(cons_cost, 2)},
-        "replenishment": {"materialsNeeding": int((da.filter_plant(da.load("stock_replenishment_and_aging_risk"), plant)["replenishment_quantity"] > 0).sum()),
-                          "totalQtyToOrder": round(float(da.filter_plant(da.load("stock_replenishment_and_aging_risk"), plant)["replenishment_quantity"].sum()), 2)},
-        "nearExpiry": {"skuCount": int(da.filter_plant(da.load("kpi_near_expiry"), plant)["material"].nunique()),
-                       "value": round(float(da.filter_plant(da.load("kpi_near_expiry"), plant)["total_cost"].sum()), 2)},
+        "replenishment": {"materialsNeeding": int((_f("stock_replenishment_and_aging_risk")["replenishment_quantity"] > 0).sum()),
+                          "totalQtyToOrder": round(float(_f("stock_replenishment_and_aging_risk")["replenishment_quantity"].sum()), 2)},
+        "nearExpiry": {"skuCount": int(_f("kpi_near_expiry")["material"].nunique()),
+                       "value": round(float(_f("kpi_near_expiry")["total_cost"].sum()), 2)},
         "stockAgingSummary": {"nonMovingSkus": int(nonmoving["material"].nunique())},
         "fillRate": {"avgFillRatePct": round(float(da.filter_plant(da.load("kpi_fill_rate"), plant)["fill_rate_pct"].mean()), 1) if len(da.filter_plant(da.load("kpi_fill_rate"), plant)) else None},
+        "categoryScope": {"applied": da.resolve_category(category),
+                          "scoped": ["stockAging", "kpiStockLevel", "daysOnHand", "inventoryTurnover",
+                                     "stockValue", "consumption", "replenishment", "nearExpiry",
+                                     "stockAgingSummary"],
+                          "unscoped": ["procurement", "fillRate", "returnRate"]},
     }
 
 
