@@ -296,9 +296,16 @@ def query(table: str, plant: Optional[str] = None, material: Optional[str] = Non
 def chart_series(table: str, plant=None, material=None, material_group=None,
                  group_by: Optional[str] = None, measures: Optional[str] = None,
                  top: Optional[int] = None, row_cap: int = 5000,
-                 category: Optional[str] = None) -> list[dict]:
-    """Chart data with optional server-side group-by aggregation (bounded payload)."""
-    df = load(table)
+                 category: Optional[str] = None,
+                 frame: Optional[pd.DataFrame] = None) -> list[dict]:
+    """Chart data with optional server-side group-by aggregation (bounded payload).
+
+    `frame` substitutes an ALREADY-LOADED equivalent of `table` — used by the one
+    caller that has to serve a pre-aggregated KPI from the richer-grain frame the ETL
+    built it from (see kpi_generic._CATEGORY_REGRAIN). Defaults to None, i.e. load the
+    table, so every other call site is untouched.
+    """
+    df = load(table) if frame is None else frame
     df = filter_plant(df, plant)
     df = filter_category(df, category)
     if material and material != "All Items" and "material" in df.columns:
@@ -331,9 +338,13 @@ def chart_series(table: str, plant=None, material=None, material_group=None,
 
 
 def summarize(table: str, plant=None, material=None, material_group=None,
-              category: Optional[str] = None) -> dict:
-    """Correct, uncapped sum/mean/count + distinct counts over the filtered table."""
-    df = load(table)
+              category: Optional[str] = None,
+              frame: Optional[pd.DataFrame] = None) -> dict:
+    """Correct, uncapped sum/mean/count + distinct counts over the filtered table.
+
+    `frame` substitutes an already-loaded equivalent of `table` — see chart_series.
+    """
+    df = load(table) if frame is None else frame
     df = filter_plant(df, plant)
     df = filter_category(df, category)
     if material and material != "All Items" and "material" in df.columns:
@@ -384,9 +395,13 @@ def _apply_filter_protocol(df: pd.DataFrame, params: dict, col_map: dict) -> pd.
 
 def paginate(table: str, plant: Optional[str], params: dict, col_map: dict,
              columns: Optional[list[str]] = None, rename: Optional[dict] = None,
-             category: Optional[str] = None) -> dict:
-    """Server-side table: filter + sort + page. Returns {data, total}."""
-    df = load(table)
+             category: Optional[str] = None,
+             frame: Optional[pd.DataFrame] = None) -> dict:
+    """Server-side table: filter + sort + page. Returns {data, total}.
+
+    `frame` substitutes an already-loaded equivalent of `table` — see chart_series.
+    """
+    df = load(table) if frame is None else frame
     df = filter_plant(df, plant)
     df = filter_category(df, category)
     df = _apply_filter_protocol(df, params, col_map)

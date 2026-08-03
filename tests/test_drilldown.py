@@ -132,3 +132,59 @@ def test_empty_slice_returns_nothing_rather_than_the_whole_chart(client):
     assert body["items"] == []
     assert body["slice_total"] == 0.0
     assert body["covered_pct"] == 0.0
+
+
+# ── the three inventory charts wired last, each against ITS OWN endpoint ──────
+# Every one of these drills goes through a source the chart does not itself read, so
+# "200 with items" is not enough: the panel's slice_total has to equal the bar the
+# user is pointing at, in every category, or the drill is confidently wrong.
+
+def test_doh_band_drill_reproduces_the_coverage_histogram(client):
+    """drill_doh_grain vs GET /kpi/days-on-hand/insights, band for band."""
+    for cat in (None, "Consumables", "Other Drugs"):
+        q = f"&Category={cat}" if cat else ""
+        bands = client.get(f"/kpi/days-on-hand/insights?x=1{q}").json()["bands"]
+        assert bands, "the histogram has no bands to compare against"
+        for b in bands:
+            d = client.get(f"/drill/top-items?kpi=days-on-hand&dim=doh_band&by=material"
+                           f"&slice={b['key']}&measure=stock_value_cost&n=1{q}").json()
+            assert d["source"] == "drill_doh_grain"
+            assert d["slice_total"] == pytest.approx(b["value"], abs=0.01), \
+                f"band {b['key']} (Category={cat}) drills to a different total than its bar"
+
+
+def test_stock_change_drill_needs_the_year_in_the_slice(client):
+    """dim=month would merge December 2025 into December 2026 under one bar."""
+    months = client.get("/kpi/stock-change/insights").json()["monthly"]
+    decembers = [m for m in months if m["month"] == "December"]
+    assert len(decembers) == 2, "fixture no longer spans two Decembers — the trap is untested"
+
+    for m in months:
+        for meas in ("inflow", "outflow"):
+            d = client.get(f"/drill/top-items?kpi=stock-change&dim=year_month&by=material"
+                           f"&slice={m['year']}-{m['month']}&measure={meas}&n=1").json()
+            assert d["slice_total"] == pytest.approx(m[meas], abs=0.01), \
+                f"{m['label']} {meas} drills to a different total than its bar"
+
+    # and the dimension that would have been the obvious choice really does over-report
+    merged = client.get("/drill/top-items?kpi=stock-change&dim=month&by=material"
+                        "&slice=December&measure=inflow&n=1").json()["slice_total"]
+    assert merged == pytest.approx(sum(m["inflow"] for m in decembers), abs=0.01)
+    assert merged > max(m["inflow"] for m in decembers)
+
+
+def test_wastage_drill_ranks_the_numerator_not_the_ratio(client):
+    """Per-plant expired value, equal to the bar's own expired_value in every category."""
+    for cat in (None, "Onco Drugs", "Consumables"):
+        q = f"&Category={cat}" if cat else ""
+        w = client.get(f"/kpi/wastage-rate/insights?x=1{q}").json()
+        for r in w["by_plant"]:
+            d = client.get(f"/drill/top-items?kpi=wastage-rate&dim=plant&by=material"
+                           f"&slice={r['plant']}&n=1{q}").json()
+            assert d["measure"] == "expired_value"
+            assert d["additive"] is True, "shares must decompose the rupees, never the %"
+            assert d["slice_total"] == pytest.approx(r["expired_value"], abs=0.01), \
+                f"plant {r['plant']} (Category={cat}) drills to a different total than its bar"
+        # the whole chart's numerator is the page's own headline
+        whole = client.get(f"/drill/top-items?kpi=wastage-rate&dim=plant&n=1{q}").json()
+        assert whole["grand_total"] == pytest.approx(w["totals"]["expired_value"], abs=0.01)

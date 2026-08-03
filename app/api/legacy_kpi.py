@@ -422,7 +422,12 @@ def stockchange_insights(Plant: str = Query(None), Category: str = Query(None)):
         inflow=("inflow", "sum"), outflow=("outflow", "sum"), net=("stock_change", "sum")).reset_index()
     m["_k"] = m["month"].map({mm: i for i, mm in enumerate(MONTH_ORDER)})
     m = m.sort_values(["year", "_k"])
+    # `year` is additive here and load-bearing on the frontend: December appears in
+    # BOTH 2025 and 2026, so the drill-down has to key its slice on year+month or a
+    # hover on one December bar would answer with both Decembers summed. No number
+    # above or below this line changes.
     months = [{"label": f"{str(r['month'])[:3]} {str(int(r['year']))[2:]}", "month": r["month"],
+               "year": int(r["year"]),
                "inflow": float(r["inflow"]), "outflow": float(r["outflow"]), "net": float(r["net"])} for _, r in m.iterrows()]
     g = df.groupby(["material", "material_desc", "material_group"], observed=True).agg(
         inflow=("inflow", "sum"), outflow=("outflow", "sum"), net=("stock_change", "sum")).reset_index()
@@ -1032,8 +1037,8 @@ def fill_insights(Plant: str = Query(None)):
 
 # ---------------- MONTHLY SKU PURCHASE insights (B2) ----------------
 @router.get("/kpi/monthly-purchase-value/insights")
-def monthly_purchase_insights(Plant: str = Query(None)):
-    mp = da.filter_plant(da.load("kpi_monthly_purchase_value"), _plant(Plant)).copy()
+def monthly_purchase_insights(Plant: str = Query(None), Category: str = Query(None)):
+    mp = _pc(da.load("kpi_monthly_purchase_value"), Plant, Category).copy()
     total = float(mp["monthly_purchase_value"].sum())
     tg = mp.groupby("material_group", observed=True)["monthly_purchase_value"].sum().sort_values(ascending=False)
     top_groups = list(tg.head(4).index)
@@ -1062,7 +1067,9 @@ def monthly_purchase_insights(Plant: str = Query(None)):
     # so map via material → material_group. Margin % = (MRP − net price) on matched rows.
     margin_matrix = None
     try:
-        g = da.filter_plant(da.load("fact_grn"), _plant(Plant)).copy()
+        # fact_grn carries the SAME derived material category, so the margin heatmap
+        # narrows with the spend heatmap instead of contradicting it.
+        g = _pc(da.load("fact_grn"), Plant, Category).copy()
         mat2grp = dict(zip(mp["material"].astype(str), mp["material_group"].astype(str)))
         g2 = g[(g["unit_mrp"] > 0) & (g["net_price"] > 0) & (g["gr_qty"] > 0)].copy()
         if not g2.empty:
@@ -1091,15 +1098,25 @@ def monthly_purchase_insights(Plant: str = Query(None)):
 
 
 # ---------------- MONTHLY PURCHASE VALUE (KPI_6) ----------------
+# kpi_monthly_purchase_value is the ONE procurement aggregate that kept its material
+# column, so it is the only procurement money metric that can honestly be cut by
+# material category — kpi_purchase_value / kpi_vendor_volume / kpi_cycle_time /
+# kpi_fill_rate / kpi_purchase_by_location were all aggregated past material, and
+# kpi_purchase_value's own `category` is the PO SPEND taxonomy (1,360 values like
+# "BARBOUR SUTURE"), not our six reporting buckets. Category is optional and defaults
+# to None => da.filter_category is a no-op, so the unfiltered response is unchanged.
 @router.get("/kpi/monthly-purchase-value")
-def monthly_purchase_value(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None)):
-    df = _filt(da.load("kpi_monthly_purchase_value"), Plant, Material, MaterialGroup)
+def monthly_purchase_value(Plant: str = Query(None), Material: str = Query(None),
+                           MaterialGroup: str = Query(None), Category: str = Query(None)):
+    df = _filt(da.load("kpi_monthly_purchase_value"), Plant, Material, MaterialGroup, Category)
     return _monthly(df, "monthly_purchase_value", "Monthly Purchase Value")
 
 
 @router.get("/kpi/monthly-purchase-value-table")
-def monthly_purchase_value_table(request: Request, Plant: str = Query(None)):
+def monthly_purchase_value_table(request: Request, Plant: str = Query(None),
+                                 Category: str = Query(None)):
     return da.paginate("kpi_monthly_purchase_value", _plant(Plant), dict(request.query_params),
+        category=Category,
         col_map={"year": "year", "period": "month", "materialId": "material", "materialName": "material_desc",
                  "materialGroup": "material_group", "monthlyPurchaseValue": "monthly_purchase_value"},
         columns=["year", "month", "material", "material_desc", "material_group", "monthly_purchase_value"],
