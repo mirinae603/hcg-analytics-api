@@ -313,6 +313,232 @@ def replen_priority(plant: Optional[str] = None) -> pd.DataFrame:
     return legacy_kpi._replen_frame(plant)
 
 
+# ── PROCUREMENT AGGREGATES REBUILT AT MATERIAL-CATEGORY GRAIN ────────────────
+# Six of the eight procurement aggregates were groupby'd PAST material, so they carry
+# no material category and `?Category=` on them was an invisible no-op — the response
+# came back identical under every bucket while the card above it said "Onco Drugs".
+# Every one of them is nevertheless a plain `fact_po` / `fact_grn` groupby (see
+# app/etl/transforms.py build_procurement_kpis / build_additional_kpis), and both fact
+# tables DO carry a material. So instead of leaving the filter inert, the request is
+# served from the fact-grain frame the aggregate was built from, cut to the category
+# FIRST and then collapsed with the aggregate's own groupby and its own derived
+# columns (the MoM shift, the per-plant vendor share, the fill-rate ratio).
+#
+# The rebuild is exact, not a lookalike: run with no category filter, each builder
+# below reproduces its committed parquet row for row and column for column — asserted
+# in tests/test_procurement_category.py. That is what makes the substitution safe:
+# Rs 649.91 Cr of PO spend is Rs 649.91 Cr whichever path produced it.
+#
+# THE TWO TAXONOMIES. fact_po and kpi_purchase_value both ship a `category` column
+# that is the PO SPEND taxonomy (~1,360 values: ANTINEOPLASTIC, BARBOUR SUTURE,
+# CAPITALS), NOT the six material buckets. po_grain keeps them apart by name —
+# `category`/`po_category` is the spend taxonomy, `material_category` is ours — and
+# the builders below filter ONLY on `material_category` while rebuilding `category`
+# as the spend taxonomy it has always been. So "Where spend goes" keeps its own
+# vocabulary and simply narrows to the chosen material bucket, and a material filter
+# can never be applied to the spend taxonomy or vice versa.
+MATERIAL_CATEGORY_COL = "material_category"
+
+
+def _cut(df: pd.DataFrame, category: str) -> pd.DataFrame:
+    """Restrict a fact-grain frame to one MATERIAL category.
+
+    Filters the explicitly-named `material_category` column, never `category` — on
+    the procurement frames that one is the PO spend taxonomy. An unrecognised bucket
+    yields an EMPTY frame rather than the whole portfolio, matching
+    data_access.filter_category's own convention: a filter the user believes is
+    applied must never quietly hand back everything.
+    """
+    return df[df[MATERIAL_CATEGORY_COL].astype(str) == str(category)]
+
+
+def _decategorize(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop pandas `category` DTYPE back to object.
+
+    Purely mechanical: po_grain/grn_grain hold their string columns as categoricals to
+    stay small, but the committed parquet hold them as object, and `_clean_records`'
+    `replace({nan: None})` behaves differently on a categorical. Casting back keeps a
+    rebuilt frame byte-comparable with the parquet it stands in for.
+    """
+    for c in df.columns:
+        if df[c].dtype.name == "category":
+            df[c] = df[c].astype(object)
+    return df
+
+
+def _rg_purchase_value(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_purchase_value — plant x vendor x PO-spend-category x month."""
+    po = po_grain()
+    if cat:
+        po = _cut(po, cat)
+    g = (po.groupby(["plant", "vendor_name", "category", "year", "month"],
+                    dropna=False, observed=True)
+           .agg(purchase_value=("purchase_value", "sum"),
+                purchase_qty=("purchase_qty", "sum"),
+                po_lines=("po_lines", "sum"))
+           .reset_index())
+    return _decategorize(g)
+
+
+def _rg_procurement_variance(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_procurement_variance — plant monthly spend + its month-on-month shift.
+
+    The MoM shift is RECOMPUTED inside the category rather than carried over from the
+    portfolio, because "spend fell 12%" has to mean this bucket's spend fell 12%.
+    Same sort (plant, year, calendar-month) and same `prev_value > 0` guard as
+    transforms.py, so with no category this is the committed parquet exactly.
+    """
+    po = po_grain()
+    if cat:
+        po = _cut(po, cat)
+    m = (po.groupby(["plant", "year", "month"], dropna=False, observed=True)["purchase_value"]
+           .sum().reset_index())
+    m["_mk"] = m["month"].astype(str).map({x: i for i, x in enumerate(da.MONTH_ORDER)})
+    m = m.sort_values(["plant", "year", "_mk"])
+    m["prev_value"] = m.groupby("plant", observed=True)["purchase_value"].shift(1)
+    m["variance_abs"] = m["purchase_value"] - m["prev_value"]
+    m["variance_pct"] = np.where(m["prev_value"].fillna(0) > 0,
+                                 m["variance_abs"] / m["prev_value"] * 100, np.nan)
+    return _decategorize(m.drop(columns=["_mk"]))
+
+
+def _rg_vendor_volume(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_vendor_volume — plant x vendor spend, share recomputed WITHIN the cut.
+
+    `value_share_pct` is a share of its plant's total. Carrying the portfolio-wide
+    share into a filtered view would leave the column no longer summing to 100 per
+    plant, so it is recomputed off the filtered plant total — "this vendor is 94.9% of
+    our onco spend at this hospital", which is the whole point of asking.
+    """
+    po = po_grain()
+    if cat:
+        po = _cut(po, cat)
+    v = (po.groupby(["plant", "vendor_name"], dropna=False, observed=True)
+           .agg(vendor_value=("purchase_value", "sum"),
+                vendor_qty=("purchase_qty", "sum"),
+                po_lines=("po_lines", "sum"))
+           .reset_index())
+    tot = v.groupby("plant", observed=True)["vendor_value"].transform("sum")
+    v["value_share_pct"] = np.where(tot > 0, v["vendor_value"] / tot * 100, 0)
+    return _decategorize(v)
+
+
+def _rg_purchase_by_location(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_purchase_by_location — one row per plant.
+
+    `vendor_count` is a nunique, not a sum, so it is recounted on the cut rather than
+    scaled: under a category it means "vendors this hospital buys THIS bucket from".
+    """
+    po = po_grain()
+    if cat:
+        po = _cut(po, cat)
+    g = (po.groupby(["plant"], dropna=False, observed=True)
+           .agg(purchase_value=("purchase_value", "sum"),
+                purchase_qty=("purchase_qty", "sum"),
+                vendor_count=("vendor_name", "nunique"),
+                po_lines=("po_lines", "sum"))
+           .reset_index())
+    return _decategorize(g)
+
+
+def _rg_fill_rate(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_fill_rate — ordered vs still-open quantity per plant.
+
+    Both legs are sums over PO lines that each carry a material, so the cut is exact.
+    See FILL_RATE_SERVICE_PO_NOTE below for the one bucket where the SOURCE data makes
+    the ratio meaningless, and which the endpoint discloses rather than clamps silently.
+    """
+    po = po_grain()
+    if cat:
+        po = _cut(po, cat)
+    f = (po.groupby(["plant"], dropna=False, observed=True)
+           .agg(ordered_qty=("purchase_qty", "sum"), open_qty=("open_qty", "sum"))
+           .reset_index())
+    f["fill_rate_pct"] = np.where(f["ordered_qty"] > 0,
+                                  (1 - f["open_qty"] / f["ordered_qty"]) * 100, np.nan)
+    return _decategorize(f)
+
+
+def _rg_cycle_time(cat: Optional[str]) -> pd.DataFrame:
+    """kpi_cycle_time — mean PO→GR / PR→GR turnaround per plant x month.
+
+    A mean is not additive, so this is rebuilt from grn_grain's SUM and COUNT columns
+    (sum(tat)/count(tat)) rather than by averaging averages — which reproduces
+    transforms.py's `mean()` exactly, including its "mean over non-null, count over all
+    rows" split between `avg_*_tat` and `gr_lines`.
+    """
+    grn = grn_grain()
+    if cat:
+        grn = _cut(grn, cat)
+    c = (grn.groupby(["plant", "year", "month"], dropna=False, observed=True)
+            .agg(_pos=("po_tat_sum", "sum"), _pon=("po_tat_n", "sum"),
+                 _prs=("pr_tat_sum", "sum"), _prn=("pr_tat_n", "sum"),
+                 gr_lines=("gr_lines", "sum"))
+            .reset_index())
+    c["avg_po_to_gr_tat"] = np.where(c["_pon"] > 0, c["_pos"] / c["_pon"], np.nan)
+    c["avg_pr_to_gr_tat"] = np.where(c["_prn"] > 0, c["_prs"] / c["_prn"], np.nan)
+    return _decategorize(
+        c[["plant", "year", "month", "avg_po_to_gr_tat", "avg_pr_to_gr_tat", "gr_lines"]])
+
+
+# aggregate table -> rebuilder. Membership of this dict IS the answer to "does this
+# procurement KPI honour ?Category=" — /meta/category-support reads it directly rather
+# than repeating the list, so the contract cannot drift from the implementation.
+PROC_REGRAIN: dict[str, Callable[[Optional[str]], pd.DataFrame]] = {
+    "kpi_purchase_value": _rg_purchase_value,
+    "kpi_procurement_variance": _rg_procurement_variance,
+    "kpi_vendor_volume": _rg_vendor_volume,
+    "kpi_purchase_by_location": _rg_purchase_by_location,
+    "kpi_fill_rate": _rg_fill_rate,
+    "kpi_cycle_time": _rg_cycle_time,
+}
+
+# 2,557 fact_po lines carry a NEGATIVE open_qty. Every one of them is Unclassified and
+# 2,555 of them are doc_type "Service PO" — value-based/blanket orders whose notional
+# ordered quantity is smaller than what was received, so "open quantity" goes below
+# zero. Unfiltered they are swamped (portfolio fill rate 91.7%), but selecting
+# Unclassified makes them the majority and the raw ratio reads 168.7%. The endpoints
+# already clamp the headline to [0,100]; clamping ALONE would print a confident
+# "100% order completion" for the one bucket where the input is meaningless, so the
+# fill-rate surfaces additionally disclose this whenever a category is applied.
+FILL_RATE_SERVICE_PO_NOTE = (
+    "Open quantity is negative on 2,557 service/blanket PO lines, all of them in "
+    "Unclassified — the raw completion ratio for this bucket exceeds 100% and has been "
+    "capped. Read fill rate on the material buckets (Onco Drugs, Other Drugs, "
+    "Consumables, Lab, Non-Medical), where every line is a real goods order."
+)
+
+# Procurement KPIs that deliberately do NOT take a material-category cut, and why.
+# Kept as data so /meta/category-support can publish the refusal instead of the
+# frontend discovering it as a control that appears to do nothing.
+CATEGORY_UNSUPPORTED: dict[str, str] = {
+    "kpi_vendor_lead_time": (
+        "Vendor lead time is a per-VENDOR scorecard with no plant or month dimension, "
+        "and its measure is a median gated at gr_lines >= 3. Cutting by material "
+        "category re-applies that gate inside the bucket and changes the vendor "
+        "POPULATION the card is about (1,648 -> 74 vendors on Onco Drugs), so the "
+        "headline vendor count would move for a sampling reason rather than a supply "
+        "one. The same fact_grn PO->GR turnaround IS available by category on "
+        "procurement-cycle-time, which is cut by plant x month and takes an exact "
+        "category filter."
+    ),
+}
+
+
+@lru_cache(maxsize=128)
+def regrain(table: str, category: Optional[str]) -> Optional[pd.DataFrame]:
+    """The frame to serve `table` from under `category`, or None to use the parquet.
+
+    None on no category is the whole backwards-compatibility contract: an unfiltered
+    request never touches this module at all, so it is not merely equal to today's
+    response, it is produced by identical code reading the identical file.
+    """
+    if not category:
+        return None
+    b = PROC_REGRAIN.get(table)
+    return b(category) if b else None
+
+
 # name -> builder(plant) . Everything else resolves through da.load(<table>).
 BUILDERS: dict[str, Callable[[Optional[str]], pd.DataFrame]] = {
     "drill_po_grain": lambda _p: po_grain(),
@@ -329,7 +555,12 @@ BUILDERS: dict[str, Callable[[Optional[str]], pd.DataFrame]] = {
 # procurement frames override it because their `category` is the PO spend taxonomy.
 DERIVED_CATEGORY_COL: dict[str, str] = {
     "drill_po_grain": "material_category",
-    "kpi_purchase_value": "material_category",   # has none — filtering stays a no-op
+    # kpi_purchase_value's own `category` is the PO SPEND taxonomy, and it carries no
+    # material_category column at all. Naming the absent column here is deliberate: it
+    # makes the drill resolver SKIP this table whenever a category is active and fall
+    # through to drill_po_grain, which does carry the material grain — rather than
+    # matching a material bucket against the spend vocabulary and returning nothing.
+    "kpi_purchase_value": "material_category",
 }
 
 
@@ -340,6 +571,6 @@ def load_source(name: str, plant: Optional[str]) -> pd.DataFrame:
 
 def clear_caches() -> None:
     for fn in (po_grain, grn_grain, inventory_grain, consumption_grain,
-               doh_grain, expired_grain,
+               doh_grain, expired_grain, regrain,
                _material_group_map, material_desc_map, department_name_map, plant_name_map):
         fn.cache_clear()

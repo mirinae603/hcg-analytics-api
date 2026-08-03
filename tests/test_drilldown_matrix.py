@@ -277,19 +277,27 @@ def test_plant_and_category_compose_on_a_rerouted_drill(client):
 def test_a_rerouted_drill_never_out_filters_the_chart_it_came_from(client):
     """A drill matches its chart's category behaviour EXACTLY — in both directions.
 
-    Stated as the invariant rather than as one example, because the example moved:
-    kpi_purchase_value's `category` is the PO spend taxonomy, so its chart ignores a
-    material bucket and its drill must ignore it too (a slice total smaller than the
-    bar being pointed at is a lie, however well-intentioned). kpi_aging_distribution
-    used to be in that group and no longer is — /kpi/aging-distribution now serves a
-    filtered request from the fact-grain frame — so its drill must now narrow with it,
-    and a drill still answering 60 Cr under a 25 Cr bar would be the same lie
-    inverted.
+    Stated as the invariant rather than as one example, because the example keeps
+    moving. kpi_aging_distribution was once in the "ignores it" group and is not any
+    more; kpi_purchase_value has now followed it, because /kpi/purchase-value is served
+    from fact_po at material grain whenever a category is passed. A drill still
+    answering Rs 649.9 Cr under a Rs 236.7 Cr bar would be exactly the lie this test
+    exists to catch, just inverted — so the assertion is "the drill total equals the
+    chart total", never "the drill ignores the filter".
     """
-    # ignores it — and the drill ignores it identically
+    # honours it — the drill narrows to the same total the CHART narrows to, and the
+    # `category` dimension it is grouped by stays the PO SPEND taxonomy throughout.
     plain = body(client, kpi="purchase-value", dim="category", by="vendor")
     onco = body(client, kpi="purchase-value", dim="category", by="vendor", Category="Onco Drugs")
-    assert onco["grand_total"] == pytest.approx(plain["grand_total"], rel=1e-9)
+    assert onco["grand_total"] < plain["grand_total"]
+    chart = client.get("/kpi/purchase-value/insights",
+                       params={"Category": "Onco Drugs"}).json()
+    assert onco["grand_total"] == pytest.approx(chart["totals"]["spend"], rel=1e-6)
+
+    # ...and the one procurement KPI that refuses the cut refuses it on the drill too,
+    # rather than quietly answering with the whole portfolio.
+    r = client.get("/drill/top-items?kpi=vendor-lead-time&by=vendor&Category=Onco%20Drugs")
+    assert r.status_code == 400
 
     # honours it — and the drill narrows to the same total the chart shows
     a = body(client, kpi="aging-distribution", dim="aging_bucket", slice="0-30", by="material")

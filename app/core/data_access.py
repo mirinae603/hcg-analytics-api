@@ -355,11 +355,29 @@ def summarize(table: str, plant=None, material=None, material_group=None,
     for c in df.columns:
         if df[c].dtype.kind in "fiu":
             s = pd.to_numeric(df[c], errors="coerce")
-            out[c] = {"sum": float(s.sum()), "mean": float(s.mean()) if len(s) else 0.0,
-                      "median": float(s.median()) if len(s) else 0.0}
+            out[c] = {"sum": _jsonable(s.sum()),
+                      "mean": _jsonable(s.mean()) if len(s) else 0.0,
+                      "median": _jsonable(s.median()) if len(s) else 0.0}
         else:
             out[c] = {"distinct": int(df[c].nunique())}
     return out
+
+
+def _jsonable(v) -> Optional[float]:
+    """NaN -> None. A statistic over an all-null column is UNDEFINED, not zero.
+
+    Starlette serialises with allow_nan=False, so a NaN here has always been a hard 500
+    rather than a bad number — which is why this can never change an existing response:
+    any path that reaches it with a NaN is currently failing outright. It starts
+    mattering once a category cut can empty a column that is populated portfolio-wide:
+    fact_grn records no PR→GR turnaround at all on onco receipts, so
+    /kpi/procurement-cycle-time/summary?Category=Onco Drugs has a fully-null
+    avg_pr_to_gr_tat. `null` says "no PR→GR data in this bucket"; 0.0 would say
+    "these arrive the same day they are requisitioned", which is a different and false
+    claim.
+    """
+    f = float(v)
+    return None if f != f else f
 
 
 def _apply_filter_protocol(df: pd.DataFrame, params: dict, col_map: dict) -> pd.DataFrame:

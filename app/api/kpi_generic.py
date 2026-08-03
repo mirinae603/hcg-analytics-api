@@ -100,11 +100,39 @@ _CATEGORY_REGRAIN = {"kpi_aging_distribution": "drill_inventory_grain"}
 
 
 def _regrained(table: str, category):
-    """The frame to serve `table` from, or None to use the table itself."""
+    """The frame to serve `table` from, or None to use the table itself.
+
+    Two substitution routes, both inert without a category:
+
+      * _CATEGORY_REGRAIN — swap in the richer-grain frame WHOLE and let
+        da.filter_category do the cut (inventory; the frame's `category` IS the
+        material category, so filtering it is correct).
+      * ds.PROC_REGRAIN — the procurement aggregates, where the same trick would be
+        actively wrong: fact_po's `category` is the PO SPEND taxonomy, so handing the
+        raw grain to filter_category would either match nothing or (as today) be
+        refused by _is_derived_category_col and silently return the whole portfolio.
+        These builders therefore cut on `material_category` themselves and hand back
+        a frame already collapsed to the aggregate's own grain — one that carries no
+        derived category column at all, so the filter_category call downstream is a
+        guaranteed no-op rather than a second, conflicting filter.
+    """
     src = _CATEGORY_REGRAIN.get(table)
     if src and da.resolve_category(category):
         return ds.load_source(src, None)
-    return None
+    return ds.regrain(table, da.resolve_category(category))
+
+
+def _category_unsupported(table: str, category) -> None:
+    """400 rather than silently ignore a Category the table cannot honour.
+
+    Only fires when a caller EXPLICITLY passes a bucket for a KPI listed in
+    ds.CATEGORY_UNSUPPORTED. Returning the unfiltered portfolio under an "Onco Drugs"
+    label is the one outcome worse than refusing: the reader cannot tell a filter that
+    did nothing from a filter that found everything. GET /meta/category-support
+    publishes the same list so a card can decide not to offer the control at all.
+    """
+    if da.resolve_category(category) and table in ds.CATEGORY_UNSUPPORTED:
+        raise HTTPException(status_code=400, detail=ds.CATEGORY_UNSUPPORTED[table])
 
 
 @_kc
@@ -122,10 +150,12 @@ def _kpi_summary_cached(table, plant, material, material_group, category=None):
 
 # `Category` is OPTIONAL everywhere and defaults to None => filter_category is a
 # no-op, so every existing call site keeps its exact current response. On tables
-# with no material grain (kpi_purchase_value, kpi_cycle_time, kpi_fill_rate, …) no
-# `category` column is derived at all, so the param is inert there too — see
-# data_access._attach_category — EXCEPT where _CATEGORY_REGRAIN above can route the
-# request to the fact-grain frame the aggregate was built from.
+# with no material grain no `category` column is derived at all — see
+# data_access._attach_category — so the param used to be inert there. It is no longer:
+# _CATEGORY_REGRAIN routes the inventory aggregate to the fact-grain frame it was built
+# from, and ds.PROC_REGRAIN rebuilds six of the eight procurement aggregates from
+# fact_po / fact_grn at material grain. The one procurement KPI that genuinely cannot
+# take the cut now says so with a 400 instead of quietly answering unfiltered.
 @router.get("/kpi/{key}")
 def kpi_chart(
     key: str,
@@ -137,7 +167,9 @@ def kpi_chart(
     measures: Optional[str] = Query(None, description="comma numeric cols to sum"),
     top: Optional[int] = Query(None, description="keep top-N rows by first measure"),
 ):
-    return _kpi_chart_cached(_resolve(key), plant, material, material_group, group_by,
+    table = _resolve(key)
+    _category_unsupported(table, category)
+    return _kpi_chart_cached(table, plant, material, material_group, group_by,
                              measures, top, category)
 
 
@@ -149,7 +181,9 @@ def kpi_summary(
     material_group: Optional[str] = Query(None, alias="MaterialGroup"),
     category: Optional[str] = Query(None, alias="Category"),
 ):
-    return _kpi_summary_cached(_resolve(key), plant, material, material_group, category)
+    table = _resolve(key)
+    _category_unsupported(table, category)
+    return _kpi_summary_cached(table, plant, material, material_group, category)
 
 
 @router.get("/kpi/{key}/table")
@@ -160,6 +194,7 @@ def kpi_table(
     category: Optional[str] = Query(None, alias="Category"),
 ):
     table = _resolve(key)
+    _category_unsupported(table, category)
     params = dict(request.query_params)
     return da.paginate(table, plant, params, col_map={}, category=category,
                        frame=_regrained(table, category))
@@ -261,6 +296,54 @@ def meta_vendors(plant: Optional[str] = Query(None, alias="Plant")):
     df = da.filter_plant(df, plant)
     vendors = sorted(v for v in df["vendor_name"].dropna().unique() if str(v) not in ("nan", ""))
     return {"vendors": vendors}
+
+
+@router.get("/meta/category-support")
+def meta_category_support():
+    """Which KPIs actually honour `?Category=`, and how — the contract a card wires off.
+
+    A card-level category control is only honest if the endpoint behind it really
+    narrows. Three outcomes exist and they are NOT distinguishable from the response
+    alone, which is exactly how a dead control survives review:
+
+      supported=true,  how="native"   the aggregate carries a material category
+                                      column, filter_category cuts it directly.
+      supported=true,  how="regrain"  the aggregate was built past material grain, so
+                                      the request is rebuilt from fact_po / fact_grn at
+                                      material grain (`source` names the fact frame).
+      supported=false                 the cut would be misleading; `reason` says why,
+                                      and passing a Category returns 400 rather than
+                                      the unfiltered portfolio under a filtered label.
+
+    Computed from the same dicts the request path uses (ds.PROC_REGRAIN,
+    _CATEGORY_REGRAIN, ds.CATEGORY_UNSUPPORTED) plus a live column check, so it cannot
+    drift from what the endpoints will actually do.
+    """
+    out = []
+    for key, (table, _status) in REGISTRY.items():
+        if table in ds.CATEGORY_UNSUPPORTED:
+            out.append({"key": key, "table": table, "supported": False, "how": None,
+                        "source": None, "reason": ds.CATEGORY_UNSUPPORTED[table]})
+            continue
+        if table in ds.PROC_REGRAIN:
+            src = "fact_grn" if table == "kpi_cycle_time" else "fact_po"
+            out.append({"key": key, "table": table, "supported": True, "how": "regrain",
+                        "source": src, "reason": None})
+            continue
+        if table in _CATEGORY_REGRAIN:
+            out.append({"key": key, "table": table, "supported": True, "how": "regrain",
+                        "source": _CATEGORY_REGRAIN[table], "reason": None})
+            continue
+        try:
+            df = da.load(table)
+            native = "category" in df.columns and da._is_derived_category_col(df)
+        except Exception:
+            native = False
+        out.append({"key": key, "table": table, "supported": bool(native),
+                    "how": "native" if native else None, "source": table if native else None,
+                    "reason": None if native else
+                    f"{table} carries no material grain and has no fact-grain rebuild."})
+    return {"categories": da.CATEGORIES, "kpis": sorted(out, key=lambda r: r["key"])}
 
 
 @router.get("/meta/categories")
@@ -699,7 +782,9 @@ def _category_applies(primary_table: str) -> bool:
     # serves it from the fact-grain frame whenever a Category is passed (see
     # _CATEGORY_REGRAIN), so the chart DOES narrow — and the drill has to narrow with
     # it or the panel would print a bigger total than the bar it was launched from.
-    if primary_table in _CATEGORY_REGRAIN:
+    # Same for the six procurement aggregates rebuilt from fact_po / fact_grn: the bar
+    # is now Rs 236.7 Cr of onco spend, so the drill inside it must be too.
+    if primary_table in _CATEGORY_REGRAIN or primary_table in ds.PROC_REGRAIN:
         return True
     try:
         # load_source, not da.load: a primary table can now BE a built frame
@@ -941,6 +1026,12 @@ def drill_top_items(
     could do instead.
     """
     kpi_key = _drill_kpi(kpi)
+    # A drill MIRRORS its chart. For the one KPI whose chart refuses a category cut, an
+    # unfiltered top-10 under an "Onco Drugs" label would be the same silent lie the 400
+    # on /kpi/<key> exists to prevent — worse here, because there is no bar above it to
+    # compare the total against.
+    if kpi_key in REGISTRY:
+        _category_unsupported(REGISTRY[kpi_key][0], category)
     plant_code = da.resolve_plant(plant)
     source, df, dplan, bplan, meas, notes = _resolve_drill(
         kpi_key, dim, by, measure, plant_code, category)

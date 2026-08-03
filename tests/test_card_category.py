@@ -61,6 +61,23 @@ WIRED = [
     ("/inventory/replenishment-data", {}),
     ("/kpi/monthly-purchase-value/insights", {}),
     ("/kpi/monthly-purchase-value", {}),
+    # ── procurement ──────────────────────────────────────────────────────────
+    # These were in NOT_WIRED, correctly, for as long as they were served from
+    # aggregates that had been groupby'd past material grain. They are now rebuilt from
+    # fact_po / fact_grn at material grain (app/core/drill_sources.py PROC_REGRAIN), so
+    # the claim their chip makes is real. tests/test_procurement_category.py checks the
+    # numbers themselves — that each rebuild reproduces its parquet exactly and that the
+    # six buckets sum back to Rs 649.91 Cr.
+    ("/portfolio/procurement/overview", {}),
+    ("/portfolio/procurement/savings", {}),
+    ("/kpi/purchase-value/insights", {}),
+    ("/kpi/purchase-value/summary", {}),
+    ("/kpi/procurement-variance/insights", {}),
+    ("/kpi/vendor-volume-contribution/insights", {}),
+    ("/kpi/purchase-by-location/insights", {}),
+    ("/kpi/procurement-cycle-time/insights", {}),
+    ("/kpi/fill-rate/insights", {}),
+    ("/kpi/vendor-volume-vs-margin", {}),           # fact_grn keeps its material column
 ]
 
 # ── endpoints deliberately left WITHOUT a card filter, and why ───────────────
@@ -68,19 +85,22 @@ WIRED = [
 # The reason is always the same shape: the aggregate was cut past material grain, so
 # there is no category column to filter on and inventing one would be a lie.
 NOT_WIRED = [
-    ("/portfolio/procurement/overview", {}),        # spend/vendor/cycle aggregates, no material
-    ("/portfolio/procurement/savings", {}),         # GRN price-variance rollup, no material
-    ("/kpi/purchase-value/insights", {}),           # kpi_purchase_value: `category` is the PO
-    ("/kpi/procurement-variance/insights", {}),     #   SPEND taxonomy (1,360 values), not ours
-    ("/kpi/vendor-volume-contribution/insights", {}),   # plant x vendor
-    ("/kpi/purchase-by-location/insights", {}),     # one row per plant
-    ("/kpi/procurement-cycle-time/insights", {}),   # plant x month
-    ("/kpi/vendor-lead-time/insights", {}),         # one row per vendor
-    ("/kpi/fill-rate/insights", {}),                # one row per plant
-    ("/kpi/vendor-volume-vs-margin", {}),           # GRN rollup to vendor
     ("/kpi/consumption-by-department/insights", {}),    # plant x cost centre x month
     ("/revenue/insights", {}),                      # billing aggregates keyed on their own
     ("/revenue/items", {"limit": "10"}),            #   `group`, not the derived category
+]
+
+# ── endpoints that REFUSE a category rather than answer unfiltered ───────────
+# Being inert is only acceptable where nobody would think to ask. Vendor lead time sits
+# in a portfolio where seven sibling cards DO take the cut, so a reader has every reason
+# to expect it to — and an unfiltered answer under an "Onco Drugs" label is
+# indistinguishable from a filter that found everything. It refuses instead; see
+# ds.CATEGORY_UNSUPPORTED for the reasoning and the metric that answers the same
+# question by category.
+REFUSES = [
+    ("/kpi/vendor-lead-time/insights", {}),
+    ("/kpi/vendor-lead-time", {}),
+    ("/kpi/vendor-lead-time/summary", {}),
 ]
 
 CATS = ["Onco Drugs", "Consumables"]
@@ -108,6 +128,16 @@ def test_an_unwired_card_endpoint_really_is_inert(client, path, extra):
     for c in CATS:
         assert _get(client, path, {**extra, "Category": c}) == base, (
             f"{path} now honours ?Category={c} — its card should have a filter")
+
+
+@pytest.mark.parametrize("path,extra", REFUSES, ids=[p for p, _ in REFUSES])
+def test_a_refusing_endpoint_says_400_rather_than_answering_unfiltered(client, path, extra):
+    """Inert is not good enough here. If this ever starts returning 200 again, the card
+    is back to showing the whole portfolio under a filtered label."""
+    assert client.get(path, params=extra).status_code == 200
+    r = client.get(path, params={**extra, "Category": "Onco Drugs"})
+    assert r.status_code == 400, f"{path} answered {r.status_code} instead of refusing"
+    assert "procurement-cycle-time" in r.json()["detail"], "must name the alternative"
 
 
 # ── the regrain: kpi_aging_distribution has no material column at all ─────────
@@ -193,9 +223,11 @@ def test_the_aging_distribution_drill_agrees_with_its_own_filtered_chart(client)
 
 # ── monthly purchase value: the one procurement table with material grain ────
 
-def test_monthly_purchase_value_is_the_only_procurement_money_metric_with_grain(client):
-    """kpi_monthly_purchase_value kept its material column, so it — alone among the
-    procurement aggregates — can honestly be cut by material category."""
+def test_monthly_purchase_value_cuts_natively_off_its_own_material_column(client):
+    """kpi_monthly_purchase_value is the one procurement aggregate that KEPT its material
+    column, so it cuts natively — no regrain in the path at all. It is the control case
+    the six rebuilt aggregates are checked against: they must land on the same numbers by
+    a different route."""
     mpv = da.load("kpi_monthly_purchase_value")
     total = float(mpv["monthly_purchase_value"].sum())
     base = _get(client, "/kpi/monthly-purchase-value/insights", {})
@@ -210,13 +242,43 @@ def test_monthly_purchase_value_is_the_only_procurement_money_metric_with_grain(
     assert seen == pytest.approx(total, rel=1e-9)
 
 
-def test_purchase_value_still_refuses_to_be_cut_by_material_category(client):
-    """kpi_purchase_value's own `category` is the PO SPEND taxonomy, so filtering it
-    with a material bucket must stay a no-op rather than silently returning Rs 0 —
-    which is what made the two procurement money metrics contradict each other."""
+def test_purchase_value_is_cut_by_regrain_never_by_its_own_category_column(client):
+    """The two `category` vocabularies must stay apart even now that the card narrows.
+
+    kpi_purchase_value's own `category` is the PO SPEND taxonomy (~1,360 values), so a
+    DIRECT filter with a material bucket must remain a no-op — matching it would return
+    Rs 0, the original bug. What changed is where the answer comes from: the request is
+    now rebuilt from fact_po at material grain, so the card narrows to the right number
+    without the spend taxonomy ever being filtered by the wrong vocabulary. Both halves
+    are asserted here because fixing either one alone reintroduces the other's bug.
+    """
+    pv = da.load("kpi_purchase_value")
+    assert da._is_derived_category_col(pv) is False
+    for c in CATS:                      # the raw column is still never filtered
+        assert len(da.filter_category(pv, c)) == len(pv)
+
+    full = float(pv["purchase_value"].sum())
     base = _get(client, "/kpi/purchase-value/summary", {})
-    for c in CATS:
-        assert _get(client, "/kpi/purchase-value/summary", {"Category": c}) == base
+    assert base["purchase_value"]["sum"] == pytest.approx(full, rel=1e-9)
+
+    seen = 0.0
+    for c in da.CATEGORIES:             # ...yet the endpoint narrows, and adds back up
+        got = _get(client, "/kpi/purchase-value/summary", {"Category": c})
+        assert 0 < got["purchase_value"]["sum"] < full, c
+        seen += got["purchase_value"]["sum"]
+    assert seen == pytest.approx(full, rel=1e-9)
+
+
+def test_the_two_procurement_money_metrics_agree_under_every_bucket(client):
+    """purchase-value and monthly-purchase-value are the same Rs 649.91 Cr of PO spend
+    aggregated two ways. They used to contradict each other under a category — one
+    returned the whole portfolio, the other the onco slice. They must now agree bucket
+    for bucket, or the dashboard is telling two stories about the same money."""
+    for c in da.CATEGORIES:
+        a = _get(client, "/kpi/purchase-value/insights", {"Category": c})["totals"]["spend"]
+        b = _get(client, "/kpi/monthly-purchase-value/insights",
+                 {"Category": c})["totals"]["total"]
+        assert a == pytest.approx(b, rel=1e-9), c
 
 
 # ── the option list the chip renders ─────────────────────────────────────────

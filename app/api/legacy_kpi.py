@@ -7,7 +7,7 @@ Plant param may be a plant code or a region name (name => all plants).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 from functools import lru_cache
 import os
@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from app.core import data_access as da
+from app.core import drill_sources as ds
 
 # Portfolio-overview results are pure functions of the STATIC snapshot parquet, so the
 # output for a given plant never changes until the data is refreshed. We memoize the
@@ -42,8 +43,8 @@ def warmup() -> None:
     # the literal args, so warming `f(None)` would NOT be hit by an endpoint calling
     # `f(None, None)` and the cold-start load would happen anyway.
     for fn_name, args in (
-        ("_procurement_overview_cached", (None,)),
-        ("_procurement_savings_cached", (None, 12)),
+        ("_procurement_overview_cached", (None, None)),
+        ("_procurement_savings_cached", (None, 12, None)),
         ("_consumption_overview_cached", (None, None)),
         ("_forecasting_overview_cached", (None, None)),
     ):
@@ -83,6 +84,37 @@ def _filt(df, plant, material, group, category=None):
 def _pc(df, plant, category=None):
     """Plant + category filter — the two global selectors, in one call."""
     return da.filter_category(da.filter_plant(df, _plant(plant)), category)
+
+
+def _proc(table: str, pl, cat=None):
+    """A procurement aggregate, cut to a material category when one is asked for.
+
+    Six of the eight procurement aggregates were groupby'd past material grain, so
+    da.filter_category cannot touch them — and kpi_purchase_value is worse than inert,
+    since its `category` column is the PO SPEND taxonomy and a material bucket matched
+    against it would be refused (returning the WHOLE portfolio under a filtered label).
+    ds.regrain rebuilds those six from fact_po / fact_grn with the aggregate's own
+    groupby, cut on `material_category` first.
+
+    With no category it returns None and this falls straight through to da.load — the
+    unfiltered response is not merely equal to today's, it is the same code reading the
+    same parquet. `pl` is an ALREADY-RESOLVED plant code (these call sites resolve once
+    and reuse), matching the surrounding cached functions' convention.
+    """
+    df = ds.regrain(table, da.resolve_category(cat))
+    return da.filter_plant(da.load(table) if df is None else df, pl)
+
+
+def _reject_uncuttable(table: str, cat) -> None:
+    """400 when a caller asks a procurement KPI for a cut it cannot honestly make.
+
+    Answering unfiltered would be indistinguishable, to the reader, from a category
+    whose data happens to look like the whole portfolio. See
+    ds.CATEGORY_UNSUPPORTED for the per-KPI reasoning and the metric that does answer
+    the same question by category.
+    """
+    if da.resolve_category(cat) and table in ds.CATEGORY_UNSUPPORTED:
+        raise HTTPException(status_code=400, detail=ds.CATEGORY_UNSUPPORTED[table])
 
 
 def _monthly(df, measure, label, keep_group=True):
@@ -725,18 +757,22 @@ def aging_distribution_insights(Plant: str = Query(None), Category: str = Query(
 
 # ---------------- PROCUREMENT OVERVIEW (portfolio dashboard) ----------------
 @router.get("/portfolio/procurement/overview")
-def procurement_overview(Plant: str = Query(None)):
-    return _procurement_overview_cached(_plant(Plant))
+def procurement_overview(Plant: str = Query(None), Category: str = Query(None)):
+    return _procurement_overview_cached(_plant(Plant), da.resolve_category(Category))
 
 
 @_cache
-def _procurement_overview_cached(pl):
-    pv = da.filter_plant(da.load("kpi_purchase_value"), pl)
-    vv = da.filter_plant(da.load("kpi_vendor_volume"), pl)
-    ct = da.filter_plant(da.load("kpi_cycle_time"), pl)
-    fr = da.filter_plant(da.load("kpi_fill_rate"), pl)
-    loc = da.filter_plant(da.load("kpi_purchase_by_location"), pl)
-    lt = da.load("kpi_vendor_lead_time")  # vendor lead time has no plant dimension
+def _procurement_overview_cached(pl, cat=None):
+    pv = _proc("kpi_purchase_value", pl, cat)
+    vv = _proc("kpi_vendor_volume", pl, cat)
+    ct = _proc("kpi_cycle_time", pl, cat)
+    fr = _proc("kpi_fill_rate", pl, cat)
+    loc = _proc("kpi_purchase_by_location", pl, cat)
+    # Vendor lead time has no plant dimension AND takes no category cut (see
+    # ds.CATEGORY_UNSUPPORTED) — it stays the portfolio-wide figure it already is on
+    # every plant view, rather than being quietly recomputed on a different vendor
+    # population. The `median_lead` card is flagged below when a category is applied.
+    lt = da.load("kpi_vendor_lead_time")
 
     spend = float(pv["purchase_value"].sum())
     po_lines = int(pv["po_lines"].sum())
@@ -753,6 +789,7 @@ def _procurement_overview_cached(pl):
     llg = float(lt["gr_lines"].sum())
     med_lead = float((lt["median_lead_time_days"] * lt["gr_lines"]).sum() / llg) if llg else 0.0
     ordered = float(fr["ordered_qty"].sum()); openq = float(fr["open_qty"].sum())
+    raw_completion = ((1 - openq / ordered) * 100) if ordered else 0.0
     completion = (max(0.0, min(1.0, 1 - openq / ordered)) * 100) if ordered else 0.0
 
     m = pv.groupby(["year", "month"], observed=True)["purchase_value"].sum().reset_index()
@@ -778,7 +815,10 @@ def _procurement_overview_cached(pl):
     # fact_grn's placeholder/transposed-price rows inflate an unfiltered mrp_val ~2.7x).
     # Sharing _clean_grn_rows guarantees this card and that page can never drift apart.
     try:
-        clean = _clean_grn_rows(da.filter_plant(da.load("fact_grn"), pl))
+        # fact_grn keeps its material column, so the margin proxy takes the category cut
+        # NATIVELY — no regrain needed, and the same filter the Vendor Margin detail page
+        # applies, so the card and that page still cannot drift apart under a filter.
+        clean = _clean_grn_rows(da.filter_category(da.filter_plant(da.load("fact_grn"), pl), cat))
         mrp_val = float(clean["mrp_value"].sum())
         cost_val = float(clean["cost_value"].sum())
     except Exception:
@@ -799,8 +839,12 @@ def _procurement_overview_cached(pl):
     }
 
     # Open POs — undelivered order value by category (client #12: category + number + value).
+    # `op["g"]` below is the PO SPEND taxonomy (major_group), while the cut applied here
+    # is the MATERIAL category: selecting "Onco Drugs" narrows the ROWS and leaves the
+    # bars labelled in the spend vocabulary they have always used. fact_po carries the
+    # derived material category, so this is a native filter, not a regrain.
     try:
-        po = da.filter_plant(da.load("fact_po"), pl)
+        po = da.filter_category(da.filter_plant(da.load("fact_po"), pl), cat)
         op = po[po["open_qty"] > 0].copy()
         op["open_value"] = op["open_qty"] * op["net_price"]
         op["g"] = op["major_group"].apply(_clean_group)
@@ -810,7 +854,7 @@ def _procurement_overview_cached(pl):
     except Exception:
         open_po = {"total_value": 0.0, "total_pos": 0, "total_lines": 0, "categories": []}
 
-    return {
+    out = {
         "totals": {"spend": spend, "vendors": n_vendors, "po_lines": po_lines, "avg_po_gr": avg_po_gr,
                    "avg_pr_gr": avg_pr_gr, "median_lead": med_lead, "completion": completion,
                    "top5_share": top5_share, "n_plants": n_plants,
@@ -818,23 +862,41 @@ def _procurement_overview_cached(pl):
         "timeline": timeline, "categories": categories, "vendors": top_vendors, "locations": locations, "cards": cards,
         "open_po": open_po,
     }
+    # Per-card caveats, attached ONLY when a category is actually applied — so the
+    # unfiltered response keeps its exact existing shape (the regression gate compares
+    # whole JSON documents) and a reader who filtered is told which two of the nine
+    # cards did not narrow the way the other seven did.
+    if cat:
+        notes = {"vendor-lead-time": ds.CATEGORY_UNSUPPORTED["kpi_vendor_lead_time"]}
+        if raw_completion < 0 or raw_completion > 100:
+            notes["fill-rate"] = ds.FILL_RATE_SERVICE_PO_NOTE
+        out["category"] = cat
+        out["category_notes"] = notes
+        out["totals"]["completion_raw"] = raw_completion
+    return out
 
 
 # ---------------- PROCUREMENT SAVING OPPORTUNITY (client #12: item-wise loss/saving) ----------------
 @router.get("/portfolio/procurement/savings")
-def procurement_savings(Plant: str = Query(None), limit: int = Query(12)):
+def procurement_savings(Plant: str = Query(None), limit: int = Query(12),
+                        Category: str = Query(None)):
     """Price-consolidation headroom: for each material bought >=4 times at a
     consistent unit (max/min <= 2.5x, so we don't compare mixed pack sizes), sum the
     spend ABOVE that item's own median achieved price. Conservative negotiation
-    headroom — an honest 'you paid above your own median' figure, not a guaranteed saving."""
-    return _procurement_savings_cached(_plant(Plant), limit)
+    headroom — an honest 'you paid above your own median' figure, not a guaranteed saving.
+
+    The whole computation is PER MATERIAL, so a material-category cut is a clean subset:
+    each item's median price, its >=4-purchase gate and its headroom are identical
+    whether or not its bucket is selected, and the flagged items simply partition across
+    the six buckets. fact_grn carries the material category natively — no regrain."""
+    return _procurement_savings_cached(_plant(Plant), limit, da.resolve_category(Category))
 
 
 @_cache
-def _procurement_savings_cached(pl, limit):
+def _procurement_savings_cached(pl, limit, cat=None):
     empty = {"totals": {"opportunity": 0.0, "items_flagged": 0, "spend_base": 0.0}, "items": []}
     try:
-        g = da.filter_plant(da.load("fact_grn"), pl)
+        g = da.filter_category(da.filter_plant(da.load("fact_grn"), pl), cat)
         d = g[(g["net_price"] > 0) & (g["gr_qty"] > 0)][["material", "material_desc", "net_price", "gr_qty", "major_group"]].copy()
         if d.empty:
             return empty
@@ -862,11 +924,17 @@ def _procurement_savings_cached(pl, limit):
 
 # ---------------- PURCHASE VALUE insights (B1) ----------------
 @router.get("/kpi/purchase-value/insights")
-def purchase_value_insights(Plant: str = Query(None)):
-    pl = _plant(Plant)
-    pv = da.filter_plant(da.load("kpi_purchase_value"), pl)
-    vv = da.filter_plant(da.load("kpi_vendor_volume"), pl)
-    loc = da.filter_plant(da.load("kpi_purchase_by_location"), pl)
+def purchase_value_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # PO spend is a sum over PO lines and every line carries a material, so a material
+    # cut is exact: the six buckets partition Rs 649.91 Cr with nothing lost. The
+    # `categories` block below stays in the PO SPEND taxonomy (kpi_purchase_value's own
+    # `category` column) — the material filter narrows which lines are counted, it never
+    # relabels the bars. Those two vocabularies are locked apart in
+    # tests/test_procurement_category.py.
+    pl = _plant(Plant); cat = da.resolve_category(Category)
+    pv = _proc("kpi_purchase_value", pl, cat)
+    vv = _proc("kpi_vendor_volume", pl, cat)
+    loc = _proc("kpi_purchase_by_location", pl, cat)
 
     spend = float(pv["purchase_value"].sum()); lines = int(pv["po_lines"].sum()); qty = float(pv["purchase_qty"].sum())
     avg_po = (spend / lines) if lines else 0.0
@@ -897,8 +965,13 @@ _PROC_WINDOW = {(2025, "December"), (2026, "January"), (2026, "February"), (2026
 
 # ---------------- PROCUREMENT VARIANCE insights (B3) ----------------
 @router.get("/kpi/procurement-variance/insights")
-def variance_insights(Plant: str = Query(None)):
-    pv = da.filter_plant(da.load("kpi_purchase_value"), _plant(Plant))
+def variance_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # Month-on-month change is computed here from the PORTFOLIO monthly series (this
+    # endpoint re-aggregates kpi_purchase_value across plants), not from
+    # kpi_procurement_variance's per-plant shift — so a category cut cannot introduce
+    # the sparse-plant gap that would make "MoM" compare non-adjacent months. All six
+    # buckets have spend in all six months of the window.
+    pv = _proc("kpi_purchase_value", _plant(Plant), da.resolve_category(Category))
     m = pv.groupby(["year", "month"], observed=True)["purchase_value"].sum().reset_index()
     m["_k"] = m["month"].map({x: i for i, x in enumerate(MONTH_ORDER)})
     m = m.sort_values(["year", "_k"])
@@ -924,8 +997,14 @@ def variance_insights(Plant: str = Query(None)):
 
 # ---------------- VENDOR VOLUME insights (B4) ----------------
 @router.get("/kpi/vendor-volume-contribution/insights")
-def vendor_volume_insights(Plant: str = Query(None)):
-    vv = da.filter_plant(da.load("kpi_vendor_volume"), _plant(Plant))
+def vendor_volume_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # Vendor concentration IS a per-category question — arguably only a per-category
+    # question. The measure is money (a sum over PO lines, fully additive), and every
+    # share, cumulative share, n80 and HHI below is recomputed against the FILTERED
+    # total, so the shares still sum to 100 within the bucket the reader chose. The
+    # answer is not cosmetic: portfolio top-1 is 45.8% and HHI 2,140, while Onco Drugs
+    # is 94.9% top-1 and HHI 9,004 — single-source risk the unfiltered view hides.
+    vv = _proc("kpi_vendor_volume", _plant(Plant), da.resolve_category(Category))
     vg = vv.groupby("vendor_name", observed=True).agg(value=("vendor_value", "sum"), lines=("po_lines", "sum"), qty=("vendor_qty", "sum")).reset_index().sort_values("value", ascending=False)
     tot = float(vg["value"].sum()); n = int(len(vg))
     vg["share"] = np.where(tot > 0, vg["value"] / tot * 100, 0.0)
@@ -940,8 +1019,12 @@ def vendor_volume_insights(Plant: str = Query(None)):
 
 # ---------------- PURCHASE BY LOCATION insights (B7) ----------------
 @router.get("/kpi/purchase-by-location/insights")
-def location_insights(Plant: str = Query(None)):
-    loc = da.filter_plant(da.load("kpi_purchase_by_location"), _plant(Plant)).copy()
+def location_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # Spend per hospital, so exactly as cuttable as spend itself. `vendor_count` is a
+    # nunique rather than a sum and is RECOUNTED on the cut inside the regrain, so under
+    # a category it means "vendors this hospital buys this bucket from" — not a stale
+    # portfolio-wide vendor count sitting next to a filtered rupee figure.
+    loc = _proc("kpi_purchase_by_location", _plant(Plant), da.resolve_category(Category)).copy()
     tot = float(loc["purchase_value"].sum()); n = int(loc["plant"].nunique())
     loc["share"] = np.where(tot > 0, loc["purchase_value"] / tot * 100, 0.0)
     bypv = loc.sort_values("purchase_value", ascending=False)
@@ -957,8 +1040,13 @@ def location_insights(Plant: str = Query(None)):
 
 # ---------------- PROCUREMENT CYCLE TIME insights (E2) ----------------
 @router.get("/kpi/procurement-cycle-time/insights")
-def cycle_insights(Plant: str = Query(None)):
-    ct = da.filter_plant(da.load("kpi_cycle_time"), _plant(Plant)).copy()
+def cycle_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # PO→GR turnaround per plant x month. Every GRN line carries a material, and the
+    # regrain rebuilds the mean from fact_grn's TAT sums and counts rather than
+    # averaging averages — so the cut is the exact mean of that bucket's own receipts.
+    # It is also the metric that genuinely differs by bucket: 2.5 days on Onco Drugs
+    # against 12.4 on Lab, against a 5.4-day portfolio mean that describes neither.
+    ct = _proc("kpi_cycle_time", _plant(Plant), da.resolve_category(Category)).copy()
     ct = ct[ct.apply(lambda r: (int(r["year"]), str(r["month"])) in _PROC_WINDOW, axis=1)]
     ct["po_w"] = ct["avg_po_to_gr_tat"] * ct["gr_lines"]; ct["pr_w"] = ct["avg_pr_to_gr_tat"] * ct["gr_lines"]
     cm = ct.groupby(["year", "month"], observed=True).agg(po_w=("po_w", "sum"), pr_w=("pr_w", "sum"), gl=("gr_lines", "sum")).reset_index()
@@ -983,7 +1071,15 @@ def cycle_insights(Plant: str = Query(None)):
 
 # ---------------- VENDOR LEAD TIME insights (E3) ----------------
 @router.get("/kpi/vendor-lead-time/insights")
-def lead_insights(Plant: str = Query(None)):
+def lead_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # The one procurement metric that does NOT take a material-category cut. It is a
+    # per-VENDOR scorecard (no plant, no month) whose measure is a median behind a
+    # gr_lines >= 3 significance gate; re-applying that gate inside a bucket changes the
+    # vendor POPULATION the card counts (1,648 -> 74 vendors on Onco Drugs), so its
+    # headline would move for a sampling reason rather than a supply one. The same
+    # fact_grn PO→GR turnaround IS available by category on procurement-cycle-time.
+    # Refusing loudly beats answering with the whole portfolio under a filtered label.
+    _reject_uncuttable("kpi_vendor_lead_time", Category)
     lt = da.load("kpi_vendor_lead_time").copy()  # no plant dimension
     gl = float(lt["gr_lines"].sum())
     med = float((lt["median_lead_time_days"] * lt["gr_lines"]).sum() / gl) if gl else 0.0
@@ -1003,15 +1099,22 @@ def lead_insights(Plant: str = Query(None)):
 
 # ---------------- FILL RATE insights (E4) ----------------
 @router.get("/kpi/fill-rate/insights")
-def fill_insights(Plant: str = Query(None)):
-    fr = da.filter_plant(da.load("kpi_fill_rate"), _plant(Plant)).copy()
+def fill_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # Both legs are sums over PO lines that each carry a material, so the cut is exact —
+    # and on the five real material buckets it is strictly CLEANER than the unfiltered
+    # figure, because the pathological rows live entirely in Unclassified (see below).
+    pl = _plant(Plant); cat = da.resolve_category(Category)
+    fr = _proc("kpi_fill_rate", pl, cat).copy()
     # kpi_fill_rate carries no line count, so gate on kpi_purchase_by_location.po_lines —
     # the row count of the identical fact_po groupby that produced ordered_qty (1:1 on
     # plant). Gating on ordered_qty instead would be a no-op: the smallest plant already
-    # has 25 units, so no plant would ever be filtered.
-    fr = fr.merge(da.load("kpi_purchase_by_location")[["plant", "po_lines"]], on="plant", how="left")
+    # has 25 units, so no plant would ever be filtered. The gate table is cut to the SAME
+    # category, so a bucket's plants are gated on that bucket's own line counts.
+    fr = fr.merge(_proc("kpi_purchase_by_location", pl, cat)[["plant", "po_lines"]],
+                  on="plant", how="left")
     fr["po_lines"] = fr["po_lines"].fillna(0)
     ordered = float(fr["ordered_qty"].sum()); openq = float(fr["open_qty"].sum())
+    raw_overall = ((1 - openq / ordered) * 100) if ordered else 0.0
     overall = (max(0.0, min(1.0, 1 - openq / ordered)) * 100) if ordered else 0.0
     fr["comp"] = (1 - fr["open_qty"] / fr["ordered_qty"]).clip(0, 1) * 100
     fr_sig = fr[fr["po_lines"] >= 20]  # drop tiny-sample plants that skew the ranking
@@ -1030,9 +1133,22 @@ def fill_insights(Plant: str = Query(None)):
     edges = [(99.5, 200.0, "100%"), (95.0, 99.5, "95–99%"), (85.0, 95.0, "85–95%"), (70.0, 85.0, "70–85%"), (-1.0, 70.0, "<70%")]
     dist = [{"label": lab, "plants": int(((frv["comp"] >= lo) & (frv["comp"] < hi)).sum())} for lo, hi, lab in edges]
     perfect = int((frv["comp"] >= 99.5).sum())
-    return {"totals": {"overall": overall, "plants": int(fr["plant"].nunique()), "open_qty": openq, "ordered_qty": ordered,
-                       "perfect": perfect, "best_plant": best[0]["plant"] if best else "-", "worst_plant": worst[0]["plant"] if worst else "-"},
-            "worst": worst, "best": best, "plants": plants, "dist": dist}
+    out = {"totals": {"overall": overall, "plants": int(fr["plant"].nunique()), "open_qty": openq, "ordered_qty": ordered,
+                      "perfect": perfect, "best_plant": best[0]["plant"] if best else "-", "worst_plant": worst[0]["plant"] if worst else "-"},
+           "worst": worst, "best": best, "plants": plants, "dist": dist}
+    # The clamp above already existed and already fired per plant. Under Unclassified it
+    # fires on the HEADLINE — the raw ratio is 168.7% because 2,557 service/blanket PO
+    # lines carry a negative open_qty, all of them in that bucket. Printing a confident
+    # "100% order completion" and saying nothing would be the misleading outcome, so the
+    # raw figure and the reason travel with it. Added only when a category is applied, so
+    # the unfiltered response keeps its exact existing shape.
+    if cat:
+        out["category"] = cat
+        out["totals"]["overall_raw"] = raw_overall
+        out["totals"]["capped"] = bool(raw_overall < 0 or raw_overall > 100)
+        out["note"] = (ds.FILL_RATE_SERVICE_PO_NOTE
+                       if (raw_overall < 0 or raw_overall > 100) else None)
+    return out
 
 
 # ---------------- MONTHLY SKU PURCHASE insights (B2) ----------------
@@ -1160,15 +1276,21 @@ def _clean_grn_rows(grn):
     return clean
 
 
-def _vendor_margin(plant):
+def _vendor_margin(plant, category=None):
     """MRP-proxy margin per vendor-month — see _clean_grn_rows for the outlier-clean
     methodology. Aggregates a VALUE-WEIGHTED margin_pct = (mrp_value-cost_value)/mrp_value
     — never a mean of per-line ratios (semantics.py gotcha #15/#17 — denominator is always
     mrp_value, and a 0 denominator must yield None, not a fake 0%).
+
+    The category cut is applied BEFORE _clean_grn_rows, so each bucket's outlier band is
+    computed from that bucket's own rows — the per-material median the band is built on
+    is unchanged either way (it is per material, and a material lives in exactly one
+    bucket), which is what makes the filtered margin comparable to the unfiltered one.
+    fact_grn carries the material category natively; no regrain is involved.
     """
     cols = ["vendor_name", "year", "month", "grn_volume", "unit_cost", "unit_mrp",
             "margin", "clean_n", "is_stable"]
-    grn = da.filter_plant(da.load("fact_grn"), _plant(plant))
+    grn = da.filter_category(da.filter_plant(da.load("fact_grn"), _plant(plant)), category)
     clean = _clean_grn_rows(grn)
     if clean.empty:
         return pd.DataFrame(columns=cols)
@@ -1194,8 +1316,8 @@ def _num_or_none(v):
 
 
 @router.get("/kpi/vendor-volume-vs-margin")
-def vendor_margin(Plant: str = Query(None)):
-    g = _vendor_margin(Plant)
+def vendor_margin(Plant: str = Query(None), Category: str = Query(None)):
+    g = _vendor_margin(Plant, Category)
     g = g.sort_values("grn_volume", ascending=False).head(200)
     out = []
     for _, r in g.iterrows():
@@ -1211,8 +1333,8 @@ def vendor_margin(Plant: str = Query(None)):
 
 
 @router.get("/kpi/vendor-volume-vs-margin-table")
-def vendor_margin_table(request: Request, Plant: str = Query(None)):
-    g = _vendor_margin(Plant)
+def vendor_margin_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
+    g = _vendor_margin(Plant, Category)
     return _paginate_df(g, request,
         ["year", "month", "vendor_name", "grn_volume", "unit_cost", "unit_mrp", "margin", "clean_n", "is_stable"],
         {"year": "year", "month": "period", "vendor_name": "vendorName", "grn_volume": "grnVolume",
