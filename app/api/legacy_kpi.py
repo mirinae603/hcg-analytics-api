@@ -236,17 +236,53 @@ def inventory_valuation_table(request: Request, Plant: str = Query(None), Catego
 # annualize (×2). Single snapshot ⇒ "average inventory" is the snapshot point (proxy).
 @router.get("/kpi/inventory-turnover-ratio/insights")
 def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
-    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
+    # Always billed+internal ("both") -- no Scope param, no "internal only" view left
+    # on this page. Hardcoded rather than read from a query param; every branch below
+    # keyed on `scope` already implements the correct math (and the fan-out-bug fix),
+    # this just removes the way to ask for the old, incomplete answer.
+    scope = "both"
     ANN = 2.0  # 6 months -> annual
-    cogs6 = float(df["consumption_cost"].sum())
-    inv = float(df["closing_stock_value"].sum())
+    # `orig` — the untouched (plant,material) frame, always internal-only. Portfolio
+    # and category totals are literal SUMs across (plant,material) rows, and billed
+    # COGS only exists once per MATERIAL (sales_by_material carries no plant key) —
+    # merging it onto plant-grain rows and then summing would multiply it by however
+    # many plants stock each material (caught live: a naive merge-then-sum inflated
+    # portfolio COGS to Rs 3,305 Cr against a real Rs 308 Cr billable total). So every
+    # SUM-based total below adds a material-grain, deduped billed figure to `orig`'s
+    # own sums — never to a plant-fanned-out one.
+    #
+    # `df` — da.itr_scoped(scope) when billable/both: the SAME (plant,material) grain
+    # with turnover_annualized recomputed per row (network billed rate ÷ THIS plant's
+    # own inventory). Legitimate at row grain — each row stands alone in its own band
+    # bucket or SKU-table row, never re-summed across plants — so it drives
+    # bands/movers_itr/the SKU table, not the SUM-based totals.
+    orig = _pc(da.load("kpi_health_score"), Plant, Category).copy()
+    df = orig if scope not in ("billable", "both") else _pc(da.itr_scoped(scope), Plant, Category).copy()
+    inv = float(orig["closing_stock_value"].sum())  # inventory value never changes by Scope
+    internal_cogs6 = float(orig["consumption_cost"].sum())
+
+    billed_by_group = pd.Series(dtype=float)
+    billed_total = 0.0
+    if scope in ("billable", "both"):
+        sm_path = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+        if os.path.exists(sm_path):
+            sm = pd.read_parquet(sm_path)
+            cat = da.resolve_category(Category)
+            if cat:
+                cmap = da._material_category_map()
+                sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
+            billed_by_group = sm.groupby("group")["cost"].sum()
+            billed_total = float(sm["cost"].sum())
+    cogs6 = billed_total if scope == "billable" else (internal_cogs6 + billed_total if scope == "both" else internal_cogs6)
     port_itr = (cogs6 * ANN) / inv if inv else 0.0
     tv = df["turnover_annualized"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     movers = df[df["consumption_cost"] > 0]
     movers_itr = float(movers["turnover_annualized"].replace([np.inf, -np.inf], np.nan).clip(upper=60).mean()) if len(movers) else 0.0
 
-    g = df.groupby("material_group", observed=True).agg(
-        cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"), skus=("material", "nunique")).reset_index()
+    g = orig.groupby("material_group", observed=True).agg(
+        internal_cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"), skus=("material", "nunique")).reset_index()
+    g["billed_cogs"] = g["material_group"].map(billed_by_group).fillna(0.0)
+    g["cogs"] = g["billed_cogs"] if scope == "billable" else (g["internal_cogs"] + g["billed_cogs"] if scope == "both" else g["internal_cogs"])
     g["itr"] = np.where(g["inv"] > 0, g["cogs"] * ANN / g["inv"], 0.0)
     cats = [{"name": r["material_group"], "itr": float(r["itr"]), "cogs": float(r["cogs"]),
              "inv": float(r["inv"]), "skus": int(r["skus"])} for _, r in g.sort_values("inv", ascending=False).head(12).iterrows()]
@@ -266,7 +302,27 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
     tl = fc.groupby(["year", "month_num", "month"], observed=True)["amount_lc"].sum().reset_index().sort_values(["year", "month_num"])
     timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "value": float(r["amount_lc"])} for _, r in tl.iterrows()]
 
+    # sales_monthly.parquet is patient x month only -- no plant or material grain --
+    # so folding it into the trend line is only honest at All Plants + All Categories.
+    # Anywhere else the line stays internal-only regardless of Scope, and
+    # `timeline_billed_available` tells the frontend why rather than leaving it to
+    # guess at a mismatch.
+    timeline_billed_available = False
+    if scope in ("billable", "both") and not da.resolve_plant(Plant) and not da.resolve_category(Category):
+        sm_path = os.path.join(_KPI_DIR, "sales_monthly.parquet")
+        if os.path.exists(sm_path):
+            sm = pd.read_parquet(sm_path)
+            billed_by_key = sm.assign(
+                _yr=sm["month"].astype(str).str.slice(0, 4).astype(int),
+                _mn=sm["month"].astype(str).str.slice(5, 7).astype(int),
+            ).groupby(["_yr", "_mn"])["cost"].sum()
+            for row, (_, r) in zip(timeline, tl.iterrows()):
+                billed = float(billed_by_key.get((int(r["year"]), int(r["month_num"])), 0.0))
+                row["value"] = billed if scope == "billable" else row["value"] + billed
+            timeline_billed_available = True
+
     return {
+        "timeline_billed_available": timeline_billed_available,
         "totals": {"portfolio_itr": port_itr, "cogs_6mo": cogs6, "cogs_annual": cogs6 * ANN, "inventory": inv,
                    "months_on_hand": (12.0 / port_itr) if port_itr else 0.0, "total_skus": int(len(df)),
                    "movers": int(len(movers)), "movers_itr": movers_itr},
@@ -278,7 +334,25 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
 @router.get("/kpi/inventory-turnover-ratio")
 def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: str = Query(None),
         Category: str = Query(None), top: int = Query(None)):
+    # No live frontend caller as of this fix -- InventoryTurnOverRatio.tsx, the only
+    # consumer, is itself unreferenced anywhere in the frontend (confirmed via a full
+    # app-wide audit). Fixed anyway for hygiene, mirroring itr_insights' fan-out-safe
+    # "both" pattern exactly: raw internal COGS per group (safe, plant-grain) plus a
+    # SEPARATE, once-only billed COGS per group from sales_by_material (material-grain,
+    # deduped) -- summing a row-blended da.health_scoped("both") frame by group instead
+    # would multiply the billed portion by however many plants each material is stocked
+    # at (see itr_insights' own comment, and app/ai/semantics.py gotcha #30 for the
+    # identical trap in AI-analyst SQL).
     df = _filt(da.load("kpi_health_score"), Plant, Material, MaterialGroup, Category)
+    billed_by_group = pd.Series(dtype=float)
+    sm_path = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+    if os.path.exists(sm_path):
+        sm = pd.read_parquet(sm_path)
+        cat = da.resolve_category(Category)
+        if cat:
+            cmap = da._material_category_map()
+            sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
+        billed_by_group = sm.groupby("group")["cost"].sum()
     # Weighted SUM(consumption)/SUM(inventory) per group, matching the bespoke ITR
     # drill-down's own `itr` formula below -- a mean of each material's own
     # turnover_annualized lets one near-zero-inventory SKU post a ratio in the tens of
@@ -287,6 +361,8 @@ def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: st
     # the exec-summary category breakdown reads, so it must agree with the drill-down.
     g = df.groupby("material_group", as_index=False).agg(
         cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"))
+    g["billed_cogs"] = g["material_group"].map(billed_by_group).fillna(0.0)
+    g["cogs"] = g["cogs"] + g["billed_cogs"]
     g["ITR"] = np.where(g["inv"] > 0, g["cogs"] * 2.0 / g["inv"], 0.0)
     g = g.sort_values("ITR", ascending=False)
     # OPTIONAL, defaults to every group (unchanged prior behaviour) -- only the registry
@@ -299,7 +375,13 @@ def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: st
 
 @router.get("/kpi/inventory-turnover-ratio-table")
 def itr_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
-    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
+    # No live frontend caller as of this fix -- RecordsTableInventoryTurnOverRatio.tsx,
+    # the only consumer, is itself unreferenced anywhere in the frontend (confirmed via
+    # a full app-wide audit). Fixed anyway for hygiene: row-level use of
+    # da.health_scoped("both") is safe here (no cross-row summing, each row stands
+    # alone) -- unlike itr()'s group-level aggregate above, which needs the fan-out-safe
+    # additive pattern instead.
+    df = _pc(da.health_scoped("both"), Plant, Category).copy()
     df["year"] = 2026; df["period"] = "May"
     return _paginate_df(df, request, ["year", "period", "material", "material_desc", "material_group", "consumption_cost", "closing_stock_value", "turnover_annualized"],
         {"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
@@ -342,7 +424,10 @@ DOH_BANDS = [
 
 @router.get("/kpi/days-on-hand/insights")
 def doh_insights(Plant: str = Query(None), Category: str = Query(None)):
-    doh = _pc(da.load("kpi_doh"), Plant, Category).copy()
+    # Always billed+internal (da.doh_scoped("both")), never the old internal-only
+    # kpi_doh parquet -- verified correct, see nonmoving_insights' comment above.
+    # No Scope param: there is no "internal only" view left on this page.
+    doh = _pc(da.doh_scoped("both"), Plant, Category).copy()
     sv = _pc(da.load("kpi_stock_value"), Plant, Category)[["plant", "material", "stock_value_cost"]]
     doh = doh.merge(sv, on=["plant", "material"], how="left")
     doh["stock_value_cost"] = doh["stock_value_cost"].fillna(0.0)
@@ -401,7 +486,9 @@ HS_TIERS = ["Healthy", "Watch", "At Risk"]
 
 @router.get("/kpi/inventory-health-score/insights")
 def health_insights(Plant: str = Query(None), Category: str = Query(None)):
-    df = _pc(da.load("kpi_health_score"), Plant, Category).copy()
+    # Always billed+internal (da.health_scoped("both")), never the old internal-only
+    # kpi_health_score parquet -- verified correct, see nonmoving_insights' comment.
+    df = _pc(da.health_scoped("both"), Plant, Category).copy()
     df["moving"] = (df["consumption_cost"] > 0).astype(int)
     n = len(df)
     total_value = float(df["closing_stock_value"].sum())
@@ -449,7 +536,89 @@ def health_insights(Plant: str = Query(None), Category: str = Query(None)):
 # ---------------- STOCK LEVEL CHANGE OVER TIME — monthly flow (A6) ----------------
 @router.get("/kpi/stock-change/insights")
 def stockchange_insights(Plant: str = Query(None), Category: str = Query(None)):
+    # Always billed+internal ("both") -- no Scope param, no "internal only" view left
+    # on this page. Hardcoded rather than read from a query param; every branch below
+    # keyed on `scope` already implements the correct math, this just removes the way
+    # to ask for the old, incomplete answer. See nonmoving_insights' comment for why
+    # "both" is verified correct, not just a different opinion.
+    scope = "both"
+    # kpi_stock_change's `outflow` is 100% internal goods-issue (fact_consumption) —
+    # real patient-billed material leaving the hospital never appears in it at all.
+    # `inflow` (GRN receipts) is untouched by Scope in every case below: billing has
+    # no concept of "receiving" stock, only using it. Row grain is (plant, material,
+    # year, month), an outer-join of GRN and consumption keys, so a material with
+    # real GRN activity but zero internal issue already HAS a row (inflow>0,
+    # outflow=0) -- but one with neither in this window would not, so material-level
+    # aggregates below still union sales_by_material in, same as Units Consumed/SKU.
     df = _pc(da.load("kpi_stock_change"), Plant, Category).copy()
+
+    internal_g = df.groupby(["material", "material_desc", "material_group"], observed=True, dropna=False).agg(
+        inflow=("inflow", "sum"), internal_outflow=("outflow", "sum")).reset_index()
+    # dropna=False above is deliberate (a null material_desc/material_group must not
+    # drop an otherwise-real material row -- that was the actual bug: without it,
+    # ~29% of real units silently vanished from Units Consumed's totals). A null
+    # MATERIAL CODE itself (89 raw rows in kpi_stock_change, a pre-existing data
+    # quality gap) is a different case -- there is no material to attribute a
+    # per-material riser/faller row to, so it is excluded from `g` below. Portfolio
+    # totals are therefore computed from `df` directly (see total_inflow/
+    # total_internal_outflow below), NOT from summing `g` -- summing `g` after this
+    # drop would silently lose that row's real contribution from the headline totals,
+    # which very nearly shipped as a second bug caught in testing.
+    internal_g = internal_g.dropna(subset=["material"])
+    internal_g["material"] = internal_g["material"].astype(str)
+    internal_g["billed_outflow"] = 0.0
+    g = internal_g
+    if scope in ("billable", "both"):
+        sm_path = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+        if os.path.exists(sm_path):
+            sm = pd.read_parquet(sm_path)
+            cat = da.resolve_category(Category)
+            if cat:
+                cmap = da._material_category_map()
+                sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
+            billed_g = sm.groupby(["material", "desc", "group"], observed=True, dropna=False).agg(billed_outflow=("qty", "sum")).reset_index()
+            billed_g["material"] = billed_g["material"].astype(str)
+            billed_g = billed_g.rename(columns={"desc": "material_desc_b", "group": "material_group_b"})
+            g = internal_g.drop(columns=["billed_outflow"]).merge(billed_g, on="material", how="outer")
+            g["material_desc"] = g["material_desc"].fillna(g["material_desc_b"])
+            g["material_group"] = g["material_group"].fillna(g["material_group_b"])
+            g = g.drop(columns=["material_desc_b", "material_group_b"])
+            for c in ("inflow", "internal_outflow", "billed_outflow"):
+                g[c] = g[c].fillna(0.0)
+            # A material can be missing a description on BOTH sides -- fall back to
+            # the material code itself so `rows()` never puts a bare float NaN in a
+            # string field (json.dumps rejects it outright: "Out of range float
+            # values are not JSON compliant: nan").
+            g["material_desc"] = g["material_desc"].fillna(g["material"])
+            g["material_group"] = g["material_group"].fillna("")
+
+    g["outflow"] = g["billed_outflow"] if scope == "billable" else (g["internal_outflow"] + g["billed_outflow"] if scope == "both" else g["internal_outflow"])
+    g["net"] = g["inflow"] - g["outflow"]
+
+    # inflow/internal_outflow computed from `df` directly (matching the original,
+    # pre-Scope code exactly) rather than summed from `g`, which drops the
+    # null-material row above and would otherwise silently lose its real
+    # contribution from the headline numbers. billed_outflow IS safe to sum from
+    # `g` -- sales_by_material carries zero null-material rows (confirmed), so the
+    # outer join lost nothing on that side; every billed material got a row.
+    total_inflow = float(df["inflow"].sum())
+    total_internal_outflow = float(df["outflow"].sum())
+    total_billed_outflow = float(g["billed_outflow"].sum())
+    total_outflow = total_billed_outflow if scope == "billable" else (total_internal_outflow + total_billed_outflow if scope == "both" else total_internal_outflow)
+
+    # Monthly timeline stays row-grain, always internal-only — permanently, unlike
+    # totals/risers/fallers above. sales_by_material (material grain, no month) and
+    # sales_monthly (month grain, no material) each cover half of what a "billed
+    # monthly outflow" would need; neither can supply both at once, so there is no
+    # honest way to fold billed data into a specific month's bar. This isn't a
+    # missing feature — it's the same irreducible gap that makes the drill-down
+    # (dim=year_month, by=material) itself internal-only-sourced. Folding billed
+    # qty into the bar while the drill stays internal-only would make the bar's own
+    # per-material breakdown not sum back to it — the exact silent-mismatch failure
+    # mode test_drilldown.py exists to catch (caught live: this used to be
+    # conditional on Scope=billable/both, which no caller could ever legitimately
+    # request once Scope stopped being a real toggle, so the mismatch would have
+    # been permanent and unexplained rather than an opt-in caveat).
     m = df.groupby(["year", "month"], observed=True).agg(
         inflow=("inflow", "sum"), outflow=("outflow", "sum"), net=("stock_change", "sum")).reset_index()
     m["_k"] = m["month"].map({mm: i for i, mm in enumerate(MONTH_ORDER)})
@@ -461,14 +630,12 @@ def stockchange_insights(Plant: str = Query(None), Category: str = Query(None)):
     months = [{"label": f"{str(r['month'])[:3]} {str(int(r['year']))[2:]}", "month": r["month"],
                "year": int(r["year"]),
                "inflow": float(r["inflow"]), "outflow": float(r["outflow"]), "net": float(r["net"])} for _, r in m.iterrows()]
-    g = df.groupby(["material", "material_desc", "material_group"], observed=True).agg(
-        inflow=("inflow", "sum"), outflow=("outflow", "sum"), net=("stock_change", "sum")).reset_index()
 
     def rows(x):
         return [{"name": r["material_desc"], "material": r["material"], "inflow": float(r["inflow"]),
                  "outflow": float(r["outflow"]), "net": float(r["net"])} for _, r in x.iterrows()]
-    return {"totals": {"inflow": float(df["inflow"].sum()), "outflow": float(df["outflow"].sum()),
-                       "net": float(df["stock_change"].sum()), "skus": int(df["material"].nunique()),
+    return {"totals": {"inflow": total_inflow, "outflow": total_outflow,
+                       "net": total_inflow - total_outflow, "skus": int(len(g)),
                        "months": int(df["month"].nunique())},
             "monthly": months, "risers": rows(g.sort_values("net", ascending=False).head(8)),
             "fallers": rows(g.sort_values("net").head(8))}
@@ -477,7 +644,13 @@ def stockchange_insights(Plant: str = Query(None), Category: str = Query(None)):
 # ---------------- NON-MOVING INVENTORY — blocked capital (A9) ----------------
 @router.get("/kpi/non-moving-inventory/insights")
 def nonmoving_insights(Plant: str = Query(None), Category: str = Query(None)):
-    df = _pc(da.load("kpi_non_moving"), Plant, Category).copy()
+    # Always billed+internal (da.nonmoving_scoped("both")), never the old
+    # internal-only kpi_non_moving parquet -- verified correct (billed cost cross-
+    # checks exactly against /revenue/insights' independently-built figure, and
+    # fact_consumption/the billing extract are structurally incapable of double-
+    # counting the same event -- see memory: billable-nonbillable-consumption-card).
+    # No Scope param: there is no "internal only" view left on this page to switch to.
+    df = _pc(da.nonmoving_scoped("both"), Plant, Category).copy()
     # Denominator for the hero's "% of stock lines". kpi_non_moving is a strict row
     # subset of kpi_stock_value (both keyed plant+material, no dupes), so
     # blocked_skus / total_stock_lines is exact — and, unlike the literal it replaces,
@@ -510,7 +683,10 @@ def nonmoving_insights(Plant: str = Query(None), Category: str = Query(None)):
 # ---------------- INVENTORY RISK CLASSIFICATION — risk matrix (A10) ----------------
 @router.get("/kpi/inventory-risk/insights")
 def risk_insights(Plant: str = Query(None), Category: str = Query(None)):
-    df = _pc(da.load("kpi_risk_classification"), Plant, Category).copy()
+    # Always billed+internal (da.risk_scoped("both")), never the old internal-only
+    # kpi_risk_classification parquet -- verified correct, see nonmoving_insights'
+    # comment above.
+    df = _pc(da.risk_scoped("both"), Plant, Category).copy()
     tiers = [{"level": L, "count": int((df["risk_level"] == L).sum()),
               "value": float(df.loc[df["risk_level"] == L, "closing_stock_value"].sum())}
              for L in ["High", "Medium", "Low"]]
@@ -669,6 +845,90 @@ def _wastage_frame(pl, cat=None):
             "wastage_pct_qty": round(expired_qty / total_stock_qty * 100, 3) if total_stock_qty > 0 else None,
         },
         "by_plant": plants,
+    }
+
+
+@router.get("/kpi/stock-out-rate/insights")
+def stock_out_insights(Plant: str = Query(None), Category: str = Query(None)):
+    """Stock-out exposure for the bespoke detail page.
+
+    Pre-aggregated on purpose: the underlying table is 5,507 (plant, material) rows and
+    ~1.6 MB as JSON, far too heavy to ship to a page on load. Everything here is derived
+    from that same frame so the page and the /kpi/stock-out-rate/table underneath it can
+    never disagree.
+
+    NOTE on the rate: the generic /kpi/{key} group_by path SUMS measures, so summing
+    `out_pct` there yields 18100 for 181 stocked-out rows. Rates are therefore computed
+    here as out/pairs, never read off a summed column.
+    """
+    df = da.load("kpi_stock_out")
+    p = _plant(Plant)
+    if p:
+        df = df[df["plant"].astype(str) == str(p)]
+    cat = da.resolve_category(Category)
+    if cat:
+        df = df[df["category"].astype(str) == str(cat)]
+    if not len(df):
+        return {"ready": False, "totals": {}, "by_plant": [], "by_group": [], "top_out": []}
+
+    out = df[df["out_of_stock"]]
+    pairs, n_out = int(len(df)), int(len(out))
+    val_all, val_out = float(df["cost_6mo"].sum()), float(out["cost_6mo"].sum())
+
+    def _bucket(frame, key, n):
+        g = frame.groupby(key, dropna=False).agg(
+            pairs=("material", "size"),
+            out=("out_of_stock", "sum"),
+            value_all=("cost_6mo", "sum"),
+        ).reset_index()
+        ov = (frame[frame["out_of_stock"]].groupby(key, dropna=False)["cost_6mo"].sum()
+              .rename("value_out").reset_index())
+        g = g.merge(ov, on=key, how="left")
+        g["value_out"] = g["value_out"].fillna(0.0)
+        g["out"] = g["out"].astype(int)
+        g["rate"] = np.where(g["pairs"] > 0, g["out"] / g["pairs"] * 100.0, 0.0)
+        g = g.sort_values("value_out", ascending=False).head(n)
+        return [{key: str(r[key]), "pairs": int(r["pairs"]), "out": int(r["out"]),
+                 "rate": float(r["rate"]), "value_out": float(r["value_out"]),
+                 "value_all": float(r["value_all"])} for _, r in g.iterrows()]
+
+    def _groups(frame, n):
+        """Material groups carry BOTH the raw stored key and a display label.
+
+        The table stores 'M139-GROCERY'; the UI shows 'Grocery'. A drill-down that sends
+        the pretty label back matches zero rows — which is precisely how this card shipped
+        showing 'Rs 1.7Cr' next to an empty 'No items in this slice' panel. `raw` is what a
+        drill must send; `label` is what a human reads. Never interchange them.
+        """
+        g = _bucket(frame, "material_group", n)
+        for row in g:
+            raw = row["material_group"]
+            # Rows with no group at all bucket into "Uncategorised". Their stored key is
+            # NaN, so nothing can ever be drilled out of that slice -- hand back raw=None
+            # so the UI renders it inert instead of opening an empty panel.
+            row["raw"] = None if raw in ("nan", "None", "") else raw
+            row["label"] = _clean_group(raw)
+        return g
+
+    top = out.sort_values("cost_6mo", ascending=False).head(12)
+    top_out = [{"plant": str(r.plant), "material": str(r.material), "desc": str(r.material_desc),
+                "group": _clean_group(r.material_group), "cost_6mo": float(r.cost_6mo),
+                "units_6mo": float(r.units_6mo), "months_consumed": int(r.months_consumed),
+                "last_month": str(r.last_month)} for _, r in top.iterrows()]
+
+    return {
+        "ready": True,
+        "totals": {
+            "pairs": pairs, "out": n_out,
+            "rate": (n_out / pairs * 100.0) if pairs else 0.0,
+            "value_all": val_all, "value_out": val_out,
+            "value_rate": (val_out / val_all * 100.0) if val_all else 0.0,
+            "plants": int(df["plant"].nunique()), "materials": int(df["material"].nunique()),
+            "materials_out": int(out["material"].nunique()),
+        },
+        "by_plant": _bucket(df, "plant", 30),
+        "by_group": _groups(df, 12),
+        "top_out": top_out,
     }
 
 
@@ -1438,32 +1698,112 @@ def _consumption_overview_cached(pl, cat=None):
 
 
 @router.get("/kpi/unit-sold-per-sku/insights")
-def units_consumed_insights(Plant: str = Query(None), Category: str = Query(None)):
+def units_consumed_insights(Plant: str = Query(None), Category: str = Query(None),
+                             Scope: str = Query("nonbillable", alias="Scope")):
+    scope = (Scope or "nonbillable").strip().lower()
+    # kpi_units_consumed is built by grouping fact_consumption itself (transforms.py
+    # C8), so it is ALWAYS internal-only at this row grain -- unlike kpi_doh/
+    # kpi_health_score (built from the A1 physical-stock universe, which lists every
+    # material regardless of consumption), a material that is billed-only (never
+    # internally issued -- Onco Drugs especially) has NO ROW here at all. So folding
+    # billable/both in correctly means UNIONING sales_by_material's own materials in,
+    # not just merging billed figures onto materials that already happen to have an
+    # internal row -- otherwise the SKU list/scatter/leaderboard would silently miss
+    # exactly the materials this feature exists to surface, even though the portfolio
+    # totals (summed independently below) would still be honest.
     uc = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
-    units = float(uc["total_units"].sum()); cost = float(uc["consumption_cost"].sum())
-    m = _msort(uc.groupby(["year", "month"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index())
-    timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "units": float(r["units"]), "cost": float(r["cost"])} for _, r in m.iterrows()]
-    uc["cat"] = uc["material_group"].fillna("Uncategorized").astype(str)
-    cg = uc.groupby("cat", observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index().sort_values("units", ascending=False)
+
+    internal_sg = uc.groupby(["material", "material_desc", "material_group"], observed=True, dropna=False).agg(
+        internal_units=("total_units", "sum"), internal_cost=("consumption_cost", "sum")).reset_index()
+    internal_sg["material"] = internal_sg["material"].astype(str)
+    internal_sg["billed_units"] = 0.0
+    internal_sg["billed_cost"] = 0.0
+    sg = internal_sg
+    if scope in ("billable", "both"):
+        sm_path = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+        if os.path.exists(sm_path):
+            sm = pd.read_parquet(sm_path)
+            cat = da.resolve_category(Category)
+            if cat:
+                cmap = da._material_category_map()
+                sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
+            billed_sg = sm.groupby(["material", "desc", "group"], observed=True, dropna=False).agg(
+                billed_units=("qty", "sum"), billed_cost=("cost", "sum")).reset_index()
+            billed_sg["material"] = billed_sg["material"].astype(str)
+            billed_sg = billed_sg.rename(columns={"desc": "material_desc_b", "group": "material_group_b"})
+            sg = internal_sg.drop(columns=["billed_units", "billed_cost"]).merge(billed_sg, on="material", how="outer")
+            sg["material_desc"] = sg["material_desc"].fillna(sg["material_desc_b"])
+            sg["material_group"] = sg["material_group"].fillna(sg["material_group_b"])
+            sg = sg.drop(columns=["material_desc_b", "material_group_b"])
+            for c in ("internal_units", "internal_cost", "billed_units", "billed_cost"):
+                sg[c] = sg[c].fillna(0.0)
+            # A material can be missing a description on BOTH sides -- fall back to
+            # the material code itself so `mk()` never puts a bare float NaN in a
+            # string field (json.dumps rejects it outright: "Out of range float
+            # values are not JSON compliant: nan").
+            sg["material_desc"] = sg["material_desc"].fillna(sg["material"])
+            sg["material_group"] = sg["material_group"].fillna("")
+
+    sg["units"] = sg["billed_units"] if scope == "billable" else (sg["internal_units"] + sg["billed_units"] if scope == "both" else sg["internal_units"])
+    sg["cost"] = sg["billed_cost"] if scope == "billable" else (sg["internal_cost"] + sg["billed_cost"] if scope == "both" else sg["internal_cost"])
+    sg["cpu"] = np.where(sg["units"] > 0, sg["cost"] / sg["units"], 0.0)
+    units = float(sg["units"].sum()); cost = float(sg["cost"].sum())
+
+    sg["cat"] = sg["material_group"].fillna("Uncategorized").astype(str)
+    cg = sg.groupby("cat", observed=True).agg(units=("units", "sum"), cost=("cost", "sum")).reset_index().sort_values("units", ascending=False)
     ctot = float(cg["units"].sum())
     categories = [{"name": str(r["cat"]), "units": float(r["units"]), "cost": float(r["cost"]), "share": float(r["units"] / ctot * 100) if ctot else 0.0,
                    "uncat": str(r["cat"]).strip().lower() in ("uncategorized", "", "nan", "none")} for _, r in cg.head(9).iterrows()]
-    sg = uc.groupby(["material", "material_desc"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index()
-    sg["cpu"] = np.where(sg["units"] > 0, sg["cost"] / sg["units"], 0.0)
     mk = lambda df: [{"material": str(r["material"]), "desc": str(r["material_desc"]), "units": float(r["units"]), "cost": float(r["cost"]), "cpu": float(r["cpu"])} for _, r in df.iterrows()]
     top_units = mk(sg.sort_values("units", ascending=False).head(10))
     scatter = mk(sg[sg["units"] >= 1].sort_values("cost", ascending=False).head(45))
-    # category × month matrix (top 8 groups by units) — powers the heatmap
+
+    # Timeline stays row-grain (month), always internal — sales_by_material has no
+    # month dimension to distribute across correctly. sales_monthly.parquet DOES have
+    # month (patient x month -> qty/cost, network-wide, no material/category grain),
+    # so it can fold into the two headline mini-charts honestly -- but ONLY at All
+    # Plants + All Categories, exactly like Turnover Ratio's TrendCard.
+    # `timeline_billed_available` says which is true, same convention.
+    m = _msort(uc.groupby(["year", "month"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index())
+    timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "units": float(r["units"]), "cost": float(r["cost"])} for _, r in m.iterrows()]
+    timeline_billed_available = False
+    if scope in ("billable", "both") and not da.resolve_plant(Plant) and not da.resolve_category(Category):
+        smo_path = os.path.join(_KPI_DIR, "sales_monthly.parquet")
+        if os.path.exists(smo_path):
+            smo = pd.read_parquet(smo_path)
+            month_num_of = {mm: i + 1 for i, mm in enumerate(da.MONTH_ORDER)}
+            billed_by_key = smo.assign(
+                _yr=smo["month"].astype(str).str.slice(0, 4).astype(int),
+                _mn=smo["month"].astype(str).str.slice(5, 7).astype(int),
+            ).groupby(["_yr", "_mn"]).agg(q=("qty", "sum"), c=("cost", "sum"))
+            for row, (_, r) in zip(timeline, m.iterrows()):
+                key = (int(r["year"]), month_num_of.get(str(r["month"]), 0))
+                bq, bc = (float(billed_by_key.loc[key, "q"]), float(billed_by_key.loc[key, "c"])) if key in billed_by_key.index else (0.0, 0.0)
+                row["units"] = bq if scope == "billable" else row["units"] + bq
+                row["cost"] = bc if scope == "billable" else row["cost"] + bc
+            timeline_billed_available = True
+
+    # Category × month heatmap: exempt from Scope entirely, always internal-only,
+    # ranked by internal-only volume. sales_by_material has no month grain and
+    # sales_monthly has no material/category grain -- there is no honest way to build
+    # a billed category-by-month cut, and re-ranking the top-8 rows by a scope-aware
+    # total while the cells themselves stay internal-only would show a category
+    # ranked #1 above a heatmap row reading almost empty. Kept byte-identical to
+    # today regardless of Scope so it never contradicts itself.
+    uc["cat"] = uc["material_group"].fillna("Uncategorized").astype(str)
+    cg_internal = uc.groupby("cat", observed=True).agg(units=("total_units", "sum")).reset_index().sort_values("units", ascending=False)
     order = _chrono_months(uc)
-    top_cats = list(cg.head(8)["cat"])
+    top_cats = list(cg_internal.head(8)["cat"])
     mrows = []
     for c in top_cats:
         g = uc[uc["cat"] == c].groupby("month", observed=True).agg(u=("total_units", "sum"), co=("consumption_cost", "sum"))
-        vals = [float(g["u"].get(m, 0)) for m in order]; costs = [float(g["co"].get(m, 0)) for m in order]
+        vals = [float(g["u"].get(mo, 0)) for mo in order]; costs = [float(g["co"].get(mo, 0)) for mo in order]
         mrows.append({"name": str(c), "values": vals, "cost": costs, "total": float(sum(vals)), "cost_total": float(sum(costs)),
                       "uncat": str(c).strip().lower() in ("uncategorized", "", "nan", "none")})
-    matrix = {"labels": [m[:3] for m in order], "months": order, "rows": mrows}
-    return {"totals": {"units": units, "cost": cost, "materials": int(uc["material"].nunique()),
+    matrix = {"labels": [mo[:3] for mo in order], "months": order, "rows": mrows}
+
+    return {"scope": scope, "timeline_billed_available": timeline_billed_available,
+            "totals": {"units": units, "cost": cost, "materials": int(len(sg)),
                        "cpu": (cost / units) if units else 0.0, "top_material": top_units[0]["desc"] if top_units else "-"},
             "timeline": timeline, "categories": categories, "skus": top_units, "scatter": scatter, "matrix": matrix}
 
@@ -2107,6 +2447,21 @@ def revenue_insights():
     rev, cost = ipr + opr, ipc + opc
     margin = rev - cost
 
+    # Non-billable (internal goods-issue) cost per month, so the timeline can carry the
+    # billable-vs-non-billable comparison instead of it only existing as a grand total.
+    # fact_consumption's year+month_num rebuild the same "YYYY-MM" key sales_monthly uses,
+    # and the two extracts cover exactly the same six months, so this is a straight 1:1
+    # month join — no mapping, no coverage gap. (Deliberately NOT offered per category or
+    # per hospital: only ~49% of billed revenue maps onto the consumption category
+    # taxonomy, so a category-level split of this would be misleading.)
+    internal_by_month = {}
+    try:
+        _fc = da.load("fact_consumption")
+        _k = _fc["year"].astype(int).astype(str) + "-" + _fc["month_num"].astype(int).astype(str).str.zfill(2)
+        internal_by_month = _fc.groupby(_k)["amount_lc"].sum().to_dict()
+    except Exception:
+        internal_by_month = {}
+
     timeline = []
     if mon is not None and len(mon):
         mon["month"] = mon["month"].astype(str)
@@ -2115,8 +2470,11 @@ def revenue_insights():
             ipx, opx = sub[sub.patient == "IP"], sub[sub.patient == "OP"]
             ir, ic = float(ipx.revenue.sum()), float(ipx.cost.sum())
             orr, oc = float(opx.revenue.sum()), float(opx.cost.sum())
+            rv, mg = ir + orr, (ir + orr) - (ic + oc)
             timeline.append({"month": mm, "label": _MN.get(mm[5:7], mm), "ip_revenue": ir, "op_revenue": orr,
-                             "revenue": ir + orr, "ip_margin": ir - ic, "op_margin": orr - oc, "margin": (ir + orr) - (ic + oc)})
+                             "revenue": rv, "ip_margin": ir - ic, "op_margin": orr - oc, "margin": mg,
+                             "margin_pct": (mg / rv * 100 if rv else 0.0),
+                             "internal_cost": float(internal_by_month.get(mm, 0.0))})
 
     def top(df, n, namecol):
         if df is None or not len(df):
@@ -2131,7 +2489,19 @@ def revenue_insights():
 
     top_items, by_category = [], []
     if matx is not None and len(matx):
-        mm = matx.copy(); mm["margin"] = mm["revenue"] - mm["cost"]
+        mm = matx.copy()
+        # The sales extract stores the SAME product under two ids — "218766" and
+        # "218766.0" — so 6,789 of the 21,960 rows here are the second half of a product
+        # that already appears above. Until now that was repaired only in the DuckDB view
+        # layer (app/ai/warehouse.py), never on this pandas path, so this endpoint reported
+        # 21,960 distinct materials when there are 15,171, and a split product could take
+        # two separate slots in top_items with each half's revenue. Rupee TOTALS were never
+        # wrong (both halves summed), only the per-material grain and the counts.
+        mm["material"] = mm["material"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+        agg = {"revenue": "sum", "cost": "sum", "qty": "sum"}
+        keep = {c: "first" for c in ("desc", "group") if c in mm.columns}
+        mm = mm.groupby("material", as_index=False).agg({**agg, **keep})
+        mm["margin"] = mm["revenue"] - mm["cost"]
         for _, r in mm.sort_values("revenue", ascending=False).head(12).iterrows():
             top_items.append({"material": str(r.material), "desc": str(r.desc), "group": _clean_group(r.group),
                               "revenue": float(r.revenue), "margin": float(r.margin), "qty": float(r.qty),
@@ -2143,22 +2513,85 @@ def revenue_insights():
             by_category.append({"group": r.g, "revenue": float(r.revenue), "margin": float(r.margin),
                                 "margin_pct": (float(r.margin) / float(r.revenue) * 100 if r.revenue else 0.0)})
 
-    try:
-        internal = float(da.load("fact_consumption")["amount_lc"].sum())
-    except Exception:
-        internal = 0.0
+    # Summed from the SAME per-month figures the timeline carries, so the monthly
+    # non-billable bars always add up to this headline number exactly — a mismatch
+    # between the two is the first thing a reader would catch.
+    internal = float(sum(internal_by_month.values())) if internal_by_month else 0.0
 
     return {"ready": True,
             "totals": {"revenue": rev, "cost": cost, "margin": margin, "margin_pct": (margin / rev * 100 if rev else 0.0),
                        "ip_revenue": ipr, "op_revenue": opr, "ip_margin": ipr - ipc, "op_margin": opr - opc,
                        "ip_share": (ipr / rev * 100 if rev else 0.0), "op_share": (opr / rev * 100 if rev else 0.0),
                        "qty": ipq + opq, "lines": ipl + opl,
-                       "materials": int(matx.material.nunique()) if matx is not None else 0,
+                       # counted off the de-duplicated frame above, not the raw extract
+                       "materials": int(len(mm)) if (matx is not None and len(matx)) else 0,
                        "manufacturers": int(len(mfr)) if mfr is not None else 0,
                        "hospitals": int(len(hos)) if hos is not None else 0,
                        "internal_cost": internal, "months": len(timeline)},
             "timeline": timeline, "by_hospital": by_hospital, "by_manufacturer": by_manufacturer,
             "top_items": top_items, "by_category": by_category}
+
+
+@router.get("/consumption/billable-split")
+def billable_split_insights(Category: str = Query(None, alias="Category")):
+    """Billable (patient-billed) vs non-billable (internal) material usage, side by
+    side. This is deliberately informational, not a fix for anything: fact_consumption
+    and the sales/billing extract are two genuinely separate SAP processes -- every
+    fact_consumption row is "GI for cost center" (never billable, by definition), and
+    the billing extract never carries an internal-only issue. Nothing here changes
+    what any existing card computes; it exists so a reader of "Units Consumed" doesn't
+    mistake it for total real usage.
+
+    Category filters BOTH sides independently, unfiltered ("All") by default so the
+    original portfolio totals never move on load. fact_consumption already carries the
+    derived `category` column filter_category expects; sales_by_material does not, so
+    its materials are mapped through the SAME dim_material lookup the rest of the app
+    uses for this (_material_category_map) -- one shared source of truth for what
+    "Onco Drugs" etc. means, rather than a second, possibly-drifting definition. Sales
+    materials absent from dim_material entirely (about 10% of billed revenue) fold
+    into "Unclassified", same convention as everywhere else -- never silently dropped.
+    """
+    cat = da.resolve_category(Category)
+
+    cons = da.filter_category(da.load("fact_consumption"), Category)
+    nb_cost = float(cons["amount_lc"].sum())
+    nb_materials = int(cons["material"].nunique())
+
+    sm_path = os.path.join(_KPI_DIR, "sales_by_material.parquet")
+    sm = pd.read_parquet(sm_path) if os.path.exists(sm_path) else pd.DataFrame()
+    b_revenue = b_cost = 0.0
+    b_materials = 0
+    if len(sm):
+        cmap = da._material_category_map()
+        sm = sm.assign(_cat=sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED))
+        if cat:
+            sm = sm[sm["_cat"] == cat]
+        b_revenue = float(sm["revenue"].sum())
+        b_cost = float(sm["cost"].sum())
+        b_materials = int(sm["material"].nunique())
+    b_margin = b_revenue - b_cost
+
+    # Manufacturer count is reported network-wide, unfiltered, regardless of Category:
+    # sales_by_material carries no manufacturer column to re-derive it per-category
+    # from, and a stale-looking "0 manufacturers" under a category with real billed
+    # revenue would read as a bug rather than a scope note.
+    mfr_path = os.path.join(_KPI_DIR, "sales_by_manufacturer.parquet")
+    manufacturers_network = int(len(pd.read_parquet(mfr_path))) if os.path.exists(mfr_path) else 0
+
+    total = nb_cost + b_revenue
+    return {
+        "category": cat or "All",
+        "nonBillable": {"cost": nb_cost, "materials": nb_materials},
+        "billable": {
+            "revenue": b_revenue, "cost": b_cost, "margin": b_margin,
+            "marginPct": (b_margin / b_revenue * 100 if b_revenue else 0.0),
+            "materials": b_materials, "manufacturersNetwork": manufacturers_network,
+        },
+        "totalUsage": total,
+        "billableSharePct": (b_revenue / total * 100 if total else 0.0),
+        "nonBillableSharePct": (nb_cost / total * 100 if total else 0.0),
+        "visibilityMultiple": (total / nb_cost if nb_cost else None),
+    }
 
 
 # ---------------- helpers ----------------

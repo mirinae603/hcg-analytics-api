@@ -234,6 +234,60 @@ def _build_procurement_mart(con: duckdb.DuckDBPyConnection) -> None:
         _tables[name] = ""   # register so schema_text()/grain_text() expose them to the model
 
 
+# ── Billable/non-billable consumption fix ─────────────────────────────────────
+# Mirrors app/core/data_access.py's *_scoped("both") functions and
+# app/api/kpi_generic.py's _ALWAYS_BOTH_SCOPED map. These 4 tables' precomputed
+# parquets are internal-consumption-only (fact_consumption alone) — missing every
+# patient-billed material entirely. Every OTHER surface in the app (the bespoke
+# /insights pages, the generic /kpi/{key} routes, the drill-downs, the exec-summary
+# /api/dashboard/all) already reads the billed+internal ("both") recompute instead
+# of the raw parquet — this warehouse was the one remaining place that didn't,
+# because it builds its views straight off read_parquet(), bypassing
+# app.core.data_access entirely. Left unfixed, the agent's own SQL against kpi_doh /
+# kpi_health_score / kpi_non_moving / kpi_risk_classification would silently answer
+# "what's our days on hand" (etc.) with the exact stale, internal-only figure this
+# whole change set exists to replace (median(doh_days) would read ~116 instead of the
+# correct ~17). kpi_stock_change / kpi_units_consumed are DELIBERATELY excluded —
+# same reasoning as _ALWAYS_BOTH_SCOPED: stock-change's raw grain stays internal-only
+# by design, and Units Consumed's own default view is internal-only too. See memory:
+# billable-nonbillable-consumption-card.
+_registered_dfs: list = []   # keep pandas objects alive for the connection's lifetime
+
+
+def _fix_billable_nonbillable_scope(con: duckdb.DuckDBPyConnection) -> None:
+    from app.core import data_access as da   # lazy import — no hard dependency for
+                                              # callers that never touch these 4 tables
+    # kpi_health_score is DELIBERATELY excluded here, unlike its Python counterparts
+    # (itr_insights/_ALWAYS_BOTH_SCOPED). Its "both" recompute (da.health_scoped) folds
+    # billed COGS into consumption_cost/turnover_annualized PER ROW using a single
+    # network-wide rate broadcast onto every plant that stocks a material — legitimate
+    # at row grain (one row, read/ranked alone), but a free-form SQL agent can and will
+    # SUM/AVG this column across many rows for a portfolio or group total, which
+    # multiplies the billed portion by however many plants each material is stocked at
+    # (confirmed live: a naive portfolio ITR came out ~10x too high after a first attempt
+    # at overriding this view — see semantics.py gotcha #30's worked example for the
+    # correct two-piece additive pattern this table is meant to be read with instead).
+    # kpi_doh's avg_daily_consumption has the identical broadcast shape, but its safe
+    # usage pattern (MEDIAN of the derived doh_days ratio, not SUM of the rate) was
+    # already the established convention before this fix, so it stays overridden here.
+    overrides = {
+        "kpi_doh": lambda: da.doh_scoped("both"),
+        "kpi_non_moving": lambda: da.nonmoving_scoped("both"),
+        "kpi_risk_classification": lambda: da.risk_scoped("both"),
+    }
+    for name, builder in overrides.items():
+        if name not in _tables:
+            continue   # the raw parquet wasn't found/loaded — nothing to override
+        try:
+            df = builder()
+            _registered_dfs.append(df)
+            reg = f"_pydf_{name}"
+            con.register(reg, df)
+            con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM {reg}")
+        except Exception:
+            pass   # fall back silently to the raw-parquet view _connect() already made
+
+
 def con() -> duckdb.DuckDBPyConnection:
     global _con
     with _lock:
@@ -241,6 +295,7 @@ def con() -> duckdb.DuckDBPyConnection:
             _con = _connect()
             _fix_material_duplicate_keys(_con)
             _build_procurement_mart(_con)
+            _fix_billable_nonbillable_scope(_con)
     return _con
 
 

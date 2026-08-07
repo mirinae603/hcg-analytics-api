@@ -193,6 +193,253 @@ def refresh_cache() -> None:
     _load_cached.cache_clear()
     _name_to_code.cache_clear()
     _material_category_map.cache_clear()
+    sales_material_margin.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def sales_material_margin() -> pd.DataFrame:
+    """One row per BILLED MATERIAL, with margin — the frame behind the Revenue &
+    Margin detail table.
+
+    sales_by_material.parquet cannot be served as-is, for three separate reasons:
+
+    1. It stores the SAME product under two ids — "218766" and "218766.0". 7,320 of
+       its 21,960 rows carry the ".0" suffix, so a raw read reports 21,960 materials
+       where there are 15,171, and splits a KEYTRUDA-class product across two rows
+       that each hold half its revenue. legacy_kpi.revenue_insights already repairs
+       this for its own top_items/materials count; this is the same repair, done once
+       and shared, so the table underneath that page cannot disagree with it.
+    2. It carries no `margin` or `margin_pct` column at all — both are derived here.
+       margin_pct is computed PER ROW from that row's own revenue, never summed:
+       averaging a rate across materials is meaningless and summing it is worse.
+    3. Its `category` (attached by _attach_category at read time) is wrong on every
+       ".0" row, because "218766.0" misses dim_material's "218766". Categorising
+       AFTER the normalise lifts Onco Drugs from 708 to 733 materials and drops
+       Unclassified from 5,507 to 4,214 — without it a Category=Onco Drugs cut
+       understates billed revenue by ~4.4% (297.5 Cr served vs 311.1 Cr true).
+
+    The statement order below is load-bearing:
+      normalise the id  ->  sort by the trimmed group DESCENDING so a non-blank group
+      sorts ahead of a blank one  ->  groupby(material).agg(group="first").
+    Without that sort, agg("first") is free to pick the blank half of a split pair and
+    the material lands in "Uncategorised" despite the extract knowing its group. Only
+    then is the category attached, and only then are margin and margin_pct derived.
+
+    NOTE: this extract has NO plant column. Anything built on it is network-wide; a
+    Plant/Hospital filter over it is genuinely inert, and callers must say so rather
+    than imply a hospital cut that the source cannot support.
+    """
+    # Imported lazily: app.api.legacy_kpi imports this module at its top, so a
+    # module-level import here would be circular. By the time this function is first
+    # CALLED (from a request handler) both modules are fully loaded.
+    from app.api.legacy_kpi import _clean_group
+
+    p = KPI / "sales_by_material.parquet"
+    if not p.exists():
+        return pd.DataFrame(columns=["material", "desc", "group", "group_label", "category",
+                                     "revenue", "cost", "margin", "margin_pct", "qty", "lines"])
+    df = pd.read_parquet(p)
+    df["material"] = (df["material"].astype(str)
+                      .str.replace(r"\.0$", "", regex=True).str.strip())
+    df["_g"] = df["group"].astype(str).str.strip()
+    df = df.sort_values("_g", ascending=False, kind="mergesort")
+
+    agg = {"revenue": ("revenue", "sum"), "cost": ("cost", "sum"), "qty": ("qty", "sum")}
+    if "lines" in df.columns:
+        agg["lines"] = ("lines", "sum")
+    if "desc" in df.columns:
+        agg["desc"] = ("desc", "first")
+    m = df.groupby("material", as_index=False).agg(group=("_g", "first"), **agg)
+
+    m = _attach_category(m)          # AFTER the normalise — see (3) above
+    # RAW group kept untouched ("M065-INJECTIONS"); the pretty form lives beside it.
+    # Anything sent back to an API must use the raw key, never the label.
+    m["group_label"] = m["group"].map(_clean_group)
+    m["margin"] = m["revenue"] - m["cost"]
+    m["margin_pct"] = np.where(m["revenue"] > 0, m["margin"] / m["revenue"] * 100.0, 0.0)
+    return m.sort_values("revenue", ascending=False).reset_index(drop=True)
+
+
+def nonmoving_scoped(scope: str) -> pd.DataFrame:
+    """Recomputes A9 (kpi_non_moving) with a different "moving" material definition.
+
+    Shared by legacy_kpi.py's /kpi/non-moving-inventory/insights and kpi_generic.py's
+    /kpi/non-moving-inventory/table so both surfaces agree under a Scope filter.
+    Reproduces transforms.py's A9 formula verbatim (isin -> aging>180 OR-filter ->
+    reason label) against kpi_inventory_aging, the pre-classification universe A9 is
+    itself derived from, swapping only which materials count as "moving": today's A9
+    (scope "nonbillable", never reaches this function) uses fact_consumption alone.
+    "billable" uses sales_by_material's material set instead (patient-billed, IP+OP);
+    "both" unions the two — the exact gap the DOH RCA identified: injectable/oncology
+    materials dispensed via billing but never internally issued get wrongly classified
+    "non-moving" today.
+    """
+    a2 = load("kpi_inventory_aging")  # already carries its own last_sale_date (see transforms.py A2)
+    cons = load("fact_consumption")
+    moving = set()
+    if scope in ("billable", "both"):
+        sm_path = KPI / "sales_by_material.parquet"
+        if sm_path.exists():
+            moving |= set(pd.read_parquet(sm_path)["material"].astype(str).unique())
+    if scope == "both":
+        moving |= set(cons["material"].astype(str).unique())
+
+    a9 = a2.copy()
+    a9["consumed_in_window"] = a9["material"].astype(str).isin(moving)
+    a9 = a9[(~a9["consumed_in_window"]) | (a9["aging_days"] > 180)].copy()
+    a9["reason"] = np.where(~a9["consumed_in_window"], "No consumption in 6mo", "Aging > 180d")
+    # `category` carries over from kpi_inventory_aging (already attached at load()
+    # time via _attach_category) so filter_category still works downstream — a plain
+    # column-select without it would silently no-op any Category filter combined with
+    # Scope=billable|both, since _attach_category only runs inside load()/_read_parquet,
+    # never on an in-memory frame built after the fact.
+    return a9[["plant", "material", "material_desc", "material_group", "category",
+               "closing_stock_quantity", "closing_stock_value", "aging_days",
+               "last_sale_date", "reason"]]
+
+
+# sales_by_material retains no per-row date to derive a dynamic span from (unlike
+# fact_consumption's own days_span, computed live from real posting dates). This is
+# the fixed Dec 2025-May 2026 window ingest_sales.py's own KEEP set already bakes in
+# ("match the rest of the data") -- 31+31+28+31+30+31 days, not a separate guess.
+_SALES_WINDOW_DAYS = 182
+
+
+def doh_scoped(scope: str) -> pd.DataFrame:
+    """Recomputes A3 (kpi_doh) folding in the patient-billed consumption rate.
+
+    "nonbillable" (today's default, never reaches this function) leaves
+    avg_daily_consumption/doh_days exactly as ETL wrote them, fact_consumption-only.
+    "billable" replaces avg_daily_consumption with the billed qty/day rate from
+    sales_by_material; "both" SUMS the internal and billed daily-quantity rates
+    before dividing stock_qty by the total -- this is deliberately a units/day figure
+    both sides, never mixed with revenue/cost, so the two rates stay unit-compatible.
+    This is the DOH RCA's own proposed fix, offered as an optional lens rather than a
+    silent change to the shipped default.
+
+    Caveat surfaced in the UI, not hidden here: sales_by_material carries no plant
+    dimension, so the billed rate is ONE network-wide qty/day per material applied to
+    every plant that stocks it, not a true per-hospital rate.
+    """
+    doh = load("kpi_doh").copy()
+    billed_daily = pd.Series(dtype=float)
+    if scope in ("billable", "both"):
+        sm_path = KPI / "sales_by_material.parquet"
+        if sm_path.exists():
+            sm = pd.read_parquet(sm_path, columns=["material", "qty"])
+            billed_daily = sm.groupby("material")["qty"].sum() / _SALES_WINDOW_DAYS
+    doh["material"] = doh["material"].astype(str)
+    doh["billed_daily"] = doh["material"].map(billed_daily).fillna(0.0)
+    if scope == "billable":
+        doh["avg_daily_consumption"] = doh["billed_daily"]
+    elif scope == "both":
+        doh["avg_daily_consumption"] = doh["avg_daily_consumption"] + doh["billed_daily"]
+    doh["doh_days"] = np.where(doh["avg_daily_consumption"] > 0,
+                               doh["stock_qty"] / doh["avg_daily_consumption"], np.nan)
+    return doh.drop(columns=["billed_daily"])
+
+
+def itr_scoped(scope: str) -> pd.DataFrame:
+    """Recomputes A8 (kpi_health_score) folding in the patient-billed COGS.
+
+    "nonbillable" (today's default, never reaches this function) leaves
+    consumption_cost/turnover_annualized exactly as ETL wrote them, fact_consumption
+    -only. "billable" replaces consumption_cost with billed cost from
+    sales_by_material ('cost' = TOTALCOSTPRICE); "both" SUMS the internal and billed
+    COST before recomputing turnover_annualized -- cost+cost, the mirror of
+    doh_scoped's qty+qty rule, never mixing the two units.
+
+    Annualization uses ANN=2.0 (6mo -> annual), the same convention
+    /kpi/inventory-turnover-ratio/insights already hardcodes for its own live
+    aggregates -- not transforms.py's slightly different dynamic `months` factor,
+    which is within a rounding error of 2.0 over this dataset's real ~6-month window.
+    This keeps the recompute symmetric with the endpoint that reads it.
+
+    health_score/health_tier are NOT recomputed -- that composite (aging + turnover +
+    movement) is a separate KPI this Scope toggle doesn't claim to redefine.
+
+    Caveat surfaced in the UI, not hidden here: sales_by_material carries no plant
+    dimension, so billed COGS is ONE network-wide figure per material applied to
+    every plant that stocks it -- see doh_scoped's identical caveat.
+    """
+    hs = load("kpi_health_score").copy()
+    billed_cogs = pd.Series(dtype=float)
+    if scope in ("billable", "both"):
+        sm_path = KPI / "sales_by_material.parquet"
+        if sm_path.exists():
+            sm = pd.read_parquet(sm_path, columns=["material", "cost"])
+            billed_cogs = sm.groupby("material")["cost"].sum()
+    hs["material"] = hs["material"].astype(str)
+    hs["billed_cogs"] = hs["material"].map(billed_cogs).fillna(0.0)
+    if scope == "billable":
+        hs["consumption_cost"] = hs["billed_cogs"]
+    elif scope == "both":
+        hs["consumption_cost"] = hs["consumption_cost"] + hs["billed_cogs"]
+    ANN = 2.0
+    hs["turnover_annualized"] = np.where(hs["closing_stock_value"] > 0,
+                                         hs["consumption_cost"] * ANN / hs["closing_stock_value"], 0.0)
+    return hs.drop(columns=["billed_cogs"])
+
+
+def health_scoped(scope: str) -> pd.DataFrame:
+    """Recomputes A8's health_score/health_tier composite on top of itr_scoped's
+    billed-aware consumption_cost/turnover_annualized.
+
+    itr_scoped's own docstring explicitly deferred this: "health_score/health_tier
+    are NOT recomputed -- that composite is a separate KPI this Scope toggle doesn't
+    claim to redefine." This function is that follow-up, reproducing transforms.py's
+    exact aging_score/turn_score/move_score weights (0.4/0.4/0.2) and health_tier cut
+    points unchanged -- only the turnover/movement halves shift with Scope, aging_score
+    never does (aging_days is a physical-stock fact).
+
+    Only ever called for scope in ("billable", "both") -- see itr_scoped's own
+    "nonbillable" short-circuit note; the "nonbillable" default path never reaches
+    this function at the route level, so its zero-drift guarantee is unaffected.
+    """
+    hs = itr_scoped(scope)  # consumption_cost/turnover_annualized already billed-aware
+    aging_score = (1 - (hs["aging_days"].clip(0, 365) / 365)) * 100
+    turn_score = (hs["turnover_annualized"].clip(0, 6) / 6) * 100
+    move_score = np.where(hs["consumption_cost"] > 0, 100, 0)
+    hs["health_score"] = (0.4 * aging_score + 0.4 * turn_score + 0.2 * move_score).round(1)
+    hs["health_tier"] = pd.cut(hs["health_score"], [-1, 40, 70, 101],
+                               labels=["At Risk", "Watch", "Healthy"]).astype(str)
+    return hs
+
+
+def risk_scoped(scope: str) -> pd.DataFrame:
+    """Recomputes A10 (kpi_risk_classification) folding in the patient-billed
+    consumption signal into the `consumed` flag.
+
+    A9 (Non-Moving) and A10 (Risk Classification) are built in transforms.py from the
+    IDENTICAL `consumed_materials` set -- the exact same bug, two different outputs.
+    nonmoving_scoped already fixes A9's side; this is A10's. Keeps aging_days,
+    days_to_expiry, nearest_expiry and closing_stock_value exactly as precomputed --
+    those are physical-stock/expiry facts Scope has no claim over -- and only
+    recomputes `consumed` and the risk_level classifier that reads it (verbatim from
+    transforms.py's `_risk()`).
+    """
+    rc = load("kpi_risk_classification").copy()
+    cons = load("fact_consumption")
+    moving = set()
+    if scope in ("billable", "both"):
+        sm_path = KPI / "sales_by_material.parquet"
+        if sm_path.exists():
+            moving |= set(pd.read_parquet(sm_path)["material"].astype(str).unique())
+    if scope == "both":
+        moving |= set(cons["material"].astype(str).unique())
+    rc["material"] = rc["material"].astype(str)
+    rc["consumed"] = rc["material"].isin(moving)
+
+    def _risk(r):
+        if pd.notna(r["days_to_expiry"]) and r["days_to_expiry"] <= 90:
+            return "High"
+        if r["aging_days"] > 365 or not r["consumed"]:
+            return "High"
+        if r["aging_days"] > 180:
+            return "Medium"
+        return "Low"
+    rc["risk_level"] = rc.apply(_risk, axis=1)
+    return rc
 
 
 @lru_cache(maxsize=1)

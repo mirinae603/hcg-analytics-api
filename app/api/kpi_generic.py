@@ -44,6 +44,22 @@ REGISTRY = {
     # Consumption
     "unit-sold-per-sku": ("kpi_units_consumed", "available"),
     "consumption-by-department": ("kpi_consumption_by_department", "available"),
+    # Promoted from "simulated" once HCG's IP+OP billing extract landed. Each is a
+    # DISTINCT cut — they were all previewing against the same /revenueMargin page, which
+    # is the executive umbrella, not a per-KPI source:
+    #   revenue-per-location  hospital x material  (57,455 rows)
+    #   op-ip-revenue         patient-type x month (12 rows — the only grain the split has)
+    #   billable-consumption  material-grain union of billed + internal goods-issue
+    "revenue-per-location": ("sales_by_material_hospital", "available"),
+    "op-ip-revenue": ("sales_monthly", "available"),
+    "billable-consumption": ("kpi_billable_consumption", "available"),
+    # Inventory — promoted out of the simulated set. fact_inventory never carries a qty=0
+    # row: a stocked-out item is simply ABSENT from the snapshot, so absence is the signal
+    # and no daily stock history is needed. Grain is (plant, material) restricted to the 25
+    # plants that appear in BOTH the inventory snapshot and consumption — at the other 26
+    # consumption plants there is no inventory data at all, so "absent" there would mean
+    # "not measured", not "out of stock".
+    "stock-out-rate": ("kpi_stock_out", "available"),
     # Forecasting (D3/D5/D6 derived tables; D1/D4/D8 via /inventory/replenishment-data)
     "fulfillment-rate": ("kpi_fulfillment", "available"),
     "stock-radar": ("kpi_stock_radar", "available"),
@@ -98,15 +114,39 @@ def clear_kpi_caches() -> None:
 # on stock_value, stock_qty AND sku_count — asserted in tests/test_drilldown.py.
 _CATEGORY_REGRAIN = {"kpi_aging_distribution": "drill_inventory_grain"}
 
+# These 4 KPIs' precomputed parquets are internal-consumption-only (fact_consumption),
+# missing every patient-billed material entirely -- the exact gap legacy_kpi.py's
+# bespoke /insights routes now permanently correct for (see nonmoving_insights et al.,
+# and memory: billable-nonbillable-consumption-card). Every OTHER consumer of these
+# same tables -- the generic SKU table, chart series (the /inventory overview page's
+# mini-charts), and summary -- must agree with that fix too, or a detail page's own
+# SKU table / the overview page's chart would silently disagree with its own headline.
+# kpi_stock_change is deliberately excluded: its bespoke page keeps "both" scoped
+# internally per-branch (see stockchange_insights) but its raw/generic-grain consumers
+# stay internal-only by design, consistent with that page's own documented caveat.
+_ALWAYS_BOTH_SCOPED = {
+    "kpi_non_moving": lambda: da.nonmoving_scoped("both"),
+    "kpi_doh": lambda: da.doh_scoped("both"),
+    # kpi_health_score backs BOTH inventory-health-score and inventory-turnover-ratio
+    # (REGISTRY maps both keys to this one table). health_scoped("both") is a strict
+    # superset of itr_scoped("both") -- it calls itr_scoped internally and only adds
+    # health_score/health_tier columns on top -- so it correctly serves either key.
+    "kpi_health_score": lambda: da.health_scoped("both"),
+    "kpi_risk_classification": lambda: da.risk_scoped("both"),
+}
+
 
 def _regrained(table: str, category):
     """The frame to serve `table` from, or None to use the table itself.
 
-    Two substitution routes, both inert without a category:
+    Three substitution routes:
 
+      * _ALWAYS_BOTH_SCOPED — unconditional, regardless of category: these tables'
+        own parquet is stale (internal-only), so every read goes through the
+        billed+internal recompute instead. Checked first since it wins outright.
       * _CATEGORY_REGRAIN — swap in the richer-grain frame WHOLE and let
         da.filter_category do the cut (inventory; the frame's `category` IS the
-        material category, so filtering it is correct).
+        material category, so filtering it is correct). Inert without a category.
       * ds.PROC_REGRAIN — the procurement aggregates, where the same trick would be
         actively wrong: fact_po's `category` is the PO SPEND taxonomy, so handing the
         raw grain to filter_category would either match nothing or (as today) be
@@ -114,8 +154,12 @@ def _regrained(table: str, category):
         These builders therefore cut on `material_category` themselves and hand back
         a frame already collapsed to the aggregate's own grain — one that carries no
         derived category column at all, so the filter_category call downstream is a
-        guaranteed no-op rather than a second, conflicting filter.
+        guaranteed no-op rather than a second, conflicting filter. Inert without a
+        category.
     """
+    both = _ALWAYS_BOTH_SCOPED.get(table)
+    if both:
+        return both()
     src = _CATEGORY_REGRAIN.get(table)
     if src and da.resolve_category(category):
         return ds.load_source(src, None)
@@ -196,8 +240,14 @@ def kpi_table(
     table = _resolve(key)
     _category_unsupported(table, category)
     params = dict(request.query_params)
+    # No Scope param: _ALWAYS_BOTH_SCOPED (see _regrained) already makes these 5
+    # keys' SKU table permanently billed+internal, matching their bespoke /insights
+    # page. Only Units Consumed per SKU keeps a live Scope toggle, and it reaches
+    # this route through a different key (unit-sold-per-sku) not in that map, so
+    # _regrained falls through to its normal (unaffected) behaviour for it.
+    frame = _regrained(table, category)
     return da.paginate(table, plant, params, col_map={}, category=category,
-                       frame=_regrained(table, category))
+                       frame=frame)
 
 
 PORTFOLIOS = {

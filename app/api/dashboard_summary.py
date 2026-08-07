@@ -53,11 +53,23 @@ def dashboard_all(region: Optional[str] = Query(None),
     def _f(table):
         return da.filter_category(da.filter_plant(da.load(table), plant), category)
 
+    def _fdf(df):
+        return da.filter_category(da.filter_plant(df, plant), category)
+
     inv = _f("kpi_stock_value")
-    doh = _f("kpi_doh")
+    # doh/nonmoving read the billed+internal ("both") recompute, not the raw internal-
+    # only parquet -- legacy_kpi.py's doh_insights/nonmoving_insights moved to "both"
+    # permanently (see memory: billable-nonbillable-consumption-card), and this exec-
+    # summary tile has to move with them or it silently shows a different, stale
+    # figure than the page one click away shows for the exact same KPI (caught live:
+    # this tile read 116 days while the already-fixed DOH page read 17 for "All
+    # Plants"). `health` stays RAW here on purpose -- see avg_itr below for why.
+    doh = _fdf(da.doh_scoped("both"))
     health = _f("kpi_health_score")
-    units = _f("kpi_units_consumed")
-    nonmoving = _f("kpi_non_moving")
+    units = _f("kpi_units_consumed")  # Consumption KPI: default view stays internal-
+                                       # only, matching Units Consumed per SKU's own
+                                       # default scope (that page keeps its live toggle).
+    nonmoving = _fdf(da.nonmoving_scoped("both"))
 
     bucket = _aging_buckets(plant, category)
     fresh = float(bucket.get("0-30", 0))
@@ -75,9 +87,10 @@ def dashboard_all(region: Optional[str] = Query(None),
     # MEDIAN, not mean: a handful of near-zero-consumption SKUs (e.g. 1 unit consumed all
     # window against thousands in stock) produce a finite but astronomical doh_days (895,950
     # in one real case) that a plain mean can't shrug off — it dragged the portfolio figure
-    # to 1445 days against a stated 30-90 day target. Median matches the bespoke DOH
-    # drill-down's own `median_doh` (legacy_kpi.py /kpi/days-on-hand/insights) so this tile
-    # and that page now agree, instead of showing two different DOH numbers on one visit.
+    # to 1445 days against a stated 30-90 day target. Median over `doh` (now da.doh_scoped
+    # ("both")) matches the bespoke DOH drill-down's own `median_doh` (legacy_kpi.py's
+    # doh_insights, also "both") so this tile and that page agree, instead of showing two
+    # different DOH numbers on one visit.
     # `median() or 0` does NOT guard an empty frame: pd.Series([]).median() is nan and
     # nan is TRUTHY in Python, so nan flowed straight into the response and FastAPI
     # 500'd ("Out of range float values are not JSON compliant"). Unreachable before the
@@ -89,11 +102,32 @@ def dashboard_all(region: Optional[str] = Query(None),
     # SKUs (a rounding-error's worth of stock value) post ratios in the tens of thousands and
     # pull the average far above any plant's real turnover. This is the identical
     # "portfolio_itr" formula the bespoke Inventory Turnover Ratio drill-down already uses
-    # (legacy_kpi.py's `itr_insights`), so this tile now matches that page instead of showing
+    # (legacy_kpi.py's `itr_insights`), so this tile matches that page instead of showing
     # 2.4x here vs 0.66x there for the same underlying data.
-    _cogs6 = float(health["consumption_cost"].sum())
     _inv6 = float(health["closing_stock_value"].sum())
+    _internal_cogs6 = float(health["consumption_cost"].sum())
     ANN = 2.0  # 6 months of data -> annualized
+
+    # Billed COGS folded in exactly like itr_insights' "both" branch: a material-grain,
+    # DEDUPED sum from sales_by_material, added to `health`'s own RAW plant-grain sum --
+    # never computed by summing a plant-fanned-out itr_scoped()/health_scoped() frame,
+    # which would multiply the billed figure by however many plants stock each material
+    # (caught live earlier this session: a naive merge-then-sum inflated portfolio COGS
+    # to Rs 3,305 Cr against a real Rs 308 Cr billable total -- this is why `health`
+    # above stays the raw table rather than a "both"-scoped one). sales_by_material
+    # carries no plant column, so this is network-wide billed COGS folded in regardless
+    # of which Plant is selected -- the same caveat itr_insights documents for its own
+    # page, replicated here rather than reinvented.
+    _billed_cogs6 = 0.0
+    sm_path = da.KPI / "sales_by_material.parquet"
+    if sm_path.exists():
+        sm = pd.read_parquet(sm_path)
+        cat = da.resolve_category(category)
+        if cat:
+            cmap = da._material_category_map()
+            sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
+        _billed_cogs6 = float(sm["cost"].sum())
+    _cogs6 = _internal_cogs6 + _billed_cogs6
     avg_itr = (_cogs6 * ANN) / _inv6 if _inv6 else 0.0
 
     loc = "All Plants" if not plant else plant

@@ -252,8 +252,13 @@ def doh_grain() -> pd.DataFrame:
     of "no movement" — materialised once and cached, so summing `stock_value_cost`
     per band here reproduces the histogram bar for bar and `sku_count` reproduces its
     SKU counts.
+
+    Reads da.doh_scoped("both"), not the raw kpi_doh parquet -- GET .../insights
+    itself moved to "both" (see doh_insights), so this has to move with it or the
+    band a SKU falls into here would silently disagree with the histogram that
+    launched the drill.
     """
-    doh = da.load("kpi_doh")
+    doh = da.doh_scoped("both")
     sv = da.load("kpi_stock_value")[["plant", "material", "stock_value_cost", "stock_value_mrp"]]
     g = doh.merge(sv, on=["plant", "material"], how="left")
     for c in ("stock_value_cost", "stock_value_mrp"):
@@ -564,7 +569,27 @@ DERIVED_CATEGORY_COL: dict[str, str] = {
 }
 
 
+# kpi_generic._ALWAYS_BOTH_SCOPED's sibling for the drill path. _resolve_drill tries
+# each KPI's OWN base table (e.g. "kpi_non_moving") before any drill_* fallback, and
+# a plain da.load(name) of one of these 4 raw parquets would silently serve
+# internal-only rows under a chart whose own headline is now permanently
+# billed+internal -- wrong in the exact way this whole change set exists to prevent
+# (caught live: /kpi/non-moving-inventory's "reason" drill answered Rs 27.4 Cr
+# against a Rs 79.1 Cr bar). kpi_stock_change is deliberately excluded, matching
+# kpi_generic._ALWAYS_BOTH_SCOPED -- see stockchange_insights' own comment on why its
+# monthly bars can never honestly agree with a billed-aware material drill anyway.
+_ALWAYS_BOTH_SCOPED = {
+    "kpi_non_moving": lambda: da.nonmoving_scoped("both"),
+    "kpi_doh": lambda: da.doh_scoped("both"),
+    "kpi_health_score": lambda: da.health_scoped("both"),
+    "kpi_risk_classification": lambda: da.risk_scoped("both"),
+}
+
+
 def load_source(name: str, plant: Optional[str]) -> pd.DataFrame:
+    both = _ALWAYS_BOTH_SCOPED.get(name)
+    if both:
+        return both()
     b = BUILDERS.get(name)
     return b(plant) if b else da.load(name)
 
