@@ -57,14 +57,14 @@ def dashboard_all(region: Optional[str] = Query(None),
         return da.filter_category(da.filter_plant(df, plant), category)
 
     inv = _f("kpi_stock_value")
-    # doh/nonmoving read the billed+internal ("both") recompute, not the raw internal-
-    # only parquet -- legacy_kpi.py's doh_insights/nonmoving_insights moved to "both"
-    # permanently (see memory: billable-nonbillable-consumption-card), and this exec-
-    # summary tile has to move with them or it silently shows a different, stale
-    # figure than the page one click away shows for the exact same KPI (caught live:
-    # this tile read 116 days while the already-fixed DOH page read 17 for "All
-    # Plants"). `health` stays RAW here on purpose -- see avg_itr below for why.
-    doh = _fdf(da.doh_scoped("both"))
+    # nonmoving reads the billed+internal ("both") recompute, not the raw internal-only
+    # parquet -- legacy_kpi.py's nonmoving_insights moved to "both" permanently (see
+    # memory: billable-nonbillable-consumption-card), and this exec-summary tile has to
+    # move with it or it silently shows a different, stale figure than the page one click
+    # away shows for the exact same KPI. `health` stays RAW here on purpose -- see
+    # avg_itr below for why. (DOH itself is now da.doh_value_scoped(), a value-basis
+    # portfolio ratio computed straight from kpi_stock_value/fact_consumption/
+    # sales_by_material below -- no separate doh_scoped() load needed for it here.)
     health = _f("kpi_health_score")
     units = _f("kpi_units_consumed")  # Consumption KPI: default view stays internal-
                                        # only, matching Units Consumed per SKU's own
@@ -84,19 +84,14 @@ def dashboard_all(region: Optional[str] = Query(None),
     # MRP-proxy revenue & margin (flagged as proxy in workbook)
     revenue_proxy = stock_mrp
     margin = round((1 - (stock_value / stock_mrp)) * 100, 1) if stock_mrp else 0.0
-    # MEDIAN, not mean: a handful of near-zero-consumption SKUs (e.g. 1 unit consumed all
-    # window against thousands in stock) produce a finite but astronomical doh_days (895,950
-    # in one real case) that a plain mean can't shrug off — it dragged the portfolio figure
-    # to 1445 days against a stated 30-90 day target. Median over `doh` (now da.doh_scoped
-    # ("both")) matches the bespoke DOH drill-down's own `median_doh` (legacy_kpi.py's
-    # doh_insights, also "both") so this tile and that page agree, instead of showing two
-    # different DOH numbers on one visit.
-    # `median() or 0` does NOT guard an empty frame: pd.Series([]).median() is nan and
-    # nan is TRUTHY in Python, so nan flowed straight into the response and FastAPI
-    # 500'd ("Out of range float values are not JSON compliant"). Unreachable before the
-    # Category param existed; trivially reachable now with a filter that yields no rows.
-    _med = doh["doh_days"].replace([np.inf, -np.inf], np.nan).dropna().median()
-    avg_doh = 0.0 if pd.isna(_med) else float(_med)
+    # Client's own formula (Closing Inventory Value / avg daily Value sold+consumed),
+    # the same da.doh_value_scoped() the bespoke DOH drill-down's own headline now uses
+    # (legacy_kpi.py's doh_insights, totals.days_inventory_value) — matches that page so
+    # this tile and that page agree, instead of showing two different DOH numbers on one
+    # visit. None (no billed-cost-applicable denominator, or a filter with zero rows)
+    # becomes 0.0 here rather than crashing the response.
+    _dv = da.doh_value_scoped(region, category)
+    avg_doh = float(_dv["days_inventory_value"]) if _dv["days_inventory_value"] is not None else 0.0
     # Portfolio-level SUM(consumption)/SUM(inventory), annualized -- NOT a mean of each
     # material's own turnover ratio. A mean-of-ratios lets a handful of near-zero-inventory
     # SKUs (a rounding-error's worth of stock value) post ratios in the tens of thousands and

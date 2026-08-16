@@ -339,6 +339,77 @@ def doh_scoped(scope: str) -> pd.DataFrame:
     return doh.drop(columns=["billed_daily"])
 
 
+def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
+    """Days Inventory Outstanding, client's own formula: Closing Inventory VALUE /
+    (avg daily VALUE of goods sold+consumed). This is a DIFFERENT metric from
+    doh_scoped's doh_days (unit quantity, per-SKU MEDIAN) -- a single, portfolio-
+    level, VALUE-weighted ratio: SUM(closing_stock_value) / (SUM(internal cost)/181
+    + SUM(billed cost)/182). Verified against real data: ~29.3 days at All Plants,
+    vs. the unit-median DOH's 16.57 -- both correct, answering different questions
+    (typical SKU's cover vs. rupee-weighted portfolio cover, which skews toward
+    high-value slow movers exactly the way the mean-vs-median doh_days gap already
+    does). Ships alongside doh_days, not replacing it: bands/reorder/overstock
+    still need real per-SKU quantities, which a single aggregate ratio can't give.
+
+    PLANT CAVEAT (real, load-bearing, discovered live -- not theoretical): billed
+    cost (sales_by_material) carries no plant dimension, same limitation doh_scoped
+    already has. doh_scoped absorbs that by blending the network-wide billed rate
+    into each SKU's own row before taking a MEDIAN across thousands of rows, which
+    dilutes any one mismatch. THIS function has no such buffer -- it is a single
+    SUM/SUM ratio, so blending the network's entire billed total into one hospital's
+    denominator collapsed the number to 2-4 days (verified: HC05 -> 4.4d, HO01 ->
+    2.5d test values, both absurd). So: billed cost is folded in ONLY at the true
+    All-Plants view; a single-plant selection returns an honest INTERNAL-ONLY days
+    figure instead (real number, narrower scope) rather than a blended, meaningless
+    one. `billed_applicable` in the return tells the caller which case fired, so the
+    UI can disclose it instead of leaving the scope change silent.
+
+    CATEGORY CAVEAT: sales_by_material carries its own `category` bucket (attached
+    at load() time, NOT the raw material_group column) -- filtering billed cost by
+    `group`/material_group instead of `category` silently returns nothing for every
+    real category value here (confirmed live: an M0xx- style filter zeroed both
+    kpi_stock_value AND fact_consumption, since neither carries that column at all;
+    they carry `category`). Category filtering works at ANY plant scope, unlike
+    Plant -- Onco Drugs is the proof this matters: ~0 internal consumption but
+    Rs 197 Cr of billed cost, so the category filter is worthless here unless billed
+    is correctly included (verified: 23.24 days once wired correctly, not the
+    near-infinite number a consumption-only view would show for a near-zero
+    denominator).
+    """
+    p = resolve_plant(plant)
+    cat = resolve_category(category)
+
+    sv = filter_category(filter_plant(load("kpi_stock_value"), p), cat)
+    closing_value = float(sv["stock_value_cost"].sum())
+
+    cons_all = load("fact_consumption")
+    days_span = max((cons_all["posting_date"].max() - cons_all["posting_date"].min()).days, 1)
+    cons_f = filter_category(filter_plant(cons_all, p), cat)
+    internal_value = float(cons_f["amount_lc"].sum())
+    internal_daily = internal_value / days_span
+
+    billed_applicable = p is None
+    billed_value = 0.0
+    if billed_applicable:
+        sm = load("sales_by_material")
+        if cat:
+            sm = sm[sm["category"].astype(str) == cat]
+        billed_value = float(sm["cost"].sum())
+    billed_daily = billed_value / _SALES_WINDOW_DAYS
+
+    avg_daily_value = internal_daily + billed_daily
+    days = (closing_value / avg_daily_value) if avg_daily_value > 0 else None
+    return {
+        "closing_inventory_value": closing_value,
+        "internal_consumption_value": internal_value,
+        "billed_cost_value": billed_value,
+        "billed_applicable": billed_applicable,
+        "days_span": days_span,
+        "avg_daily_value": avg_daily_value,
+        "days_inventory_value": days,
+    }
+
+
 def itr_scoped(scope: str) -> pd.DataFrame:
     """Recomputes A8 (kpi_health_score) folding in the patient-billed COGS.
 

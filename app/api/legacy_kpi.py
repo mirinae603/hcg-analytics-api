@@ -461,11 +461,21 @@ def doh_insights(Plant: str = Query(None), Category: str = Query(None)):
                   "value": float(r["stock_value_cost"]), "qty": float(r["stock_qty"])} for _, r in over.iterrows()]
 
     bv = {b["key"]: b for b in bands}
+    # Client's own formula (Closing Inventory Value / avg daily Value sold+consumed) —
+    # a single portfolio-level, VALUE-weighted ratio, genuinely different from
+    # median_doh (unit-quantity, per-SKU median) below. See doh_value_scoped's own
+    # docstring for the real, live-verified caveats (billed cost only blends in at
+    # All-Plants scope; a single-plant selection is honestly internal-only).
+    dv = da.doh_value_scoped(Plant, Category)
     return {
         "totals": {
             "total_skus": int(len(doh)), "moving_skus": int(len(moving)), "nonmoving_skus": int(len(nonmoving)),
             "median_doh": (float(moving["doh_days"].median()) if len(moving) else 0.0),
             "mean_doh": (float(moving["doh_days"].mean()) if len(moving) else 0.0),
+            "days_inventory_value": dv["days_inventory_value"],
+            "closing_inventory_value": dv["closing_inventory_value"],
+            "avg_daily_value": dv["avg_daily_value"],
+            "billed_applicable": dv["billed_applicable"],
             "total_value": float(doh["stock_value_cost"].sum()),
             "risk_value": bv["critical"]["value"] + bv["low"]["value"],
             "risk_count": bv["critical"]["count"] + bv["low"]["count"],
