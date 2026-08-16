@@ -1682,9 +1682,14 @@ def _consumption_overview_cached(pl, cat=None):
     cg = uc.groupby("cat", observed=True).agg(value=("consumption_cost", "sum"), units=("total_units", "sum")).reset_index().sort_values("value", ascending=False)
     categories = [{"name": str(r["cat"]), "value": float(r["value"]), "units": float(r["units"]),
                    "uncat": str(r["cat"]).strip().lower() in ("uncategorized", "", "nan", "none")} for _, r in cg.head(10).iterrows()]
-    dg = dp.groupby("cost_ctr", observed=True).agg(value=("consumption_cost", "sum"), qty=("consumption_qty", "sum")).reset_index().sort_values("value", ascending=False)
+    # Same real, exact 1:1 cost-center->plant mapping as dept_insights (0/730 span more
+    # than one plant) -- gives "which hospital" for a code the frontend can show until
+    # HCG supplies real department names.
+    dg = dp.groupby("cost_ctr", observed=True).agg(value=("consumption_cost", "sum"), qty=("consumption_qty", "sum"), plant=("plant", "first")).reset_index().sort_values("value", ascending=False)
     dtot = float(dg["value"].sum())
-    departments = [{"code": str(r["cost_ctr"]), "value": float(r["value"]), "qty": float(r["qty"]), "share": float(r["value"] / dtot * 100) if dtot else 0.0} for _, r in dg.head(8).iterrows()]
+    pnames = ds.plant_name_map()
+    departments = [{"code": str(r["cost_ctr"]), "value": float(r["value"]), "qty": float(r["qty"]), "share": float(r["value"] / dtot * 100) if dtot else 0.0,
+                    "plant": str(r["plant"]), "hospital": pnames.get(str(r["plant"]), str(r["plant"]))} for _, r in dg.head(8).iterrows()]
     dept_top5 = float(dg.head(5)["value"].sum() / dtot * 100) if dtot else 0.0
     sg = uc.groupby(["material", "material_desc"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index().sort_values("cost", ascending=False)
     skus = [{"material": str(r["material"]), "desc": str(r["material_desc"]), "units": float(r["units"]), "cost": float(r["cost"])} for _, r in sg.head(8).iterrows()]
@@ -1812,11 +1817,20 @@ def units_consumed_insights(Plant: str = Query(None), Category: str = Query(None
 def dept_insights(Plant: str = Query(None)):
     dp = da.filter_plant(da.load("kpi_consumption_by_department"), _plant(Plant)).copy()
     cost = float(dp["consumption_cost"].sum()); qty = float(dp["consumption_qty"].sum())
-    dg = dp.groupby("cost_ctr", observed=True).agg(value=("consumption_cost", "sum"), qty=("consumption_qty", "sum")).reset_index().sort_values("value", ascending=False)
+    # HCG hasn't supplied a cost-center-to-department-NAME master (see dim_costcenter's own
+    # comment) so `code` alone is opaque -- but every one of the 730 cost centers belongs to
+    # exactly ONE plant in the actual consumption data (verified: 0/730 span more than one),
+    # so `.first()` here is exact, not a guess, and gives a real, useful "which hospital"
+    # answer the frontend can show next to the bare code until a real name master exists.
+    dg = dp.groupby("cost_ctr", observed=True).agg(
+        value=("consumption_cost", "sum"), qty=("consumption_qty", "sum"), plant=("plant", "first")
+    ).reset_index().sort_values("value", ascending=False)
     tot = float(dg["value"].sum()); n = int(len(dg))
     dg["share"] = np.where(tot > 0, dg["value"] / tot * 100, 0.0); dg["cum"] = dg["share"].cumsum()
     n80 = int((dg["cum"] <= 80).sum()) + 1
-    departments = [{"code": str(r["cost_ctr"]), "value": float(r["value"]), "qty": float(r["qty"]), "share": float(r["share"]), "cum": float(r["cum"])} for _, r in dg.head(24).iterrows()]
+    pnames = ds.plant_name_map()
+    departments = [{"code": str(r["cost_ctr"]), "value": float(r["value"]), "qty": float(r["qty"]), "share": float(r["share"]), "cum": float(r["cum"]),
+                    "plant": str(r["plant"]), "hospital": pnames.get(str(r["plant"]), str(r["plant"]))} for _, r in dg.head(24).iterrows()]
     m = _msort(dp.groupby(["year", "month"], observed=True).agg(cost=("consumption_cost", "sum"), qty=("consumption_qty", "sum")).reset_index())
     timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "cost": float(r["cost"]), "qty": float(r["qty"])} for _, r in m.iterrows()]
     # top-6 department × month matrix — powers the stacked stream
@@ -1827,6 +1841,7 @@ def dept_insights(Plant: str = Query(None)):
         srows.append({"name": str(code), "values": [float(sub.get(mm, 0)) for mm in order]})
     matrix = {"labels": [mm[:3] for mm in order], "months": order, "rows": srows}
     return {"totals": {"cost": cost, "qty": qty, "departments": n, "top_dept": str(dg["cost_ctr"].iloc[0]) if n else "-",
+                       "top_dept_hospital": pnames.get(str(dg["plant"].iloc[0]), str(dg["plant"].iloc[0])) if n else "-",
                        "top1": float(dg["share"].iloc[0]) if n else 0.0, "top5": float(dg.head(5)["share"].sum()),
                        "top10": float(dg.head(10)["share"].sum()), "n80": n80, "hhi": float((dg["share"] ** 2).sum())},
             "departments": departments, "timeline": timeline, "matrix": matrix}
