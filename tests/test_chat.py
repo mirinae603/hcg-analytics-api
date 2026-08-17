@@ -7,6 +7,8 @@
 # exercised for real in the live smoke test (outside pytest) instead.
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests.conftest import ADMIN_EMAIL, ADMIN_PASSWORD, bearer, signup_and_approve
@@ -217,3 +219,170 @@ def test_list_chat_sessions_requires_auth(client):
 def test_get_nonexistent_session_is_404(client, admin_headers):
     r = client.get("/chat/sessions/424242", headers=admin_headers)
     assert r.status_code == 404
+
+
+# ---------- delete ----------
+
+def test_delete_session_removes_it_and_its_messages(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    client.post(f"/chat/sessions/{session['id']}/messages", json={"query": "hi"}, headers=admin_headers)
+
+    r = client.delete(f"/chat/sessions/{session['id']}", headers=admin_headers)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": True, "id": session["id"]}
+
+    assert client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).status_code == 404
+    ids = {s["id"] for s in client.get("/chat/sessions", headers=admin_headers).json()["sessions"]}
+    assert session["id"] not in ids
+
+
+def test_delete_nonexistent_session_is_404(client, admin_headers):
+    r = client.delete("/chat/sessions/424242", headers=admin_headers)
+    assert r.status_code == 404
+
+
+def test_delete_session_requires_auth(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    r = client.delete(f"/chat/sessions/{session['id']}")
+    assert r.status_code == 401
+
+
+def test_any_user_can_delete_any_session(client, admin_headers):
+    # "Chat is common": deletion follows the same shared-visibility model as list/view,
+    # already covered for those by test_different_logged_in_user_can_list_and_see_who_created_session.
+    creator_email = signup_and_approve(client, admin_headers, email="del-creator@example.com", password="password123")
+    creator_token = _signin(client, creator_email, "password123")
+    session = client.post("/chat/sessions", json={}, headers=bearer(creator_token)).json()
+
+    other_email = signup_and_approve(client, admin_headers, email="del-other@example.com", password="password123")
+    other_token = _signin(client, other_email, "password123")
+
+    r = client.delete(f"/chat/sessions/{session['id']}", headers=bearer(other_token))
+    assert r.status_code == 200, r.text
+    assert client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).status_code == 404
+
+
+# ---------- rename ----------
+
+def test_rename_session(client, admin_headers):
+    session = client.post("/chat/sessions", json={"title": "Original"}, headers=admin_headers).json()
+    r = client.patch(f"/chat/sessions/{session['id']}", json={"title": "Renamed"}, headers=admin_headers)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": session["id"], "title": "Renamed"}
+    assert client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).json()["title"] == "Renamed"
+
+
+def test_rename_does_not_reorder_updated_at(client, admin_headers):
+    # A rename must not bump updated_at -- that would jump the session to "Today" in the
+    # sidebar purely from a title edit, with no new conversation activity behind it.
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    before = client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).json()["updated_at"]
+    client.patch(f"/chat/sessions/{session['id']}", json={"title": "New name"}, headers=admin_headers)
+    after = client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).json()["updated_at"]
+    assert before == after
+
+
+def test_rename_blank_title_rejected(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    r = client.patch(f"/chat/sessions/{session['id']}", json={"title": "   "}, headers=admin_headers)
+    assert r.status_code in (400, 422)
+
+
+def test_rename_nonexistent_session_is_404(client, admin_headers):
+    r = client.patch("/chat/sessions/424242", json={"title": "x"}, headers=admin_headers)
+    assert r.status_code == 404
+
+
+def test_rename_requires_auth(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    r = client.patch(f"/chat/sessions/{session['id']}", json={"title": "x"})
+    assert r.status_code == 401
+
+
+# ---------- streaming endpoint ----------
+# Additive alongside POST .../messages (never modified): live step/sql/answer/done
+# events instead of one blocking response, persisting the same shape at the end.
+
+def _read_sse_events(response):
+    events = []
+    for line in response.iter_lines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload.strip() == '{"type": "end"}':
+            continue
+        events.append(json.loads(payload))
+    return events
+
+
+def test_stream_message_yields_live_events_and_persists(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    with client.stream(
+        "POST", f"/chat/sessions/{session['id']}/messages/stream",
+        json={"query": "What is our current inventory turnover?"}, headers=admin_headers,
+    ) as r:
+        assert r.status_code == 200
+        events = _read_sse_events(r)
+
+    types = [e["type"] for e in events]
+    assert "user_message" in types
+    assert "step" in types  # the whole point: live progress, not a silent wait
+    assert "answer" in types
+    assert "persisted" in types
+
+    persisted = next(e for e in events if e["type"] == "persisted")
+    assert persisted["assistant_message"]["role"] == "assistant"
+    assert "Fake answer to" in persisted["assistant_message"]["content"]["text"]
+
+    detail = client.get(f"/chat/sessions/{session['id']}", headers=admin_headers).json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+
+
+def test_stream_message_to_nonexistent_session_is_404_not_a_broken_stream(client, admin_headers):
+    r = client.post(
+        "/chat/sessions/424242/messages/stream",
+        json={"query": "hi"}, headers=admin_headers,
+    )
+    assert r.status_code == 404
+
+
+def test_stream_empty_message_is_400(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    r = client.post(
+        f"/chat/sessions/{session['id']}/messages/stream",
+        json={"query": "   "}, headers=admin_headers,
+    )
+    assert r.status_code in (400, 422)
+
+
+def test_stream_message_requires_auth(client, admin_headers):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    r = client.post(f"/chat/sessions/{session['id']}/messages/stream", json={"query": "hi"})
+    assert r.status_code == 401
+
+
+def test_stream_scope_threads_into_next_turn(client, admin_headers, monkeypatch):
+    # Regression test for the exact live bug this was built to fix: a follow-up used to
+    # get ZERO prior context because chat_service silently dropped the orchestrator's
+    # `scope` field instead of persisting it, so _latest_scope(history) always saw "".
+    seen_scope_in_history = {}
+
+    def _scoped_answer(query, history=None):
+        hist_text = json.dumps(history or [])
+        seen_scope_in_history[query] = "active scope" in hist_text
+        yield {"type": "answer", "text": f"reply to {query}", "verified": "ok",
+               "options": [], "scope": "category = INJECTIONS"}
+        yield {"type": "done"}
+
+    monkeypatch.setattr("app.ai.orchestrator.answer", _scoped_answer)
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+
+    with client.stream("POST", f"/chat/sessions/{session['id']}/messages/stream",
+                        json={"query": "injection turnover"}, headers=admin_headers) as r:
+        _read_sse_events(r)
+    with client.stream("POST", f"/chat/sessions/{session['id']}/messages/stream",
+                        json={"query": "and last month?"}, headers=admin_headers) as r:
+        _read_sse_events(r)
+
+    assert seen_scope_in_history["injection turnover"] is False  # nothing to inherit yet
+    assert seen_scope_in_history["and last month?"] is True  # must see turn 1's scope marker

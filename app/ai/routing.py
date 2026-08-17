@@ -134,10 +134,27 @@ def _ensure_corpus(client) -> list[list[float]] | None:
     return _corpus_vecs
 
 
-def hints_for(client, question: str, allow_locks: bool = True) -> str:
+MIN_SIM_REFINEMENT = 0.45   # stricter bar than MIN_SIM (0.32) when a prior scope is active
+
+
+def hints_for(client, question: str, allow_locks: bool = True, context: str | None = None) -> str:
     """Return a focused routing-hint block for `question`, or '' on any failure.
     Never raises — routing is strictly additive. `allow_locks=False` on a scoped refinement
-    so a hard entry-point lock can't override the conversation's active scope."""
+    so a hard entry-point lock can't override the conversation's active scope.
+
+    `context` (the active scope string, when this is a refinement) fixes a real, reproduced
+    bug: with no context, THIS retrieval embeds the bare question text alone, so a terse
+    temporal follow-up like "how does that compare to last month?" sits almost on top of
+    the corpus's "procurement spend variance month over month" exemplar by pure lexical
+    similarity — REGARDLESS of what the conversation is actually about. Live-verified: this
+    exact phrase hijacked 5/5 independent conversations (stock-out rate, high-risk
+    inventory, company margin, ITR, non-moving inventory) onto procurement spend every
+    time. `allow_locks=False` does NOT fix this — it only suppresses the two hand-written
+    regex _LOCKS, never this embedding corpus, which is the actual source of the hijack.
+    The general fix: embed the question WITH its active scope prepended, so retrieval
+    reflects the real topic, not just the isolated phrase — and raise the similarity bar
+    in this mode, since a genuine refinement should mostly lean on the ACTIVE SCOPE
+    instruction already in the prompt, not a fresh routing guess."""
     q = (question or "").strip()
     if not q:
         return ""
@@ -151,14 +168,21 @@ def hints_for(client, question: str, allow_locks: bool = True) -> str:
         vecs = _ensure_corpus(client)
         if not vecs:
             return lock_block
-        qv = _embed(client, [q])[0]
+        embed_text = f"{context.strip()} — {q}" if context and context.strip() else q
+        min_sim = MIN_SIM_REFINEMENT if context else MIN_SIM
+        qv = _embed(client, [embed_text])[0]
         scored = sorted(((_cosine(qv, v), i) for i, v in enumerate(vecs)), reverse=True)
-        picked = [(_CORPUS[i][1]) for sim, i in scored[:TOP_K] if sim >= MIN_SIM]
+        picked = [(_CORPUS[i][1]) for sim, i in scored[:TOP_K] if sim >= min_sim]
         hint_block = ""
         if picked:
             lines = "\n".join(f"• {h}" for h in picked)
+            precedence = (
+                " If any of these conflict with the ACTIVE SCOPE above, ACTIVE SCOPE wins — "
+                "the user is refining their prior question, not switching topics."
+                if context else ""
+            )
             hint_block = ("🎯 MOST RELEVANT PATTERNS FOR THIS QUESTION (routing hints — pick the "
-                          "table/approach these point to before writing SQL):\n" + lines)
+                          "table/approach these point to before writing SQL." + precedence + "):\n" + lines)
         return "\n\n".join(b for b in (lock_block, hint_block) if b)
     except Exception:
         return lock_block   # locks are pure-regex, always available even if embeddings fail

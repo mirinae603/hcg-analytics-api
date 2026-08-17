@@ -20,7 +20,7 @@ import os
 import re
 import time
 
-from app.ai import warehouse, semantics, charts, routing
+from app.ai import warehouse, semantics, charts, routing, kpi_registry
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
@@ -167,6 +167,7 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 {context}
 
 HOW YOU WORK — like a sharp, friendly human analyst:
+• NAMED KPI? If the question names or clearly maps to one of the KNOWN KPIS listed in get_kpi's own description, call get_kpi FIRST — it returns the exact same calculation the dashboard card for that metric uses, not a re-derived approximation. Only fall back to run_sql for that topic if get_kpi genuinely doesn't cover the specific cut being asked for (e.g. a single named item's detail, or a custom breakdown no KPI card offers). get_kpi accepts a specific hospital or category — try that argument before ever telling the user a breakdown "isn't available"; do not reason about whether it's queryable, just call it and see.
 • UNDERSTAND the real intent first. If the request is ANSWERABLE from the data but genuinely ambiguous or under-specified (unclear time range, which metric/entity), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
 • OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts). If asked for something the data simply doesn't contain — people/roles (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
 • SPECIFIC ITEM? For ANY question about a particular product/SKU (named or by code), call lookup_item FIRST. It returns the item's identity (generic, group, manufacturer, formulary status) and a COMPLETE footprint — the row count in EVERY table it touches (sales, PO, GRN, consumption, inventory, forecasts). This guarantees you never miss a source: an item with 0 sales/purchases but rows in fact_inventory is DEAD / NON-MOVING stock (report qty, aging, expiry, formulary) — never call that "no data". Then run_sql only the tables the footprint shows have rows.
@@ -183,9 +184,10 @@ HOW YOU WORK — like a sharp, friendly human analyst:
 • Be genuinely analytical: lead with the answer, then add the insight that matters (a concentration, a trend, a risk, a surprise). Respect caveats in the schema notes (e.g. manufacturer-of-purchases coverage). Put next-question ideas in follow_ups (clickable chips), not as a trailing question in the prose.
 • When your answer is scoped to a specific thing (a category, item, vendor, plant, or a ranked subset), ALWAYS fill present()'s `scope` field with the exact filters you used — this lets a terse follow-up ('which is cheapest', 'and their lead times') correctly inherit your scope instead of resetting to the whole company.
 • ⛔ MEMORY HONESTY: you only see the recent part of the conversation. If the user refers back to something "earlier" / "we found before" / "that item/number/figure" and it is NOT actually present in the conversation you can see (nor in the ACTIVE SCOPE), do NOT invent a plausible substitute and label it as the earlier finding — that is a confident hallucination. Instead say briefly that you don't have that earlier turn in view and ask them to restate it (offer to just re-run the analysis fresh). Running a NEW global query and presenting its result as "the one we found earlier" is a serious error.
-• If the data truly can't answer it, say so plainly and suggest the closest thing you CAN answer."""
+• If the data truly can't answer it, say so plainly and suggest the closest thing you CAN answer. NEVER assert impossibility from the shape of a table/column name alone, or because it "sounds" unsupported — try the actual call first (get_kpi with the plant/category argument, or a real run_sql query). If you already used a closely related dataset successfully earlier in this same conversation, that is strong evidence the dimension likely IS available — attempt it again before declaring it isn't, rather than declaring it isn't and then producing exactly that breakdown the moment the user pushes back."""
 
 
+GET_KPI_TOOL = kpi_registry.tool_schema()
 RUN_SQL_TOOL = {
     "type": "function", "function": {
         "name": "run_sql",
@@ -461,6 +463,41 @@ def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None)
 
 
 _SCOPE_MARK = re.compile(r"\[active scope:\s*(.+?)\s*\]", re.I | re.S)
+# Deterministic output filter, not a prompt instruction: the live persona audit found
+# "Plant" leaking into the model's own unprompted phrasing (opening prose, chart titles,
+# table column labels) in roughly half of sessions even after the system prompt already
+# said to use "Hospital" — including one case where the model ignored an EXPLICIT user
+# correction mid-conversation. Asking the model to remember this turn over turn keeps
+# failing; a regex applied once at the single choke point every answer already passes
+# through (here) cannot forget. Only touches user-visible prose/labels — SQL text and
+# column names in the "N queries run" disclosure are deliberately left alone, since
+# `plant` there is the real backend field name and misrepresenting the schema would be
+# actively wrong, not helpful.
+_PLANT_WORD = re.compile(r"\bplants?\b", re.I)
+
+
+def _plant_to_hospital(text: str | None) -> str | None:
+    if not text:
+        return text
+
+    def repl(m: re.Match) -> str:
+        w = m.group(0)
+        base = "Hospital" if w[0].isupper() else "hospital"
+        return base + "s" if w.lower().endswith("s") else base
+
+    return _PLANT_WORD.sub(repl, text)
+
+
+def _sanitize_prose(text: str | None) -> str | None:
+    """Apply to every piece of text that reaches the user: strips the internal
+    "[active scope: ...]" marker if it ever leaks into visible prose (it's meant to be
+    history-only, added by chat_service._history_for_orchestrator, never user-facing —
+    the audit found it leaking into a rendered answer once), then normalises plant/Plant
+    to hospital/Hospital."""
+    if not text:
+        return text
+    text = _SCOPE_MARK.sub("", text).strip()
+    return _plant_to_hospital(text)
 _WHERE_RE = re.compile(r"\bwhere\b(.+?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)", re.I | re.S)
 # Refinement cues: a terse follow-up that leans on the PRIOR turn's scope. We only inject
 # the prior scope for these — a full, self-contained new question (topic change) must NOT
@@ -555,7 +592,7 @@ def answer(query: str, history: list | None = None):
     # Embedding-based routing hint (fail-open: '' on any error → static examples carry it).
     # When a prior scope is active (a refinement), suppress hard intent-locks so they can't
     # override the vendor/item/category the user is drilling into.
-    hint = routing.hints_for(client, query, allow_locks=not prior_scope)
+    hint = routing.hints_for(client, query, allow_locks=not prior_scope, context=prior_scope or None)
     messages.append({"role": "user", "content": (hint + "\n\n" + query) if hint else query})
 
     results: list[dict] = []
@@ -563,6 +600,23 @@ def answer(query: str, history: list | None = None):
     present_from_content = False
     verified = None
     present_attempts = 0
+
+    # Provenance for the `verified` decision below: how many of this turn's results came
+    # from the canonical get_kpi tool (provably correct — it IS the dashboard's own
+    # calculation) versus free-form run_sql (only as reliable as the model's own query).
+    # A turn grounded ENTIRELY in canonical calls needs no LLM audit at all; a mix still
+    # goes through the existing _verify() gate below, unchanged.
+    canonical_kpis_used: list[str] = []
+    free_sql_result_count = 0
+    # Fallback scope description for a canonical-only turn. _derive_scope(results) parses a
+    # SQL WHERE clause and finds nothing from a get_kpi call (its "sql" field is a comment,
+    # not real SQL) -- confirmed live: a canonical answer's persisted `scope` came back None,
+    # which meant the NEXT turn's "how does that compare to last month?" had no active scope
+    # to defend and the routing-hint fix above never even engaged. The get_kpi call already
+    # carries exactly what a scope string needs (which KPI, which hospital/category); this
+    # just carries it forward instead of discarding it once get_kpi itself is now the
+    # majority path for a named-KPI question.
+    canonical_scope_hint: str = ""
 
     any_sql_failed = False
     for step_idx in range(MAX_SQL_STEPS):
@@ -575,7 +629,7 @@ def answer(query: str, history: list | None = None):
         try:
             resp = _chat(client,
                 model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
-                tools=[RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
+                tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
         except Exception as e:
             # Only reached after _chat exhausted its retries. If we already gathered real
             # results, hand those back honestly rather than throwing the whole turn away.
@@ -609,6 +663,46 @@ def answer(query: str, history: list | None = None):
                 pending_present = args
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "ok"})
                 continue
+            if tc.function.name == "get_kpi":
+                kpi_key = (args.get("kpi") or "").strip()
+                plant = (args.get("plant") or "").strip() or None
+                category = (args.get("category") or "").strip() or None
+                if kpi_key not in kpi_registry.KPI_REGISTRY:
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                      "content": json.dumps({"error": f"Unknown kpi '{kpi_key}'. Valid keys: {sorted(kpi_registry.KPI_REGISTRY)}"})})
+                    continue
+                label = kpi_registry.KPI_REGISTRY[kpi_key]["label"]
+                yield {"type": "step", "text": f"Looking up {label}" + (f" for {plant}" if plant else "")}
+                try:
+                    kr = kpi_registry.call_kpi(kpi_key, plant=plant, category=category)
+                    canonical_kpis_used.append(kpi_key)
+                    data = kr["data"]
+                    purpose = f"{label}" + (f" — {plant}" if plant else "") + (f" — {category}" if category else "")
+                    canonical_scope_hint = purpose + (" (company-wide)" if not plant and not category else "")
+                    # Also register as a chartable "result" using the EXISTING, already-tested
+                    # chart/table pipeline below (_auto_chart / _pick_result / the table
+                    # fallback) instead of a parallel one: scan for the first list-of-dicts
+                    # field in the response (every /insights route already returns at least
+                    # one — worst/best/tiers/by_plant/buckets/reasons/...) rather than
+                    # hardcoding a field name per KPI, which is exactly the kind of
+                    # per-question special-casing this fix is meant to avoid.
+                    chartable = None
+                    for v in data.values():
+                        if isinstance(v, list) and v and all(isinstance(row, dict) for row in v) and len(v) <= 200:
+                            chartable = v
+                            break
+                    yield {"type": "sql", "purpose": purpose,
+                           "sql": f"-- get_kpi('{kpi_key}', plant={plant!r}, category={category!r})  [canonical dashboard calculation, not a derived query]",
+                           "rows": len(chartable) if chartable else 1}
+                    if chartable:
+                        cols = list(chartable[0].keys())
+                        synth = {"sql": f"-- get_kpi('{kpi_key}')", "purpose": purpose,
+                                 "columns": cols, "rows": chartable, "row_count": len(chartable), "truncated": False}
+                        results.append(synth)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(data, default=str)[:6000]})
+                except Exception as e:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:300]})})
+                continue
             if tc.function.name == "lookup_item":
                 name = (args.get("name") or "").strip()
                 yield {"type": "step", "text": f"Locating “{name}” across all tables"}
@@ -627,6 +721,7 @@ def answer(query: str, history: list | None = None):
                 res = warehouse.run_sql(sql)
                 res["purpose"] = purpose
                 results.append(res)
+                free_sql_result_count += 1
                 yield {"type": "sql", "sql": res["sql"], "purpose": purpose, "rows": res["row_count"]}
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_result(res))})
             except Exception as e:
@@ -641,13 +736,25 @@ def answer(query: str, history: list | None = None):
         # AUDIT it before accepting — and on a real problem, send it back to re-query.
         if pending_present is not None:
             cand_ans = (pending_present.get("answer") or "").strip()
+            # A turn grounded ENTIRELY in get_kpi (the canonical dashboard calculation, never
+            # free-form SQL) is correct by construction — skip the fuzzy LLM audit rather than
+            # run it anyway. The audit found in the live persona audit that this self-assessed
+            # flag fires on exactly-correct answers and stays silent on real errors; running it
+            # on a provably-correct canonical answer keeps exactly that same miscalibration
+            # risk for the one case that should never need it. (A MIXED turn — canonical PLUS
+            # free SQL — still goes through the audit below unchanged, since the free-SQL part
+            # isn't guaranteed correct just because a canonical call also happened.)
+            is_canonical_only = bool(canonical_kpis_used) and free_sql_result_count == 0
             ok, issue, fix = True, "", ""
-            if results and cand_ans:
+            if is_canonical_only and cand_ans:
+                verified = "canonical"
+            elif results and cand_ans:
                 yield {"type": "step", "text": "Cross-checking the answer against the data"}
                 ok, issue, fix = _verify(client, query, results, cand_ans, history)
             if ok or present_attempts >= MAX_AUDIT_RETRIES:
                 present_args = pending_present
-                verified = ("corrected" if present_attempts > 0 else "ok") if (results and cand_ans) else None
+                if verified != "canonical":
+                    verified = ("corrected" if present_attempts > 0 else "ok") if (results and cand_ans) else None
                 if not ok:
                     verified = "flagged"   # auditor still unhappy after retries → no green badge
                 break
@@ -666,7 +773,7 @@ def answer(query: str, history: list | None = None):
         yield {"type": "done"}
         return
 
-    ans = (present_args.get("answer") or "").strip()
+    ans = _sanitize_prose((present_args.get("answer") or "").strip())
 
     # HONEST FAILURE: if the model gave up as free-text (no present() call) having gathered
     # ZERO successful query results after a SQL error, its prose is an ungrounded excuse —
@@ -687,8 +794,11 @@ def answer(query: str, history: list | None = None):
     chart_specs = [c for c in chart_specs if c]
 
     # If the answer came back as plain content (model didn't call present), it was never
-    # audited inline — audit it now so EVERY data-backed answer gets the same gate.
-    if verified is None and results and ans:
+    # audited inline — audit it now so EVERY data-backed answer gets the same gate. Same
+    # canonical-only exemption as the inline path above.
+    if verified is None and canonical_kpis_used and free_sql_result_count == 0 and ans:
+        verified = "canonical"
+    elif verified is None and results and ans:
         yield {"type": "step", "text": "Cross-checking the answer against the data"}
         ok, _issue, _fix = _verify(client, query, results, ans, history)
         verified = "ok" if ok else "flagged"
@@ -705,11 +815,23 @@ def answer(query: str, history: list | None = None):
     # mini-model are generated AFTER everything else has already reached the user (see the
     # "followups" patch event near the end) so this feature adds ZERO perceived latency to
     # the answer itself.
-    follow_ups = [str(f).strip() for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]
+    follow_ups = [_sanitize_prose(str(f).strip()) for f in (present_args.get("follow_ups") or []) if str(f).strip()][:3]
     # Scope chain: prefer the model's own declaration, else derive from the last query. If BOTH
     # are empty (e.g. a turn that answered from prior data with no new SQL), carry the PRIOR
     # scope forward so a chain of refinements doesn't get severed by one no-query turn.
-    scope = str(present_args.get("scope") or "").strip()[:300] or _derive_scope(results) or _latest_scope(history)
+    # `_derive_scope` legitimately returns "" for a genuinely unfiltered, company-wide
+    # query (nothing to describe) -- but that emptiness ALSO meant no TOPIC carried
+    # forward, even though "revenue and margin, company-wide" is a perfectly well-defined
+    # topic for the next turn's routing to anchor on. Confirmed live: an unfiltered
+    # "overall revenue and margin" answer left scope=None, so the very next "compare that
+    # to last month" had nothing to embed alongside it and hijacked to procurement spend
+    # anyway, even with the routing fix above in place. The query's own `purpose` string
+    # exists whenever ANY query ran this turn, filtered or not -- use it as a last-resort
+    # topic description before falling back to carrying the prior turn's scope forward.
+    scope = (str(present_args.get("scope") or "").strip()[:300]
+             or canonical_scope_hint or _derive_scope(results)
+             or (results[-1].get("purpose", "") if results else "")
+             or _latest_scope(history))
     yield {"type": "answer", "text": ans, "verified": verified, "options": follow_ups, "scope": scope}
 
     # CHARTS — use the model's spec(s), else auto-build one if the data is chartable
@@ -739,6 +861,11 @@ def answer(query: str, history: list | None = None):
             yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
             spec["value_format"] = infer_kind(str(yk))
         _enhance_spec(spec, res)
+        # Same terminology filter as the prose answer — the model writes chart titles
+        # itself and the audit found "Inventory Turnover Ratio by plant" shipped as a
+        # literal chart title in one session.
+        if spec.get("title"):
+            spec["title"] = _sanitize_prose(spec["title"])
         fig = charts.build(res["rows"], spec)
         if fig:
             yield {"type": "chart", "plotly": fig}
@@ -747,8 +874,12 @@ def answer(query: str, history: list | None = None):
     if not table_res and results:
         table_res = next((r for r in reversed(results) if _has_data(r)), None)
     if _has_data(table_res):
-        yield {"type": "table", "table": {"title": table_res.get("purpose", ""),
-                                          "columns": [{"key": c, "label": c, "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
+        # `key` stays the RAW column name (rows are dicts keyed by it — changing it would
+        # break every row lookup); only the human-facing `label` goes through the same
+        # plant->hospital filter as everything else the user reads. The audit's exact
+        # example was a table column literally labeled "plant".
+        yield {"type": "table", "table": {"title": _sanitize_prose(table_res.get("purpose", "")),
+                                          "columns": [{"key": c, "label": _sanitize_prose(c), "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
                                           "rows": table_res["rows"][:50]},
                "note": ("Showing top 50 of %d rows." % table_res["row_count"]) if table_res.get("truncated") or table_res["row_count"] > 50 else ""}
 

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import HTTPException
+from sqlalchemy import update as _sa_update
 from sqlalchemy.orm import Session
 
 from app.ai import orchestrator
@@ -49,7 +50,20 @@ def _serialize_message(m: ChatMessage) -> Dict:
 def _history_for_orchestrator(session: ChatSession) -> List[Dict]:
     """Rebuild the plain {role, content} history app.ai.orchestrator.answer expects
     from what's actually stored (assistant turns are stored as a JSON envelope, so pull
-    just the text back out for conversational context)."""
+    just the text back out for conversational context).
+
+    Also re-embeds the "[active scope: …]" marker orchestrator._latest_scope() looks
+    for. That marker was designed for the OLD ephemeral /ai/chat flow, where the
+    FRONTEND appended it to the content it echoed back as history on the next turn.
+    The session-backed path never had frontend echoing at all — history is rebuilt
+    here, straight from the DB — so without this the marker could never appear and
+    orchestrator.answer() always saw prior_scope="" on every follow-up. That's not
+    hypothetical: it was caught live — "how does that compare to last month?" right
+    after an inventory-turnover-ratio answer came back discussing procurement spend
+    instead, because the model had zero idea what "that" referred to. `scope` is
+    already computed and yielded by orchestrator.answer() on every "answer" event (see
+    orchestrator.py's `scope = ...` line just above `yield {"type": "answer", ...}`);
+    the bug was purely that this file discarded it instead of storing it."""
     history: List[Dict] = []
     for m in session.messages:
         if m.role == "user":
@@ -58,8 +72,11 @@ def _history_for_orchestrator(session: ChatSession) -> List[Dict]:
             try:
                 parsed = json.loads(m.content)
                 text = parsed.get("text", "") if isinstance(parsed, dict) else str(parsed)
+                scope = parsed.get("scope") if isinstance(parsed, dict) else None
             except (TypeError, ValueError):
-                text = m.content
+                text, scope = m.content, None
+            if scope:
+                text = f"{text}\n\n[active scope: {scope}]"
             history.append({"role": "assistant", "content": text})
     return history
 
@@ -81,6 +98,7 @@ def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
     table = None
     queries: List[Dict] = []
     kind = "answer"
+    scope: Optional[str] = None
     try:
         for ev in orchestrator.answer(query, history):
             t = ev.get("type")
@@ -88,6 +106,9 @@ def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
                 text = ev.get("text")
                 verified = ev.get("verified")
                 options = ev.get("options") or options
+                # See _history_for_orchestrator's docstring: dropping this is exactly what
+                # broke multi-turn follow-ups (every prior scope silently reset to "").
+                scope = ev.get("scope") or scope
             elif t == "chart":
                 chart = ev.get("plotly")
             elif t == "table":
@@ -115,7 +136,7 @@ def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
         kind = "error"
 
     return {"text": text, "verified": verified, "options": options, "chart": chart,
-            "table": table, "queries": queries, "kind": kind}
+            "table": table, "queries": queries, "kind": kind, "scope": scope}
 
 
 # ---------- public API ----------
@@ -163,6 +184,134 @@ def get_session_detail(db: Session, session_id: int) -> Dict:
         "created_by": _user_public(creator),
         "messages": [_serialize_message(m) for m in session.messages],
     }
+
+
+def delete_session(db: Session, session_id: int) -> None:
+    """Hard delete. `cascade="all, delete-orphan"` on ChatSession.messages (models.py)
+    means db.delete(session) removes every message too — verified via the ORM object,
+    not a raw bulk DELETE, which is what actually triggers that cascade.
+
+    "Chat is common" (see this file's module docstring): the same design that lets any
+    signed-in user list/open/post to any session also lets any signed-in user delete
+    any session, not just their own. Not a gap — a deliberate extension of the existing
+    visibility model already covered by test_admin_can_see_a_members_session and
+    test_different_logged_in_user_can_list_and_see_who_created_session."""
+    session = get_session_or_404(db, session_id)
+    db.delete(session)
+    db.commit()
+
+
+def rename_session(db: Session, session_id: int, title: str) -> Dict:
+    session = get_session_or_404(db, session_id)
+    clean = (title or "").strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Title is required")
+    # A rename isn't new conversation activity, and bumping updated_at would reorder the
+    # sidebar (jump the session to "Today") purely from a title edit. The column has
+    # onupdate=_utcnow (models.py), which fires whenever the row is UPDATEd and that
+    # column has no explicit value in the SAME statement. Re-assigning `session.updated_at
+    # = session.updated_at` through the ORM does NOT count as "explicit" for this purpose
+    # -- with nothing changed, SQLAlchemy's dirty-tracking leaves it out of the SET clause
+    # entirely, so onupdate still wins. (Caught by test_rename_does_not_reorder_updated_at,
+    # which asserts on the actual timestamp, not just that the title changed -- the first
+    # version of this fix looked right and still silently failed it.) A Core-level UPDATE
+    # naming both columns explicitly is unambiguous: onupdate only fires for a column
+    # genuinely absent from .values().
+    original_updated_at = session.updated_at
+    db.execute(
+        _sa_update(ChatSession)
+        .where(ChatSession.id == session_id)
+        .values(title=clean[:200], updated_at=original_updated_at)
+    )
+    db.commit()
+    db.refresh(session)
+    return {"id": session.id, "title": session.title}
+
+
+def stream_message_events(db: Session, session_id: int, query: str):
+    """Generator of SSE-shaped event dicts for a session-backed turn — the live-progress
+    counterpart to post_message(). Reuses orchestrator.answer() exactly as post_message
+    does (same history, same audit gate), but yields step/sql/answer/chart/table/done AS
+    THEY HAPPEN instead of consolidating them into one blocking response, then persists
+    the same consolidated shape post_message would have stored, once, after "done".
+
+    Deliberately ADDITIVE: POST /chat/sessions/{id}/messages (post_message, above) is
+    left completely untouched, so none of the 12 existing tests in test_chat.py change
+    behaviour. This is a new route the frontend opts into; the old one stays a working,
+    tested fallback.
+
+    The user's message is persisted FIRST, before any streaming starts — so if the
+    client disconnects mid-answer (closed tab, network drop), the question they asked
+    is never lost, only the reply. Same durability guarantee post_message already gives
+    the user side; this extends it to the reply side by accumulating exactly what
+    _run_ai_turn accumulates and writing it once the stream concludes.
+    """
+    session = get_session_or_404(db, session_id)
+    query = (query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    history = _history_for_orchestrator(session)
+
+    user_msg = ChatMessage(session_id=session.id, role="user", content=query)
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
+    yield {"type": "user_message", "message": _serialize_message(user_msg)}
+
+    text: Optional[str] = None
+    verified: Optional[str] = None
+    options: List[str] = []
+    chart = None
+    table = None
+    queries: List[Dict] = []
+    kind = "answer"
+    scope: Optional[str] = None
+
+    try:
+        for ev in orchestrator.answer(query, history):
+            t = ev.get("type")
+            if t == "answer":
+                text = ev.get("text"); verified = ev.get("verified")
+                options = ev.get("options") or options
+                scope = ev.get("scope") or scope
+            elif t == "chart":
+                chart = ev.get("plotly")
+            elif t == "table":
+                tbl = ev.get("table")
+                table = {**tbl, "note": ev.get("note", "")} if tbl else None
+            elif t == "sql":
+                queries.append({"purpose": ev.get("purpose"), "sql": ev.get("sql"),
+                                 "rows": ev.get("rows"), "error": ev.get("error")})
+            elif t == "followups":
+                options = ev.get("options") or options
+            elif t == "clarify":
+                text = ev.get("text"); options = ev.get("options") or options; kind = "clarify"
+            elif t == "error":
+                text = ev.get("text"); kind = "error"
+            # Forward every event live — "step"/"done" included, so the UI can show real
+            # progress instead of a single frozen spinner label for the whole turn.
+            yield ev
+    except Exception as e:  # the orchestrator/Azure call itself blew up mid-stream
+        text = f"The AI Analyst hit an error answering that: {e}"
+        kind = "error"
+        yield {"type": "error", "text": text}
+
+    if text is None:
+        text = "I couldn't generate a response for that."
+        kind = "error"
+
+    reply = {"text": text, "verified": verified, "options": options, "chart": chart,
+             "table": table, "queries": queries, "kind": kind, "scope": scope}
+
+    assistant_msg = ChatMessage(session_id=session.id, role="assistant", content=json.dumps(reply))
+    db.add(assistant_msg)
+    session.updated_at = datetime.now(timezone.utc)
+    db.add(session)
+    db.commit()
+    db.refresh(assistant_msg)
+
+    yield {"type": "persisted", "assistant_message": _serialize_message(assistant_msg)}
 
 
 def post_message(db: Session, session_id: int, query: str) -> Dict:

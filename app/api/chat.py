@@ -6,9 +6,11 @@
 # and app/ai/orchestrator.py for the actual AI-answering logic this wraps.
 from __future__ import annotations
 
+import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -22,6 +24,10 @@ router = APIRouter()
 
 class CreateSessionRequest(BaseModel):
     title: Optional[str] = None
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(..., min_length=1)
 
 
 class PostMessageRequest(BaseModel):
@@ -63,3 +69,50 @@ async def post_chat_message(
     _user: User = Depends(get_current_user),
 ):
     return chat_service.post_message(db, session_id, req.query)
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    chat_service.delete_session(db, session_id)
+    return {"deleted": True, "id": session_id}
+
+
+@router.patch("/chat/sessions/{session_id}")
+async def rename_chat_session(
+    session_id: int,
+    req: RenameSessionRequest,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    return chat_service.rename_session(db, session_id, req.title)
+
+
+@router.post("/chat/sessions/{session_id}/messages/stream")
+async def post_chat_message_stream(
+    session_id: int,
+    req: PostMessageRequest,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Live-progress counterpart to POST .../messages (above), which is left completely
+    untouched. Validates eagerly -- same 404/400 semantics as every other route here --
+    BEFORE constructing the StreamingResponse: a generator's body doesn't run until it
+    is first iterated, i.e. after headers (a 200) have already gone out, so a bad
+    session id or empty query must still fail with a normal REST status here, not a 200
+    stream that then carries an error event."""
+    chat_service.get_session_or_404(db, session_id)
+    if not (req.query or "").strip():
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    def gen():
+        for ev in chat_service.stream_message_events(db, session_id, req.query):
+            yield f"data: {json.dumps(ev)}\n\n"
+        yield "data: {\"type\": \"end\"}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                                       "X-Accel-Buffering": "no"})
