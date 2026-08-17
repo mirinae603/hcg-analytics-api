@@ -162,6 +162,39 @@ def _format_result(res: dict, limit: int = 30) -> dict:
             "truncated": res.get("truncated", False)}
 
 
+def _format_kpi_payload(obj, _depth: int = 0):
+    """Pre-format a get_kpi() response the SAME way run_sql rows already are (_format_result
+    above) before it ever reaches the model as a tool result. get_kpi's raw dict/list payload
+    is straight from the KPI function — real rupee/day/percent values, e.g.
+    bands[0]['value'] == 300210253.64 — with none of run_sql's column-name-aware ₹Cr/L
+    formatting applied. Caught live: the model did its OWN ₹Cr conversion on that raw number
+    and divided by 1e6 instead of 1e7, printing "₹300.21 Cr" in its prose for a real ₹30.02 Cr
+    figure — every band in that answer was off by exactly 10x, while the deterministic
+    chart/table (built from the same raw numbers via _fmt(), never by the model) stayed
+    correct. Canonical (get_kpi-only) answers skip the LLM auditor entirely (see
+    is_canonical_only below) on the assumption the NUMBERS are correct by construction --
+    true, but that guarantee never covered the model's own prose arithmetic on an unformatted
+    payload. This walks the dict/list tree recursively and replaces any numeric leaf whose KEY
+    reads as money/percent/days with the identical pre-formatted string run_sql gets, so the
+    model quotes it verbatim instead of re-deriving it. Only touches the copy sent to the
+    model — the raw `data` object used for `chartable`/the deterministic chart pipeline is
+    untouched, so chart/table values keep coming from code, never model math."""
+    if _depth > 6:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                kind = infer_kind(str(k))
+                out[k] = _fmt(v, kind) if kind != "num" else v
+            else:
+                out[k] = _format_kpi_payload(v, _depth + 1)
+        return out
+    if isinstance(obj, list):
+        return [_format_kpi_payload(v, _depth + 1) for v in obj]
+    return obj
+
+
 SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question about the data by writing DuckDB SQL against the warehouse below and reasoning over the REAL results. You never invent numbers.
 
 {context}
@@ -699,7 +732,7 @@ def answer(query: str, history: list | None = None):
                         synth = {"sql": f"-- get_kpi('{kpi_key}')", "purpose": purpose,
                                  "columns": cols, "rows": chartable, "row_count": len(chartable), "truncated": False}
                         results.append(synth)
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(data, default=str)[:6000]})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_kpi_payload(data), default=str)[:6000]})
                 except Exception as e:
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:300]})})
                 continue

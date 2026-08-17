@@ -7,7 +7,7 @@
 # regression guard for the deterministic fix, not the prompt.
 from __future__ import annotations
 
-from app.ai.orchestrator import _plant_to_hospital, _sanitize_prose
+from app.ai.orchestrator import _plant_to_hospital, _sanitize_prose, _format_kpi_payload
 
 
 def test_plant_to_hospital_preserves_case_and_plurality():
@@ -49,3 +49,39 @@ def test_sanitize_prose_applies_plant_filter_after_stripping_marker():
     assert "[active scope" not in out
     assert "hospital" in out.lower()
     assert "plant" not in out.lower()
+
+
+# --- _format_kpi_payload -----------------------------------------------------------
+# Live bug caught by asking the deployed AI Analyst a real question: get_kpi's raw
+# payload (bands[0]['value'] == 300210253.64, real rupees) reached the model
+# UNFORMATTED, so the model did its own Cr conversion in prose and divided by 1e6
+# instead of 1e7 -- every band in that answer was off by exactly 10x ("₹300.21 Cr" for
+# a real ₹30.02 Cr), while the deterministic chart/table built from the same raw number
+# via _fmt() stayed correct. Canonical (get_kpi-only) answers skip the LLM auditor
+# entirely, so nothing else was there to catch a wrong PROSE number derived from a
+# right raw one. This is the regression guard for pre-formatting the payload before
+# it ever reaches the model, so it only ever has to quote, never convert.
+def test_format_kpi_payload_formats_nested_money_field():
+    raw = {"bands": [{"key": "critical", "label": "< 15 days", "count": 21558, "value": 300210253.64}]}
+    out = _format_kpi_payload(raw)
+    assert out["bands"][0]["value"] == "₹30.02 Cr"
+    # non-money fields must stay untouched (count is a plain number, not a rupee value)
+    assert out["bands"][0]["count"] == 21558
+
+
+def test_format_kpi_payload_formats_days_and_percent_and_leaves_labels():
+    raw = {"totals": {"median_doh": 16.574645047467023, "fresh_pct": 71.96, "skus": 18080},
+           "label": "not a number"}
+    out = _format_kpi_payload(raw)
+    assert out["totals"]["median_doh"] == "17 d"
+    assert out["totals"]["fresh_pct"] == "72.0%"
+    assert out["totals"]["skus"] == 18080  # plain count, no unit to convert
+    assert out["label"] == "not a number"
+
+
+def test_format_kpi_payload_handles_none_and_non_numeric_leaves():
+    raw = {"value": None, "name": "M065-INJECTIONS", "nested": {"cost": None}}
+    out = _format_kpi_payload(raw)
+    assert out["value"] is None
+    assert out["name"] == "M065-INJECTIONS"
+    assert out["nested"]["cost"] is None
