@@ -1879,7 +1879,12 @@ def _forecasting_overview_cached(pl, cat=None):
     g = fs.groupby("pd").agg(actual=("sales_quantity", "sum"), fc=("sales_quantity_forecast", "sum"),
                              lo=("lower_bound_sales_quantity_forecast", "sum"), hi=("upper_bound_sales_quantity_forecast", "sum"),
                              cf=("cashflow_forecast", "sum"), cflo=("lower_bound_cashflow_forecast", "sum"),
-                             cfhi=("upper_bound_cashflow_forecast", "sum")).reset_index().sort_values("pd")
+                             cfhi=("upper_bound_cashflow_forecast", "sum"),
+                             # RUPEE actuals, for cashflow_last_actual below. `actual` above is
+                             # sales_quantity (UNITS) -- a units figure can't be the denominator of
+                             # a money delta, which is why this column had to be added rather than
+                             # reusing it.
+                             cfact=("sales_value", "sum")).reset_index().sort_values("pd")
     timeline = []
     for _, r in g.iterrows():
         isf = float(r["fc"]) > 0
@@ -1891,6 +1896,15 @@ def _forecasting_overview_cached(pl, cat=None):
     fcr = [t for t in timeline if t["is_forecast"]]
     cashflow = [{"label": r["pd"].strftime("%b"), "forecast": float(r["cf"]), "lower": float(r["cflo"]), "upper": float(r["cfhi"])}
                 for _, r in g.iterrows() if float(r["cf"]) > 0]
+    # Last month of REAL spend, so the overview's "Money to restock" tile can show the same
+    # forecast-vs-last-actual delta the Cash-Flow page's own headline shows (its
+    # CashflowForecastDetail BudgetSummary: (forecast[0] - lastActual)/lastActual).
+    # `cashflow` above holds ONLY forecast months (it filters cf > 0), so the overview had no
+    # actual to compare against and computed its delta forecast[last] vs forecast[0] instead --
+    # which is structurally ~0.0% for a flat horizon and read as "no change vs current spend"
+    # while the Cash-Flow page one click away showed the real +52% for the identical metric.
+    _cf_acts = [float(r["cfact"]) for _, r in g.iterrows() if float(r["cfact"]) > 0]
+    cashflow_last_actual = _cf_acts[-1] if _cf_acts else 0.0
 
     need = rp[rp["replenishment_quantity"] > 0].copy()
     need["val"] = need["reorder_value"]
@@ -1930,7 +1944,8 @@ def _forecasting_overview_cached(pl, cat=None):
                        "mape": accd.get("Weighted MAPE %", 0.0), "series": int(accd.get("Series count", 0)),
                        "replen_skus": replen_skus, "replen_qty": replen_qty, "replen_value": replen_value,
                        "replen_now_skus": replen_now_skus, "replen_now_value": replen_now_value,
-                       "cashflow_next": cashflow[0]["forecast"] if cashflow else 0.0, "horizon": len(fcr)},
+                       "cashflow_next": cashflow[0]["forecast"] if cashflow else 0.0,
+                       "cashflow_last_actual": cashflow_last_actual, "horizon": len(fcr)},
             "timeline": timeline, "cashflow": cashflow, "radar": radar, "aging": aging,
             "top_reorder": top_reorder, "cards": cards,
             "reorder": reorder, "priority": priority,
@@ -2166,6 +2181,39 @@ def _priority_bands_summary(need):
     return out
 
 
+def _value_disclosure(priced_lines: int, lines: int, zero_stock_lines: int) -> str:
+    """The rupee-coverage caveat shown under the reorder queue.
+
+    Derives the zero-stock / no-cost split from the real counts instead of asserting a
+    single blanket reason, because the split is overwhelming but never exactly total: at
+    All Plants 15,878 of 15,885 unpriced lines are zero-stock, and the residual varies by
+    filter (100% for most plants, 99.37% for the Lab category). Stating "the rest are lines
+    at zero stock" flat would be a small lie under some filters; stating both numbers is
+    true under all of them, including the edge cases where one side is 0 and the sentence
+    would otherwise read "...and 0 with no cost recorded".
+    """
+    pct = round(priced_lines / lines * 100, 1) if lines else 0.0
+    head = f"Rupee figures cover {priced_lines:,} of {lines:,} lines ({pct}%)."
+    unpriced = lines - priced_lines
+    if unpriced <= 0:
+        return f"{head} Every line is priced."
+    other = max(unpriced - zero_stock_lines, 0)
+    # Unit cost here is closing_stock_value / closing_stock — undefined once the shelf is
+    # empty, which is why an out-of-stock line (the most urgent kind) is also the kind that
+    # cannot carry a price. Worth saying plainly: read as a bare data gap, it sends people
+    # looking for a missing feed that does not exist.
+    why = ("unit cost is derived from stock on hand, so a line already at zero stock has no "
+           "cost to derive")
+    if zero_stock_lines and other:
+        rest = (f" Of the {unpriced:,} without a price, {zero_stock_lines:,} are already at zero "
+                f"stock ({why}); the other {other:,} carry no recorded cost.")
+    elif zero_stock_lines:
+        rest = f" All {unpriced:,} without a price are already at zero stock — {why}."
+    else:
+        rest = f" The {unpriced:,} without a price carry no recorded cost in the source data."
+    return f"{head}{rest} Line and quantity counts are complete."
+
+
 def _reorder_totals(rp, need):
     priced = need[need["priced"]]
     lines = int(len(need))
@@ -2179,10 +2227,21 @@ def _reorder_totals(rp, need):
         "unpriced_lines": lines - int(len(priced)),
         "out_of_stock_lines": int((need["priority_band"] == 1).sum()),
         "under_1mo_lines": int(need["priority_band"].isin([1, 2, 3]).sum()),
-        "value_disclosure": (
-            f"Rupee figures cover {len(priced)} of {lines} lines "
-            f"({round(len(priced) / lines * 100, 1) if lines else 0.0}%) — the rest carry "
-            "no unit cost in the source data. Line and quantity counts are complete."),
+        # Says WHY the rest are unpriced, because the reason is specific and actionable
+        # rather than a generic data gap: unit_cost in stock_replenishment_and_aging_risk is
+        # derived as closing_stock_value / closing_stock, which is undefined at zero stock —
+        # so the unpriced lines are almost exactly the stock-out lines (verified: 15,878 of
+        # 15,885 unpriced lines have closing_stock == 0). The old wording ("carry no unit cost
+        # in the source data") read as "this data is missing", which sent anyone investigating
+        # toward the wrong fix. NOTE for anyone tempted to backfill these from fact_grn's
+        # net_price: that is NOT a valid substitute — GRN price is per PURCHASE pack while
+        # replenishment_quantity is in individual stock units, and no pack-size/UOM conversion
+        # exists anywhere in this dataset (checked fact_grn, fact_po, dim_material). Verified
+        # live: multiplying them straight inflates the requisition to ~Rs 910 Cr, above the
+        # entire 6-month procurement spend of Rs 649.91 Cr, because e.g. "CUVETTES 500 NOS
+        # PACK" prices Rs 7,000 per 500-unit pack against 368,868 individual units.
+        "value_disclosure": _value_disclosure(
+            len(priced), lines, int((need["priority_band"] == 1).sum())),
     }
 
 

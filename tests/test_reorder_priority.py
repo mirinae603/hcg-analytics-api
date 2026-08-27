@@ -116,7 +116,10 @@ def test_pricing_gap_is_disclosed_not_hidden(rp):
     assert t["reorder_value_priced"] == pytest.approx(PRICED_VALUE, abs=1.0)
     assert t["priced_share_pct"] == pytest.approx(16.5, abs=0.1)
     assert t["out_of_stock_lines"] == STOCKOUT_LINES
-    assert "16.5%" in t["value_disclosure"] and str(NEEDS_REORDER) in t["value_disclosure"]
+    # Thousands-separated: the disclosure is one long sentence carrying several 5-digit
+    # counts, so "19,014" reads where "19014" does not. Intent is unchanged — the caveat
+    # must still state the real priced share and the real total.
+    assert "16.5%" in t["value_disclosure"] and f"{NEEDS_REORDER:,}" in t["value_disclosure"]
 
 
 # ---------- the endpoint ----------
@@ -184,3 +187,43 @@ def test_risk_items_priority_mode_is_additive(client):
     new = client.get("/forecast/risk-items?kind=priority&limit=5").json()
     assert new["count"] == NEEDS_REORDER
     assert new["items"][0]["priority_band"] == 1
+
+
+# ── rupee-coverage disclosure ────────────────────────────────────────────────
+# The reorder queue can only price ~16.5% of its lines, and the reason is specific:
+# unit_cost is closing_stock_value / closing_stock, which is undefined once stock hits
+# zero — so the UNPRICED lines are very nearly the OUT-OF-STOCK lines (the most urgent
+# band). The disclosure used to assert a flat "the rest carry no unit cost in the source
+# data", which read as a missing feed and pointed anyone investigating at the wrong fix.
+# It now derives the zero-stock / no-cost split from real counts, because that split is
+# overwhelming but never exactly total (99.37%–100% depending on the filter).
+def test_value_disclosure_reports_the_real_priced_share(client):
+    t = client.get("/forecast/reorder-priority").json()["totals"]
+    d = t["value_disclosure"]
+    assert f"{t['priced_lines']:,}" in d and f"{t['reorder_lines']:,}" in d
+    assert f"{t['priced_share_pct']}%" in d
+    # counts stay complete even though rupees don't — that promise must survive rewording
+    assert "Line and quantity counts are complete." in d
+
+
+def test_value_disclosure_explains_zero_stock_rather_than_a_missing_feed(client):
+    d = client.get("/forecast/reorder-priority").json()["totals"]["value_disclosure"]
+    assert "zero stock" in d
+    assert "derived from stock on hand" in d
+
+
+def test_value_disclosure_split_adds_up_and_covers_its_edge_cases():
+    from app.api.legacy_kpi import _value_disclosure
+    # normal: 15,885 unpriced = 15,878 zero-stock + 7 with no recorded cost
+    d = _value_disclosure(3129, 19014, 15878)
+    assert "15,885" in d and "15,878" in d and "the other 7" in d
+    # every unpriced line is a stock-out -> no dangling ", and 0 with no cost recorded"
+    only_zero = _value_disclosure(100, 200, 100)
+    assert "All 100" in only_zero and "the other" not in only_zero
+    # none are stock-outs -> must NOT claim zero stock is the reason
+    none_zero = _value_disclosure(100, 200, 0)
+    assert "no recorded cost" in none_zero and "already at zero stock" not in none_zero
+    # fully priced -> no caveat about missing rupees at all
+    assert _value_disclosure(50, 50, 0).endswith("Every line is priced.")
+    # empty selection must not ZeroDivisionError
+    assert _value_disclosure(0, 0, 0)
