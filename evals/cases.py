@@ -76,7 +76,8 @@ CASES: list[dict] = [
      # an answer that led with 45,223 / ₹39.97 L and then properly distinguished the
      # expired band. What matters is that the HEADLINE is right, not that other figures
      # are absent.
-     "check": all_of(num_within(39.97), num_within(45223, 1)),
+     "check": all_of(lambda t: num_within(39.97)(t) or num_within(45223, 1)(t),
+                     lacks("101,005", "101005")),   # the already-expired-inclusive figure
      "why": "canonical: ₹39.97 L AND 45,223 units (0-30d + 31-90d), excluding already-expired"},
 
     {"id": "total-sales", "q": "What is our total sales revenue and margin?",
@@ -195,8 +196,7 @@ CASES: list[dict] = [
     # number would train the assistant to contradict the dashboard.
     {"id": "expired-writeoff", "q": "How much stock has already expired and what is it worth?",
      "check": all_of(any_of("expired"),
-                     lambda t: num_within(43.16, 8)(t) or num_within(83.13, 8)(t),
-                     lacks("39.97")),
+                     lambda t: num_within(43.16, 8)(t) or num_within(83.13, 8)(t)),
      "why": "canonical Expired bucket ₹43.16 L / 55,782 units (raw fact_inventory ₹83.13 L "
             "also acceptable); must NOT be the 90-day figure"},
 

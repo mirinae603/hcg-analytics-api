@@ -418,6 +418,13 @@ def answer(query: str, history: list | None = None):
         if hits:
             resolved_where[cand] = [f"{h['table']}.{h['column']}" for h in hits[:4]]
     if resolved_where:
+        # BIND them, do not merely mention them. A lesson saying "'Bangalore' exists only in
+        # dim_plant.plant_name" was read past, and the engine still reported "KEYTRUDA
+        # ₹10.78 Cr in Bangalore hospitals" from a sales table a city cannot reach. Adding
+        # the names to entity_tokens makes missing_entity_scope REJECT any query that does
+        # not reference them, so a sales query claiming to be city-filtered cannot run at
+        # all — which is the only way this stops being a matter of the model's attention.
+        entity_tokens.extend(resolved_where.keys())
         for name, places in resolved_where.items():
             lessons.append(f"'{name}' exists ONLY in {', '.join(places)} — any figure claimed to be "
                            f"about it must come from a query that filters one of those columns. "
