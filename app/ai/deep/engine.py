@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from app.ai import charts, scope, warehouse
-from app.ai.deep import capability, llm, schemas, tools
+from app.ai.deep import capability, llm, schemas, shapes, tools
 
 MAX_SUBQUESTIONS = 6
 MAX_ROUNDS = 2          # investigate → critique → (one more investigate) → stop
@@ -122,12 +122,23 @@ def _fmt(v, kind: str) -> str:
 
 
 def _chart_title(finding: dict, measure: str) -> str:
-    """A short label. `purpose` is the analyst's intent sentence, not a heading."""
-    q = (finding["sub"].get("question") or "").strip().rstrip("?")
+    """A short label describing WHAT IS PLOTTED.
+
+    It used to take the planner's sub-question verbatim, which produced "What is the sales
+    trend of Keytruda across different plants" sitting above a chart of monthly PURCHASING
+    quantities — a heading that contradicted both the data and the brief's own opening
+    line. The measure is what is actually on the axis, so it names the chart; the
+    sub-question is only a fallback, and never when it says "sales" over non-sales data.
+    """
+    m = (measure or "").replace("_", " ").strip()
+    q = _hospitalise((finding["sub"].get("question") or "").strip().rstrip("?"))
+    if m:
+        title = m[0].upper() + m[1:]
+        # keep the entity if the sub-question named one and the measure alone is generic
+        return _hospitalise(title)
     if 3 < len(q) <= 70:
         return q[0].upper() + q[1:]
-    m = measure.replace("_", " ").strip()
-    return (m[0].upper() + m[1:]) if m else "Result"
+    return "Result"
 
 
 def _order_rows(res: dict) -> dict:
@@ -178,8 +189,10 @@ def _table_payload(res: dict, title: str) -> dict:
     cols = res.get("columns") or []
     rows = res.get("rows") or []
     kinds = {c: _kind(c, rows) for c in cols}
-    return {"title": title,
-            "columns": [{"key": c, "label": c, "kind": kinds[c]} for c in cols],
+    # Column labels reach the PDF export as well as the screen, and "plant" was still
+    # arriving there long after the prose said "hospital".
+    return {"title": _hospitalise(title),
+            "columns": [{"key": c, "label": _hospitalise(c), "kind": kinds[c]} for c in cols],
             "rows": rows[:50]}
 
 
@@ -211,6 +224,100 @@ def _hospitalise(text: str) -> str:
     return _PLANT_RE.sub(sub, text or "")
 
 
+# Which measure family a table belongs to. Kept as prefixes so a new mart lands in the
+# right family automatically.
+_FAMILY_TABLES = {
+    "sales":       ("sales_by_", "sales_monthly", "sales_totals", "forecast_sales"),
+    "purchasing":  ("fact_po", "fact_grn", "mart_procurement", "kpi_purchase", "kpi_monthly_purchase",
+                    "kpi_vendor_volume", "kpi_procurement", "mart_material_vendor", "mart_material_price"),
+    "consumption": ("fact_consumption", "kpi_units_consumed", "kpi_billable_consumption",
+                    "kpi_consumption_by_department"),
+    "stock":       ("fact_inventory", "kpi_stock", "kpi_doh", "kpi_aging", "kpi_near_expiry",
+                    "kpi_inventory_aging", "kpi_non_moving"),
+}
+_FAMILY_WORDS = {
+    "sales":       ("sales", "sold", "selling", "revenue", "billed", "turnover"),
+    "purchasing":  ("purchase", "purchasing", "procure", "procurement", "bought", "po ", "vendor spend"),
+    "consumption": ("consumption", "consumed", "usage", "used", "issued"),
+    "stock":       ("stock", "inventory", "on hand", "expiry", "expiring", "aging"),
+}
+
+
+def _family_of_table(sql: str) -> str | None:
+    low = (sql or "").lower()
+    for fam, prefixes in _FAMILY_TABLES.items():
+        if any(p in low for p in prefixes):
+            return fam
+    return None
+
+
+def _family_asked(question: str) -> str | None:
+    low = (question or "").lower()
+    for fam, words in _FAMILY_WORDS.items():
+        if any(w in low for w in words):
+            return fam
+    return None
+
+
+def _measure_disclosure(question: str, findings: list[dict], primary: dict | None = None) -> str:
+    """Say so, in code, when the answer is about a DIFFERENT measure than was asked for.
+
+    This warehouse has no material-by-month SALES grain, so "sales trend of KEYTRUDA" gets
+    answered from PURCHASING. That substitution is legitimate and useful — silently
+    labelling the result "Sales Trend" is not, and it is a wrong answer however good the
+    arithmetic. The synthesis prompt has asked for this disclosure since the first version
+    and the model supplies it perhaps half the time, which is exactly the reliability a
+    prompt gives you. Plant->Hospital taught the same lesson twice; this is the third.
+    """
+    asked = _family_asked(question)
+    if not asked:
+        return ""
+    # Judge the HEADLINE, not every table touched. A turn that reads the sales total for
+    # context and builds its monthly series from purchasing was staying silent, because
+    # "sales" appeared somewhere in the turn — while the number in the first sentence,
+    # the one the reader takes away, was purchasing all along.
+    if primary is not None:
+        fam = _family_of_table(primary.get("sql", ""))
+        if not fam or fam == asked:
+            return ""
+        got = fam
+    else:
+        used = {f for f in (_family_of_table(x.get("sql", "")) for x in findings) if f}
+        if not used or asked in used:
+            return ""
+        got = " and ".join(sorted(used))
+    return (f"There is no {asked} figure available at this level for what you asked; "
+            f"what follows is {got.upper()}.\n\n")
+
+
+_VALUE_KEYS = {"value", "total", "share_pct", "change_pct_first_to_last",
+               "swing_pct_trough_to_peak", "top1_share_pct", "top3_share_pct"}
+
+
+def _format_derived(derived: list[dict]) -> list[dict]:
+    """Render every derived number in the unit its measure is actually in."""
+    def walk(node, kind):
+        if isinstance(node, dict):
+            # "_pct" ANYWHERE in the key, and tested first: `change_pct_first_to_last`
+            # does not END with _pct, so it fell through to the money branch and a −3.54%
+            # change rendered as "₹-4".
+            return {k: (_fmt(v, "pct") if "_pct" in k and isinstance(v, (int, float))
+                        else _fmt(v, kind) if k in _VALUE_KEYS and isinstance(v, (int, float))
+                        else walk(v, kind))
+                    for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(x, kind) for x in node]
+        return node
+
+    out = []
+    for d in derived:
+        kind = _kind(str(d.get("measure") or ""), [{}])
+        if kind in ("id", "text"):
+            kind = "num"
+        out.append(walk(d, kind))
+    return out
+
+
 def _num_tokens(text: str) -> set[str]:
     return {t.replace(",", "") for t in re.findall(r"\d[\d,]*\.?\d*", text or "")}
 
@@ -234,6 +341,7 @@ def answer(query: str, history: list | None = None):
     # ── PHASE 1 · FRAME ──────────────────────────────────────────────────────
     yield {"type": "step", "text": "Framing the question"}
     footprint = ""
+    fp_counts: dict = {}
     m = re.search(r'"([^"]{3,60})"|“([^”]{3,60})”', query)
     if m:
         name = (m.group(1) or m.group(2) or "").strip()
@@ -245,6 +353,7 @@ def answer(query: str, history: list | None = None):
                     if v:
                         entity_tokens.append(v)
                         entity_tokens += re.findall(r"[A-Za-z]{4,}", v)[:2]
+            fp_counts = fp.get("footprint") or {}
             footprint = json.dumps(fp)[:1800]
             yield {"type": "sql", "purpose": f"footprint of “{name}”",
                    "sql": f"-- lookup_item('{name}')", "rows": fp.get("match_count", 0)}
@@ -254,7 +363,9 @@ def answer(query: str, history: list | None = None):
     frame = llm.ask_json(
         cl, role="frame",
         system=("You frame analytics questions against a fixed warehouse. You are given the REAL "
-                "schema — never assume a table or column that is not listed.\n\n" + capability.brief()),
+                "schema — never assume a table or column that is not listed.\n\n"
+                "ANSWER SHAPES (pick the one this question really is):\n" + shapes.catalog()
+                + "\n\n" + capability.brief()),
         user=f"Question: {query}\n\nRecent conversation:\n{hist}\n\nItem footprint:\n{footprint}",
         schema_hint=schemas.FRAME)
 
@@ -269,20 +380,6 @@ def answer(query: str, history: list | None = None):
     cap_brief = capability.brief(fam if fam in capability.ENTITY_FAMILIES else None)
 
     # ── PHASE 2 · PLAN ───────────────────────────────────────────────────────
-    yield {"type": "step", "text": "Planning the investigation"}
-    plan = llm.ask_json(
-        cl, role="plan",
-        system=("You plan an analytics investigation. Break the question into sub-questions that "
-                "TOGETHER explain it — not restatements of it. A good plan tests competing "
-                "explanations (price vs volume vs mix vs site vs vendor) so the answer can say "
-                "what it is AND what it is not.\n\nSCHEMA:\n" + cap_brief),
-        user=f"Question: {query}\n\nFraming: {json.dumps(frame)[:600]}",
-        schema_hint=schemas.PLAN)
-    subs = (plan.get("sub_questions") or [])[:MAX_SUBQUESTIONS]
-    if not subs:
-        subs = [{"id": "q1", "question": query, "why": "direct", "table": ""}]
-    yield {"type": "step", "text": f"Investigating {len(subs)} lines of enquiry"}
-
     # ── PHASE 3 · INVESTIGATE (parallel) ─────────────────────────────────────
     # A LESSON BOARD shared by every worker.
     #
@@ -299,6 +396,23 @@ def answer(query: str, history: list | None = None):
     # tunnelled into forecast_sales; the fact that no sales table carries time is
     # derivable from information_schema in one pass and is exactly the knowledge they
     # needed. Deterministic facts should never cost a model call.
+    # GROUND TRUTH FOR THIS ITEM, not a generalisation. lookup_item already counts the
+    # rows this material has in EVERY table — and the planner was never shown it, so it
+    # planned a "monthly consumption trend" for an item with zero consumption rows
+    # (KEYTRUDA is billed-only; fact_consumption and kpi_units_consumed are both 0 while
+    # fact_po has 462 and kpi_monthly_purchase_value has 108). A generic lesson said "use
+    # purchasing or consumption" and it picked the empty one. Per-item counts remove the
+    # guess entirely.
+    if fp_counts:
+        have = sorted(((t, n) for t, n in fp_counts.items() if n), key=lambda x: -x[1])
+        none = sorted(t for t, n in fp_counts.items() if not n)
+        if have:
+            lessons.append("FOR THIS EXACT ITEM, tables that HAVE rows (row counts): "
+                           + ", ".join(f"{t}({n})" for t, n in have[:14]))
+        if none:
+            lessons.append("FOR THIS EXACT ITEM these tables are EMPTY — never plan against "
+                           "them: " + ", ".join(none[:12]))
+
     try:
         _fam = frame.get("entity_family") if isinstance(frame, dict) else None
         _prof = capability.profile(_fam if _fam in capability.ENTITY_FAMILIES else None)
@@ -316,6 +430,34 @@ def answer(query: str, history: list | None = None):
                        "(fact_consumption, kpi_units_consumed). Use one of those and say which.")
     except Exception:
         pass
+
+    shape_name = (frame.get("shape") or "lookup").strip().lower()
+    shape = shapes.get(shape_name)
+    slot_spec = "\n".join(
+        f"- {sl['id']} ({'REQUIRED' if sl.get('required') else 'optional'}): {sl['need']}"
+        for sl in shape["slots"])
+    yield {"type": "step", "text": f"Planning the investigation ({shape_name})"}
+    plan = llm.ask_json(
+        cl, role="plan",
+        system=("You plan an analytics investigation. This question needs a "
+                f"'{shape_name}' answer, which owes the reader: {shape['answer_must']}.\n\n"
+                f"SLOTS TO FILL:\n{slot_spec}\n\n"
+                "Each sub-question fills one slot and must be answerable by ONE query. Do not "
+                "add sub-questions that only restate the question or re-fetch an identifier "
+                "you already have.\n\n"
+                # The workers had this and the planner did not, so it kept planning around a
+                # grain the warehouse does not have — "monthly sales revenue for item X" —
+                # and every worker then failed the same way. A plan made in ignorance of what
+                # the data can do is why the whole turn came back empty.
+                "WHAT THIS DATA CAN AND CANNOT DO — plan within it:\n- "
+                + "\n- ".join(lessons) + "\n\nSCHEMA:\n" + cap_brief),
+        user=f"Question: {query}\n\nFraming: {json.dumps(frame)[:600]}",
+        schema_hint=schemas.PLAN)
+    subs = (plan.get("sub_questions") or [])[:MAX_SUBQUESTIONS]
+    if not subs:
+        subs = [{"id": "q1", "question": query, "why": "direct", "table": ""}]
+    yield {"type": "step", "text": f"Investigating {len(subs)} lines of enquiry"}
+
 
     def _note_lesson(text: str) -> None:
         t = (text or "").strip()
@@ -513,9 +655,17 @@ def answer(query: str, history: list | None = None):
         yield {"type": "done"}
         return
 
-    evidence = "\n\n".join(
-        f"[{f['sub'].get('id','?')}] {f['purpose']}\nSQL: {f['sql']}\n{_compact(f['res'])}"
-        for f in findings)
+    # Evidence is RESULTS, never the query that produced them. Putting SQL in here is why
+    # the brief said "this purchasing data is grouped by year, month, and hospital" and
+    # offered "the material ID for Keytruda is 101313" as a driver: given a query, a writer
+    # describes the query. The SQL is provenance for the reader (the "N queries run"
+    # disclosure), not context for the author.
+    def _evidence(fs):
+        return "\n\n".join(
+            f"[{f['sub'].get('id','?')}] {_hospitalise(f['purpose'])}\n{_compact(f['res'])}"
+            for f in fs)
+
+    evidence = _evidence(findings)
 
     # ── PHASE 4 · CORROBORATE (different model, different route) ─────────────
     yield {"type": "step", "text": "Re-deriving the key figures independently"}
@@ -579,11 +729,27 @@ def answer(query: str, history: list | None = None):
                                     "rows": out["res"]["row_count"]})
                     yield {"type": "sql", "purpose": out["purpose"], "sql": out["sql"],
                            "rows": out["res"]["row_count"]}
-        evidence = "\n\n".join(
-            f"[{f['sub'].get('id','?')}] {f['purpose']}\nSQL: {f['sql']}\n{_compact(f['res'])}"
-            for f in findings)
+        evidence = _evidence(findings)
 
     # ── PHASE 6 · SYNTHESISE ─────────────────────────────────────────────────
+    # Every number that requires arithmetic — direction, % change, peak, trough,
+    # concentration, share — is computed HERE, from the rows, before the model writes a
+    # word. It gets facts to explain rather than tables to describe, which is the
+    # difference between "the trend shows variability across hospitals and months" and
+    # "purchasing fell 68% from December to April, peaking in January".
+    derived = shapes.derive_all(shape_name, findings)
+    # FORMAT the derived numbers before the writer ever sees them. shapes.py works in raw
+    # floats so it stays pure and testable, but handing those straight over produced
+    # "sales started at 80,663,366" — a rupee figure written as a bare integer, in the very
+    # block that exists to stop the model doing its own arithmetic. Everything it quotes
+    # must already be in the form it should quote.
+    derived_block = json.dumps(_format_derived(derived), default=str)[:3500] if derived else ""
+    # the finding the headline rests on = the first one the shape could actually derive from
+    primary_finding = next(
+        (f for f in findings if any(d.get("from") == (f.get("purpose") or "")[:80] for d in derived)),
+        findings[0] if findings else None)
+    if derived:
+        yield {"type": "step", "text": "Computing the movement"}
     yield {"type": "step", "text": "Writing the brief"}
     corr_note = ("An independent re-derivation AGREED with the headline figure."
                  if any(c["agreed"] for c in corroborations)
@@ -593,13 +759,24 @@ def answer(query: str, history: list | None = None):
     crit_note = (f"A reviewer raised: {crit.get('problem')}" if crit.get("refuted") else
                  "A reviewer found no defect that changes the conclusion.")
 
-    prose = ""
+    disclosure = _measure_disclosure(query, findings, primary_finding)
+    if disclosure:
+        yield {"type": "answer_delta", "text": disclosure}
+    prose = disclosure
     pending = ""      # hold back a partial word so "plant" is never half-emitted
     for tok in llm.stream_text(
         cl, role="synthesise",
         system=("You are a hospital supply-chain analyst writing a short brief for an executive.\n"
+                f"THIS ANSWER MUST: {shape['answer_must']}.\n"
                 "STRUCTURE: lead with the answer and its number; then WHAT DRIVES IT, ranked; then "
                 "WHAT YOU RULED OUT; then the limits.\n"
+                "NEVER describe the data or the query. 'The data is grouped by year, month and "
+                "hospital', 'the evidence provides', 'the material ID is 101313' — these are notes "
+                "about plumbing, not findings, and they are the difference between an analyst and "
+                "a search result. Every line must say something about the BUSINESS.\n"
+                "WHAT YOU RULED OUT means a competing explanation you tested and rejected, with "
+                "the figure that rejected it. It does not mean a limitation of the dataset — that "
+                "belongs under limits.\n"
                 "RULES:\n"
                 "- Quote figures EXACTLY as formatted in the evidence. Never re-scale or recompute.\n"
                 "- Cite the evidence block you took each figure from, as [id].\n"
@@ -613,7 +790,11 @@ def answer(query: str, history: list | None = None):
                 "- Say 'hospital', never 'plant'. No trailing rhetorical question.\n"
                 "- If a line of enquiry was ruled out, say so — that is half the value.\n"
                 "- Do not claim anything the evidence does not show."),
-        user=(f"Question: {query}\n\nEVIDENCE:\n{evidence[:9000]}\n\n"
+        user=(f"Question: {query}\n\n"
+              + (f"DERIVED FACTS (computed from the rows — exact, use these for every claim "
+                 f"about direction, change, peak, trough, share or concentration; do NOT "
+                 f"recompute them):\n{derived_block}\n\n" if derived_block else "")
+              + f"EVIDENCE (results only):\n{evidence[:8000]}\n\n"
               f"CORROBORATION: {corr_note}\nREVIEW: {crit_note}")):
         pending += tok
         cut = max(pending.rfind(" "), pending.rfind("\n"))
@@ -668,7 +849,7 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "chart", "plotly": fig}
         except Exception:
             pass
-        yield {"type": "table", "table": _table_payload(res, title), "note": ""}
+        yield {"type": "table", "table": _table_payload(res, _hospitalise(title)), "note": ""}
 
     verified = "flagged" if crit.get("refuted") else (
         "ok" if any(c["agreed"] for c in corroborations) else None)

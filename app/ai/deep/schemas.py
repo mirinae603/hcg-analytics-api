@@ -5,14 +5,21 @@ to be parsed out of prose is a phase that degrades silently — and silent degra
 exact failure mode this whole engine exists to remove.
 """
 
-FRAME = """Return: {"intent": str, "entity": str|null, "entity_family":
+FRAME = """Return: {"shape": str, "intent": str, "entity": str|null, "entity_family":
 "material"|"manufacturer"|"vendor"|"hospital"|"category"|null, "needs_time_series": bool,
-"answerable": bool, "blocked_reason": str}. Set answerable=false ONLY if the schema
+"answerable": bool, "blocked_reason": str}. `shape` is the KIND of answer this question
+needs, chosen from the catalogue given — it decides what a complete answer owes the reader,
+so pick the one the question really is rather than the one the words resemble. Set answerable=false ONLY if the schema
 provided genuinely cannot support the question (e.g. the measure and the requested
 breakdown never appear on the same table); put the specific reason in blocked_reason."""
 
-PLAN = """Return: {"sub_questions": [{"id": str, "question": str, "why": str,
-"table": str, "needs": str}]}. Three to six of them. Each must be answerable by ONE SQL
+PLAN = """Return: {"sub_questions": [{"id": str, "slot": str, "question": str, "why": str,
+"table": str, "needs": str}]}. One per SLOT you are given, in that order, plus at most two
+extras if something genuinely load-bearing is missing. Set `slot` to the slot id.
+
+A slot is not a table to fetch, it is a thing the answer OWES the reader. "series" means
+one row per period with every other dimension summed away — not a grid of hospital by
+month, which is not a trend and cannot be described as one. Each must be answerable by ONE SQL
 query against ONE table named in `table`, and each must earn its place: no sub-question
 whose answer cannot change the conclusion.
 
