@@ -88,6 +88,58 @@ def _chat(client, **kwargs):
     raise last  # unreachable, but keeps type-checkers happy
 
 
+class _Streamed:
+    """What a streamed completion collapses back into: the same two fields the non-stream
+    path reads off `resp.choices[0].message`."""
+    __slots__ = ("content", "tool_calls")
+
+    def __init__(self, content, tool_calls):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _TC:
+    __slots__ = ("id", "type", "function")
+
+    def __init__(self, id, name, args):
+        self.id = id
+        self.type = "function"
+        self.function = type("F", (), {"name": name, "arguments": args})()
+
+
+def _chat_stream(client, **kwargs):
+    """Generator yielding ("delta", text) as prose arrives, then ("done", _Streamed).
+
+    Tool-call arguments arrive fragmented across chunks and have to be concatenated per
+    index before they parse as JSON — that reassembly is the whole reason this exists
+    rather than passing stream=True to _chat. Retries are NOT attempted here: a stream that
+    dies mid-answer cannot be silently restarted without either duplicating or losing text
+    the user has already seen, so the caller falls back to the non-streaming path instead.
+    """
+    kwargs["stream"] = True
+    parts: list[str] = []
+    slots: dict = {}
+    for chunk in client.chat.completions.create(**kwargs):
+        if not chunk.choices:
+            continue
+        d = chunk.choices[0].delta
+        if getattr(d, "content", None):
+            parts.append(d.content)
+            yield "delta", d.content
+        for tc in (getattr(d, "tool_calls", None) or []):
+            slot = slots.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            if tc.id:
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["args"] += fn.arguments
+    calls = [_TC(slots[i]["id"], slots[i]["name"], slots[i]["args"]) for i in sorted(slots)]
+    yield "done", _Streamed("".join(parts), calls or None)
+
+
 # ── number pre-formatting so the model can't mis-convert units ───────────────
 _INR = re.compile(r"(revenue|margin|value|cost|spend|price|amount|opportunity|overpay|mrp|purchase|sales|cr\b)", re.I)
 _PCT = re.compile(r"(pct|percent|share|rate|margin_pct|%)", re.I)
@@ -208,7 +260,7 @@ HOW YOU WORK — like a sharp, friendly human analyst:
 • Call run_sql to fetch data — MULTIPLE times as needed. Decompose complex questions, explore first, then run the precise query; join across tables freely (CTEs, window functions, subqueries all work in DuckDB). Go into real DEPTH: don't just pull the top line — look at the composition, the outliers, the trend, the "so what".
 • Every number in your final answer MUST come from a query you actually ran.
 • SCOPE YOUR CLAIMS TO WHAT YOU ACTUALLY QUERIED — never generalize a narrow or empty result into a broader absolute statement. If a filter applied to one specific list/subset returns nothing, say exactly that ("none of these particular items are X"), never the broader, unverified claim ("there are no X in the dataset") — the broader claim requires its OWN query against the full data, not an inference from a narrower one. Getting this wrong means confidently contradicting yourself the moment the user asks the broader question directly next.
-• When done, call present() with a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep it TIGHT — 2–4 sentences: the headline number(s) + the one insight that matters. Do NOT enumerate long lists item-by-item in the prose (the chart AND the data table below already show every row) — mention the top 1–2 and summarise the rest. No filler sign-offs like "let me know if you'd like…". NEVER paste a markdown/pipe table into the answer text.
+• When done, WRITE THE ANSWER AS YOUR MESSAGE TEXT and, in the SAME message, call present() to attach any chart(s)/follow_ups/scope. The answer text streams to the user as you write it; anything you put inside a tool argument does not appear until the whole call finishes, so never put the answer in present(). Write a warm, natural, analytical answer (talk like a helpful colleague, not a report generator) plus chart(s). Keep it TIGHT — 2–4 sentences: the headline number(s) + the one insight that matters. Do NOT enumerate long lists item-by-item in the prose (the chart AND the data table below already show every row) — mention the top 1–2 and summarise the rest. No filler sign-offs like "let me know if you'd like…". NEVER paste a markdown/pipe table into the answer text.
    – ALWAYS chart a ranking, breakdown, trend, comparison or share.
    – If the user asks for "two charts", "different charts", "a pie and a bar", etc., or if two views genuinely illuminate the data, put MULTIPLE specs in `charts` (e.g. a ranking bar AND a share donut).
    – bar=rankings, line=time trend, donut=shares, combo (percentage on y2)=two different scales, heatmap=matrix, scatter/bubble=correlation, treemap/sunburst=hierarchy, waterfall=build-up.
@@ -245,9 +297,9 @@ _CHART_SPEC = {
 PRESENT_TOOL = {
     "type": "function", "function": {
         "name": "present",
-        "description": "Deliver the final answer + chart(s). Call this once you have the data.",
-        "parameters": {"type": "object", "required": ["answer"], "properties": {
-            "answer": {"type": "string", "description": "Final answer in warm, natural, analytical markdown. Quote the pre-formatted figures exactly. Do NOT end with a trailing rhetorical question ('would you like to explore...?') — put real next-question suggestions in follow_ups instead, which renders as clickable chips."},
+        "description": "Attach the chart(s) and follow-ups for your final answer. WRITE THE ANSWER ITSELF AS YOUR MESSAGE TEXT, not in this call — text streams to the user as you type it, a tool argument cannot. Call this in the SAME message as the answer text.",
+        "parameters": {"type": "object", "required": [], "properties": {
+            "answer": {"type": "string", "description": "DEPRECATED — leave empty and write the answer as your message text instead. Only used as a fallback if you wrote no message text. Quote the pre-formatted figures exactly. Do NOT end with a trailing rhetorical question ('would you like to explore...?') — put real next-question suggestions in follow_ups instead, which renders as clickable chips."},
             "charts": {"type": "array", "description": "One or MORE charts. If the user asks for multiple/different charts, or two views genuinely help (e.g. a ranking bar AND a share donut), include several. Empty for a single-number answer.", "items": _CHART_SPEC},
             "chart": dict(_CHART_SPEC, description="Deprecated single-chart form — prefer 'charts'."),
             "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "OPTIONAL 2-3 short, concrete drill-down questions a user would naturally ask next about THIS answer (e.g. 'Break this down by hospital', 'Show the monthly trend'). Rendered as clickable chips — clicking one sends it as the next question. Only include ones that are genuinely answerable from this data; omit entirely for a simple/closed answer that doesn't invite a drill-down."},
@@ -453,39 +505,67 @@ def _evidence_numbers(results: list[dict]) -> set[str]:
     return out
 
 
-def _unsupported_numbers(answer: str, results: list[dict], pct_allow: int = 2) -> list[str]:
-    """Figures in the prose that appear nowhere in the evidence.
+def _unsupported_numbers(answer: str, results: list[dict], _unused: int = 0) -> list[str]:
+    """Catch UNIT-CONVERSION errors, and nothing else.
 
-    MONEY is zero-tolerance. A rupee magnitude cannot be legitimately "derived" in prose —
-    if "₹300.21 Cr" is not in the evidence, it is wrong, full stop. That is precisely the
-    error class this exists for (the real 10x bug printed ₹300.21 Cr for a ₹30.02 Cr
-    figure), and an earlier draft of this function let it through because a flat tolerance
-    of 2 swallowed the two bad figures in that very answer.
+    The first version of this asked a much broader question — "does every figure in the
+    prose appear in the evidence?" — and it was wrong in production. An analyst constantly
+    states figures that are correct but not verbatim in any cell: a margin derived as
+    revenue minus cost, a total, an average, a rounded restatement. Those were all flagged,
+    every flag bounced the answer back for a rewrite, and the retries ran up to three times.
+    That is the repeated "Correcting the analysis" loop, and it added ~6s to a turn while
+    changing nothing. A guard that fires on correct answers is worse than no guard.
 
-    PERCENTAGES AND DAY COUNTS get a small tolerance, because those genuinely are derivable
-    from supported numbers ("up 25%", "about a third") without appearing verbatim in a cell.
-    Being strict there would produce constant false bounces on correct answers, and a guard
-    that cries wolf gets switched off."""
+    So this now tests ONLY the thing it was actually built for: a figure that is the right
+    digits at the wrong scale. The real bug printed "₹300.21 Cr" where the evidence said
+    "₹30.02 Cr" — the model doing its own ₹ conversion and dividing by 1e6 instead of 1e7.
+    A money figure is flagged only when some evidence value matches it to within rounding
+    after multiplying by a power of ten. Derived arithmetic is untouched, because a derived
+    value has no such relationship to its inputs.
+    """
     if not answer or not results:
         return []
-    have = _evidence_numbers(results)
-    bad_money: list[str] = []
-    bad_other: list[str] = []
+    have: list[float] = []
+    for cn in _evidence_numbers(results):
+        m = _NUM_ONLY.search(cn)
+        if m and cn.endswith(("cr", "l", "k")):
+            try:
+                have.append(float(m.group(0)))
+            except ValueError:
+                pass
+    if not have:
+        return []
+
+    bad: list[str] = []
     for tok in _NUM_TOKEN.findall(answer):
         s = str(tok).strip()
+        if "₹" not in s:
+            continue                      # only money carries the scale-suffix hazard
         cn = _canon_num(s)
-        if cn is None or cn in have:
+        if cn is None or cn in _evidence_numbers(results):
+            continue                      # stated exactly as given — fine
+        m = _NUM_ONLY.search(cn)
+        if not m:
             continue
-        if "₹" in s:
-            bad_money.append(s)
-        else:
-            # a bare small integer is almost always a count/rank in prose ("top 5", "3 months")
-            if cn.rstrip("d%").replace(".", "").isdigit() and float(_NUM_ONLY.search(cn).group(0)) <= 12:
+        try:
+            v = float(m.group(0))
+        except ValueError:
+            continue
+        if v <= 0:
+            continue
+        for ev in have:
+            if ev <= 0:
                 continue
-            bad_other.append(s)
-    if bad_money:
-        return bad_money + bad_other
-    return bad_other if len(bad_other) > pct_allow else []
+            r = v / ev
+            for p in (10.0, 100.0, 1000.0, 0.1, 0.01, 0.001):
+                # within 1% of an exact power-of-ten multiple of a real figure
+                if abs(r - p) <= abs(p) * 0.01:
+                    bad.append(s)
+                    break
+            else:
+                continue
+            break
+    return bad
 
 
 _AUDITOR_SYS = """You are a STRICT data auditor for a hospital supply-chain analyst. You get the user's question, the exact SQL queries that ran (with their results and stated purpose), and a proposed answer. Catch answers that are WRONG or MISLEADING before they reach the user. Judge whether each number is correct FOR WHAT IT IS LABELLED AS — not whether it is the user's first-choice metric.
@@ -753,22 +833,51 @@ def answer(query: str, history: list | None = None):
             # seconds with nothing else to show. A rotating, honest-sounding line here fills
             # that gap without claiming anything specific hasn't happened yet.
             yield {"type": "step", "text": _THINKING_STEPS[(step_idx - 1) % len(_THINKING_STEPS)]}
+        # STREAM the round. Tool-planning rounds emit no prose, so nothing is shown for
+        # them; the final round's answer arrives word by word instead of landing whole
+        # after the model has finished writing it. That is the difference between a 7s
+        # blank wait and text starting at ~3s.
+        #
+        # Streamed prose is UNVERIFIED at the moment it appears — the number check and the
+        # auditor run once the text completes. That is a deliberate trade and it is only
+        # acceptable because the number check was narrowed to scale errors: it no longer
+        # bounces correct answers, so a correction after the fact is rare rather than
+        # routine. If a check does fail, the corrected answer replaces what was streamed.
+        msg = None
+        streamed_prose = ""
         try:
-            resp = _chat(client,
-                model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
-                tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL], tool_choice="auto")
-        except Exception as e:
-            # Only reached after _chat exhausted its retries. If we already gathered real
-            # results, hand those back honestly rather than throwing the whole turn away.
-            if results:
-                break
-            yield {"type": "error", "text": "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."}
-            return
-        msg = resp.choices[0].message
-        if not msg.tool_calls:
+            for kind, payload in _chat_stream(
+                client, model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
+                tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL],
+                tool_choice="auto",
+            ):
+                if kind == "delta":
+                    streamed_prose += payload
+                    yield {"type": "answer_delta", "text": payload}
+                else:
+                    msg = payload
+        except Exception:
+            # A stream cannot be safely retried mid-flight (duplicate or lost text), so fall
+            # back to the non-streaming path, which has its own retry/backoff.
+            if streamed_prose:
+                yield {"type": "answer_reset"}
+            try:
+                resp = _chat(client,
+                    model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
+                    tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL],
+                    tool_choice="auto")
+                msg = resp.choices[0].message
+            except Exception:
+                if results:
+                    break
+                yield {"type": "error", "text": "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."}
+                return
+        if msg is not None and not msg.tool_calls:
             if msg.content:
                 present_args = {"answer": msg.content}
                 present_from_content = True
+            break
+        if msg is None:
             break
 
         messages.append({"role": "assistant", "content": msg.content or None,
@@ -862,7 +971,10 @@ def answer(query: str, history: list | None = None):
         # All tool calls in this batch are now acked. If the model asked to present,
         # AUDIT it before accepting — and on a real problem, send it back to re-query.
         if pending_present is not None:
-            cand_ans = (pending_present.get("answer") or "").strip()
+            # The prose the model streamed IS the answer now; present()'s `answer` field
+            # survives only as a fallback for a model that ignored the instruction and put
+            # the text in the tool argument after all.
+            cand_ans = (streamed_prose or pending_present.get("answer") or "").strip()
             # A turn grounded ENTIRELY in get_kpi (the canonical dashboard calculation, never
             # free-form SQL) is correct by construction — skip the fuzzy LLM audit rather than
             # run it anyway. The audit found in the live persona audit that this self-assessed

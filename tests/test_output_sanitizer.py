@@ -111,11 +111,23 @@ def test_passes_the_correct_figures():
     assert _unsupported_numbers("Critical is ₹30.02 Cr (49.6%) and low is ₹5.53 Cr (9.1%).", _RES) == []
 
 
-def test_money_is_zero_tolerance_even_when_most_figures_are_right():
-    # an earlier draft used a flat tolerance of 2 and let the 10x bug through, because that
-    # answer contained exactly two bad figures. A rupee magnitude is never "derived".
-    bad = _unsupported_numbers("Critical ₹30.02 Cr, low ₹5.53 Cr, total ₹999.00 Cr.", _RES)
-    assert bad == ["₹999.00 Cr"]
+def test_derived_figures_are_not_flagged():
+    # THE regression that mattered. The first version asked "does every figure appear in
+    # the evidence?" and so flagged every legitimately-derived number — a margin computed
+    # as revenue minus cost, a total, an average. Each flag bounced the answer for a rewrite
+    # and the retry ran up to three times: that is the repeated "Correcting the analysis"
+    # loop seen in production, ~6s added to a turn for nothing. A guard that fires on
+    # correct answers is worse than no guard.
+    assert _unsupported_numbers("Critical ₹30.02 Cr and low ₹5.53 Cr, ₹35.55 Cr between them.", _RES) == []
+    assert _unsupported_numbers("Together they account for ₹35.55 Cr, averaging ₹17.78 Cr.", _RES) == []
+
+
+def test_only_power_of_ten_scale_errors_are_flagged():
+    # a figure unrelated to the evidence is NOT this check's job — that is the LLM
+    # auditor's. This one answers a narrow, decidable question: right digits, wrong scale.
+    assert _unsupported_numbers("Total is ₹999.00 Cr.", _RES) == []
+    assert _unsupported_numbers("Critical is ₹300.21 Cr.", _RES) == ["₹300.21 Cr"]     # 10x
+    assert _unsupported_numbers("Critical is ₹3002.10 Cr.", _RES) == ["₹3002.10 Cr"]   # 100x
 
 
 def test_derived_percentages_do_not_false_flag():
