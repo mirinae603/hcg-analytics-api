@@ -131,7 +131,11 @@ def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
         text = f"The AI Analyst hit an error answering that: {e}"
         kind = "error"
 
-    if text is None:
+    # Empty counts as missing, not just None. A turn once persisted `"text": ""` with a
+    # full chart, table, badge and follow-up chips attached — the UI faithfully rendered
+    # every one of those around a blank answer, which reads as the product being broken.
+    # Whatever the cause upstream, a reply with no words is never worth storing as one.
+    if text is None or not str(text).strip():
         text = "I couldn't generate a response for that."
         kind = "error"
 

@@ -826,6 +826,12 @@ def answer(query: str, history: list | None = None):
     canonical_scope_hint: str = ""
 
     any_sql_failed = False
+    # Prose survives the round it was written in. `streamed_prose` is per-round (it has to
+    # be — each round streams separately), but the model does not always put its answer in
+    # the SAME round as the present() call: on a canonical get_kpi turn it wrote the answer
+    # in one round and called present() in the next, and because present()'s `answer` field
+    # is now deliberately empty, the turn persisted `"text": ""`. Verified in the DB.
+    last_prose = ""
     for step_idx in range(MAX_SQL_STEPS):
         if step_idx > 0:
             # Every iteration's first move is a full, non-streamed model round-trip that
@@ -856,6 +862,8 @@ def answer(query: str, history: list | None = None):
                     yield {"type": "answer_delta", "text": payload}
                 else:
                     msg = payload
+            if streamed_prose.strip():
+                last_prose = streamed_prose
         except Exception:
             # A stream cannot be safely retried mid-flight (duplicate or lost text), so fall
             # back to the non-streaming path, which has its own retry/backoff.
@@ -873,8 +881,8 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "error", "text": "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."}
                 return
         if msg is not None and not msg.tool_calls:
-            if msg.content:
-                present_args = {"answer": msg.content}
+            if msg.content or last_prose:
+                present_args = {"answer": msg.content or last_prose}
                 present_from_content = True
             break
         if msg is None:
@@ -974,7 +982,7 @@ def answer(query: str, history: list | None = None):
             # The prose the model streamed IS the answer now; present()'s `answer` field
             # survives only as a fallback for a model that ignored the instruction and put
             # the text in the tool argument after all.
-            cand_ans = (streamed_prose or pending_present.get("answer") or "").strip()
+            cand_ans = (streamed_prose or last_prose or pending_present.get("answer") or "").strip()
             # A turn grounded ENTIRELY in get_kpi (the canonical dashboard calculation, never
             # free-form SQL) is correct by construction — skip the fuzzy LLM audit rather than
             # run it anyway. The audit found in the live persona audit that this self-assessed
