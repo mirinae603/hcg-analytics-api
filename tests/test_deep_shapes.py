@@ -58,8 +58,11 @@ def test_ranking_reports_concentration_not_just_the_list():
                     {"vendor_name": "Akshay", "spend": 13.41}]}
     d = shapes.derive_ranking(res)
     assert d["top"][0]["label"] == "Vardhman"
-    assert 85 < d["top1_share_pct"] < 87        # the fact that makes it an ANSWER
+    # renamed: it is the share of the rows RETURNED, not of the company. Calling it
+    # `share_pct` is how "100% of total procurement" got written from a one-row result.
+    assert 85 < d["top1_share_of_returned_pct"] < 87
     assert d["tail_n"] == 1
+    assert "rows returned" in d["share_note"]
 
 
 def test_every_shape_declares_what_the_answer_owes():
@@ -133,3 +136,22 @@ def test_a_quantity_measure_is_not_rendered_as_money():
     from app.ai.deep.engine import _format_derived
     out = _format_derived([{"measure": "total_qty", "peak": {"period": "Jan", "value": 45223.0}}])[0]
     assert out["peak"]["value"] == "45,223"
+
+
+def test_a_single_row_result_carries_a_warning_instead_of_a_share():
+    # Returning nothing for a one-row result left the model to compute the share itself,
+    # which produced "100% of the total procurement value of ₹649.91 Cr is sourced from a
+    # single vendor" (the true leader is 45.8%) and "GLASS PAPER accounts for 100.0% of
+    # out-of-stock demand". Both came from dividing a number by itself.
+    d = shapes.derive_ranking({"columns": ["vendor_name", "spend"],
+                               "rows": [{"vendor_name": "Vardhman", "spend": 6499100000}]})
+    assert d["n"] == 1
+    assert "share_pct" not in d and "top1_share_of_returned_pct" not in d
+    assert "no denominator" in d["share_note"]
+    assert d["top"][0]["value"] == 6499100000.0        # the value itself is still reported
+
+
+def test_two_rows_still_refuse_to_produce_a_share():
+    d = shapes.derive_ranking({"columns": ["k", "v"], "rows": [{"k": "a", "v": 2}, {"k": "b", "v": 1}]})
+    assert "top1_share_of_returned_pct" not in d
+    assert "no denominator" in d["share_note"]

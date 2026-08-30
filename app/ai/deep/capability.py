@@ -159,3 +159,116 @@ def entity_columns_for_search() -> tuple[tuple[str, str], ...]:
             if any(pat.match(c) for pat in ENTITY_FAMILIES.values()) or c.lower().endswith(("_name", "_desc")):
                 out.append((t, c))
     return tuple(out)
+
+
+@lru_cache(maxsize=1)
+def joinability() -> list[str]:
+    """Which entity key-spaces actually JOIN, checked against the data.
+
+    The warehouse has two hospital identifier systems that look interchangeable and are
+    not: sales rows carry state-prefixed codes ('KABHK', 'GJHCA', 'MHHNC') while
+    procurement, inventory and consumption carry plant codes ('HC05', 'AH01'). They
+    overlap in ZERO rows, and nothing anywhere maps between them — 'KABHK' appears in
+    exactly two tables, both of them sales.
+
+    So a hospital's sales cannot be connected to its purchasing or its stock, and
+    'Bangalore' — which lives only in dim_plant.plant_name — cannot reach sales at all.
+    An agent that does not know this writes a join that silently returns nothing, or
+    quietly answers about a different set of hospitals than the question meant.
+
+    Checked rather than asserted, so it stops being reported the day someone ships a
+    mapping table.
+    """
+    from app.ai import warehouse
+    pairs = [
+        ("sales_by_material_hospital", "hospital", "dim_plant", "plant",
+         "SALES hospital codes (KABHK, GJHCA…) and PLANT codes (HC05, AH01…)"),
+    ]
+    notes: list[str] = []
+    for lt, lc, rt, rc, label in pairs:
+        sch = schema()
+        if lc not in sch.get(lt, []) or rc not in sch.get(rt, []):
+            continue
+        try:
+            n = warehouse.run_sql(
+                f"SELECT COUNT(*) AS n FROM {lt} a JOIN {rt} b ON CAST(a.{lc} AS VARCHAR) = CAST(b.{rc} AS VARCHAR)",
+                row_cap=1, timeout_s=6.0)["rows"][0]["n"]
+        except Exception:
+            continue
+        if not n:
+            notes.append(
+                f"{label} DO NOT JOIN — zero overlapping rows, and no mapping table exists. "
+                f"Sales cannot be linked to procurement, inventory or consumption by hospital, "
+                f"and a city or hospital NAME (which lives only in dim_plant.plant_name) cannot "
+                f"reach the sales tables at all. If a question needs that link, say so instead "
+                f"of joining or substituting.")
+    return notes
+
+
+def vocabulary() -> list[str]:
+    """What the user's words map to in this schema.
+
+    Users say "hospital"; procurement and inventory call the column `plant`. Asked which
+    hospital holds the most inventory value, the engine replied "the schema does not
+    contain inventory value data broken down by hospital" — while fact_inventory carries
+    `plant` and `total_cost`. It was not missing data, it was missing a synonym, and it
+    reported the gap in its own vocabulary as a gap in the warehouse.
+
+    Built from ENTITY_FAMILIES so it stays true as columns are added.
+    """
+    say = {
+        "hospital": ("hospital", "site", "centre", "center", "unit", "location", "branch"),
+        "material": ("drug", "item", "product", "SKU", "medicine", "consumable", "material"),
+        "vendor": ("supplier", "vendor", "distributor"),
+        "manufacturer": ("manufacturer", "brand", "maker", "pharma company"),
+        "category": ("category", "group", "therapy area", "class"),
+        "department": ("department", "ward", "cost centre"),
+    }
+    sch = schema()
+    out = []
+    for fam, words in say.items():
+        pat = ENTITY_FAMILIES.get(fam)
+        if not pat:
+            continue
+        cols = sorted({c for cols_ in sch.values() for c in cols_ if pat.match(c)})
+        if cols:
+            out.append(f"When the user says {'/'.join(words)} they mean these columns: "
+                       + ", ".join(cols))
+    return out
+
+
+@lru_cache(maxsize=1)
+def grain_notes(max_tables: int = 18) -> list[str]:
+    """What ONE ROW means, for tables that are keyed by entity x site.
+
+    `kpi_non_moving` holds 16,872 rows and 10,501 distinct materials, because it is one row
+    per material PER HOSPITAL. Asked how many SKUs are non-moving the engine answered
+    16,872 — then noticed the table only summed to 7,350 and said so, which is good
+    instinct attached to a wrong headline. COUNT(*) is not an item count on a table like
+    this, and that is a property of the table, discoverable once.
+
+    Checked against the data so it cannot drift, capped so it stays cheap.
+    """
+    from app.ai import warehouse
+    sch = schema()
+    ent = re.compile(r"^(material|material_id)$", re.I)
+    site = re.compile(r"^(plant|hospital)$", re.I)
+    notes: list[str] = []
+    for t, cols in sorted(sch.items()):
+        if len(notes) >= max_tables:
+            break
+        e = next((c for c in cols if ent.match(c)), None)
+        if not e or not any(site.match(c) for c in cols):
+            continue
+        try:
+            r = warehouse.run_sql(
+                f"SELECT COUNT(*) AS rows_n, COUNT(DISTINCT {e}) AS ent_n FROM {t}",
+                row_cap=1, timeout_s=5.0)["rows"][0]
+        except Exception:
+            continue
+        rows_n, ent_n = int(r["rows_n"] or 0), int(r["ent_n"] or 0)
+        if ent_n and rows_n > ent_n * 1.1:
+            notes.append(f"{t}: {rows_n:,} rows but only {ent_n:,} distinct {e} — one row per "
+                         f"{e} PER SITE. COUNT(*) here is NOT an item count; use "
+                         f"COUNT(DISTINCT {e}).")
+    return notes

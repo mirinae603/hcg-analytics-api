@@ -133,9 +133,40 @@ def profile_column(table: str, column: str) -> dict:
     return {"table": table, "column": column, **base, "most_common": top}
 
 
-def run_query(sql: str, entity_tokens: list[str] | None = None) -> dict:
+_COUNTING_WORDS = re.compile(r"\bhow many\b|\bnumber of\b|\bcount of\b", re.I)
+_ITEM_WORDS = re.compile(r"\bskus?\b|\bitems?\b|\bproducts?\b|\bdrugs?\b|\bmaterials?\b|\bmedicines?\b", re.I)
+_COUNT_STAR = re.compile(r"count\s*\(\s*\*\s*\)", re.I)
+
+
+def _miscounts_items(sql: str, question: str) -> str | None:
+    """COUNT(*) is not an item count on a table keyed by item PER SITE.
+
+    kpi_non_moving holds 16,872 rows and 10,501 distinct materials — one row per material
+    per hospital. Asked how many SKUs are non-moving, the answer was 16,872. The grain is
+    stated in the lesson board and was read past, which is what a stated preference is
+    worth; this makes it a property of the query instead.
+    """
+    q = question or ""
+    if not (_COUNTING_WORDS.search(q) and _ITEM_WORDS.search(q)):
+        return None
+    if not _COUNT_STAR.search(sql or ""):
+        return None
+    from app.ai.deep import capability
+    low = (sql or "").lower()
+    for note in capability.grain_notes():
+        table = note.split(":", 1)[0]
+        if re.search(rf"\b{re.escape(table)}\b", low):
+            return (f"COUNT(*) on {table} counts rows, and {note.split('—', 1)[-1].strip()} "
+                    f"The question asks how many ITEMS, so use COUNT(DISTINCT material).")
+    return None
+
+
+def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = "") -> dict:
     """Run it and SEE the result — including the error, which is information, not a dead end."""
     from app.ai import scope
+    miscount = _miscounts_items(sql, question)
+    if miscount:
+        return {"error": miscount}
     off = scope.missing_entity_scope(sql, entity_tokens or [])
     if off:
         return {"error": off}
@@ -224,7 +255,7 @@ DISPATCH = {
     "find_value": lambda a, ctx: find_value(a.get("value", "")),
     "profile_column": lambda a, ctx: profile_column(a.get("table", ""), a.get("column", "")),
     "get_kpi": lambda a, ctx: get_kpi(a.get("key", ""), a.get("plant", ""), a.get("category", "")),
-    "run_query": lambda a, ctx: run_query(a.get("sql", ""), ctx.get("entity_tokens")),
+    "run_query": lambda a, ctx: run_query(a.get("sql", ""), ctx.get("entity_tokens"), ctx.get("question", "")),
 }
 
 

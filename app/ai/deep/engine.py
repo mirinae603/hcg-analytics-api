@@ -48,6 +48,15 @@ PARALLEL = 4            # Azure rate limits bite harder than the CPU does
 ROW_CAP = 200
 MAX_TOOL_STEPS = 8      # a worker that hasn't found it in eight looks isn't going to
 
+# Capitalised words that name nothing in a warehouse — probing these wastes a round-trip
+# and binds noise.
+_STOPWORDS = {
+    "what", "which", "how", "show", "give", "list", "our", "the", "and", "for", "are", "was",
+    "top", "most", "least", "best", "worst", "compare", "across", "each", "every", "total",
+    "does", "have", "with", "from", "into", "them", "their", "this", "that", "over", "under",
+    "why", "when", "where", "who", "much", "many", "make", "made", "than", "then", "also",
+}
+
 
 # ── small helpers ────────────────────────────────────────────────────────────
 # A column that identifies a row rather than measuring it. `year` is the one that did the
@@ -81,7 +90,8 @@ def _kind(col: str, rows: list) -> str:
         return "pct"
     if c.endswith("_days") or c.endswith("_day") or "lead_time" in c or c.startswith("days_"):
         return "days"
-    if any(k in c for k in ("revenue", "cost", "margin", "value", "price", "spend", "amount")):
+    if any(k in c for k in ("revenue", "cost", "margin", "value", "price", "spend", "amount",
+                            "exposure", "mrp")):
         return "inr"
     if "pct" in c:
         return "pct"
@@ -174,11 +184,29 @@ def _kpi_rows(out: dict) -> dict:
     """A canonical KPI payload as {columns, rows}, so a KPI-backed finding renders exactly
     like a query-backed one — same table, same chart, same formatting."""
     data = ((out.get("payload") or {}).get("data") or {})
-    for key in ("rows", "items", "bands", "breakdown", "series"):
+    # A KPI payload holds several views of itself and the RIGHT one is the breakdown, not
+    # the summary. `near-expiry` keys are totals/buckets/timeline/categories/ladder, and
+    # "buckets" was missing from this list — so it fell through to `totals` and the answer
+    # reported `exposure` (₹1.98 Cr of TOTAL near-expiry) as "19,807,976 units expiring in
+    # 90 days". The banded breakdown is what a 90-day question is actually asking for.
+    for key in ("buckets", "bands", "rows", "items", "breakdown", "series",
+                "vendors", "plants", "groups", "categories", "timeline", "ladder"):
         v = data.get(key)
         if isinstance(v, list) and v and isinstance(v[0], dict):
             cols = list(v[0].keys())
             return {"columns": cols, "rows": v[:200], "row_count": len(v)}
+    # Generic fallback: the largest list of records in the payload. The named list above
+    # keeps the RIGHT view winning where two exist (near-expiry: buckets, not categories),
+    # but a KPI naming its breakdown something unforeseen used to fall through to `totals`
+    # — which is how vendor-volume-contribution, whose payload literally carries
+    # top1 = 45.8%, produced "100% of ₹649.91 Cr from a single vendor".
+    best_key, best_len = None, 0
+    for k, v in data.items():
+        if isinstance(v, list) and len(v) > best_len and v and isinstance(v[0], dict):
+            best_key, best_len = k, len(v)
+    if best_key:
+        v = data[best_key]
+        return {"columns": list(v[0].keys()), "rows": v[:200], "row_count": len(v)}
     totals = data.get("totals")
     if isinstance(totals, dict) and totals:
         return {"columns": list(totals.keys()), "rows": [totals], "row_count": 1}
@@ -360,11 +388,50 @@ def answer(query: str, history: list | None = None):
         except Exception:
             pass
 
+    lessons: list[str] = []
+    lesson_lock = Lock()
+
+    # The user's vocabulary is not the schema's. Seeded before anything is framed, because
+    # a missing synonym gets reported as missing DATA.
+    lessons.extend(capability.vocabulary())
+    # what ONE ROW means: COUNT(*) on a material-per-site table is not an item count
+    lessons.extend(capability.grain_notes())
+
+    # RESOLVE THE ENTITIES THE QUESTION NAMES, whatever kind they are.
+    #
+    # Entity binding only ever triggered on a QUOTED item, so "Bangalore", "MSD" and vendor
+    # names bound nothing and any query could claim to be about them. Asked for the top
+    # selling drugs in Bangalore, the engine returned "KEYTRUDA ₹16.37 Cr in Bangalore
+    # hospitals" — and on the previous run ₹10.78 Cr — for a filter that cannot exist:
+    # a city lives only in dim_plant.plant_name, which shares no rows with the sales tables.
+    #
+    # find_value() already knows where any literal lives. Using it on the capitalised words
+    # of the question binds every entity kind, not just materials.
+    resolved_where: dict[str, list[str]] = {}
+    for cand in dict.fromkeys(re.findall(r"\b[A-Z][A-Za-z]{3,}\b", query)):
+        if cand.lower() in _STOPWORDS:
+            continue
+        try:
+            hits = tools.find_value(cand).get("found_in") or []
+        except Exception:
+            continue
+        if hits:
+            resolved_where[cand] = [f"{h['table']}.{h['column']}" for h in hits[:4]]
+    if resolved_where:
+        for name, places in resolved_where.items():
+            lessons.append(f"'{name}' exists ONLY in {', '.join(places)} — any figure claimed to be "
+                           f"about it must come from a query that filters one of those columns. "
+                           f"If the measure you need is in a table that cannot reach it, say so.")
+
     frame = llm.ask_json(
         cl, role="frame",
         system=("You frame analytics questions against a fixed warehouse. You are given the REAL "
                 "schema — never assume a table or column that is not listed.\n\n"
-                "ANSWER SHAPES (pick the one this question really is):\n" + shapes.catalog()
+                "VOCABULARY — the user's words are not the schema's:\n- "
+                + "\n- ".join(capability.vocabulary())
+                + "\n\nANSWER SHAPES (pick the one this question really is):\n" + shapes.catalog()
+                + "\n\nCANONICAL METRICS (kpi_key — the dashboard's own calculations):\n"
+                + ", ".join(tools.kpi_keys())
                 + "\n\n" + capability.brief()),
         user=f"Question: {query}\n\nRecent conversation:\n{hist}\n\nItem footprint:\n{footprint}",
         schema_hint=schemas.FRAME)
@@ -388,8 +455,6 @@ def answer(query: str, history: list | None = None):
     # parallel. Each worker writes what it learned about the SHAPE of the data here, and
     # every later worker reads it. One worker's dead end becomes everyone's starting
     # knowledge, which is the cheapest accuracy win in the engine.
-    lessons: list[str] = []
-    lesson_lock = Lock()
 
     # SEED the board with what the schema already proves, before any worker spends a step
     # discovering it. Four workers independently hunted for a monthly sales grain and
@@ -421,6 +486,10 @@ def answer(query: str, history: list | None = None):
                                 if e["table"].startswith("sales") and not e["time"])
         if _timed:
             lessons.append("Tables carrying BOTH this entity and a time column: " + ", ".join(_timed[:14]))
+        # structural traps discovered from the data, not asserted — e.g. the two hospital
+        # code systems that look interchangeable and share zero rows
+        for _note in capability.joinability():
+            lessons.append(_note)
         if _sales_no_time:
             lessons.append("These sales tables have NO time/month column, so no trend can come "
                            "from them: " + ", ".join(_sales_no_time))
@@ -456,6 +525,39 @@ def answer(query: str, history: list | None = None):
     subs = (plan.get("sub_questions") or [])[:MAX_SUBQUESTIONS]
     if not subs:
         subs = [{"id": "q1", "question": query, "why": "direct", "table": ""}]
+    # CANONICAL FIRST. If a dashboard metric already answers this, take its figure before
+    # any SQL is written. "How much stock is expiring in 90 days" was being re-derived as
+    # `expiry_date <= today + 90` — which silently includes stock that expired MONTHS ago
+    # and returned 101,005 units against the canonical 45,223. A chatbot that disagrees
+    # with the dashboard is worse than one that says nothing, and the definition of
+    # "expiring" lives in exactly one place.
+    kpi_key = (frame.get("kpi_key") or "").strip()
+    if kpi_key and kpi_key in tools.kpi_keys():
+        yield {"type": "step", "text": f"Taking the canonical figure for {kpi_key}"}
+        out = tools.get_kpi(kpi_key)
+        if out.get("canonical"):
+            res = _kpi_rows(out)
+            if res.get("row_count"):
+                findings.append({"sub": {"id": "kpi", "question": f"canonical {kpi_key}"},
+                                 "sql": f"-- get_kpi('{kpi_key}')", "res": res, "canonical": True,
+                                 "purpose": f"{kpi_key} (the dashboard's own calculation)"})
+                queries.append({"purpose": f"{kpi_key} (canonical)", "sql": f"-- get_kpi('{kpi_key}')",
+                                "rows": res["row_count"]})
+                yield {"type": "sql", "purpose": f"{kpi_key} (canonical)",
+                       "sql": f"-- get_kpi('{kpi_key}')", "rows": res["row_count"]}
+                # still single-threaded here, and _note_lesson is defined further down
+                lessons.append(f"The canonical {kpi_key} figure is already retrieved — quote "
+                               f"it, do not recompute it in SQL.")
+                # The summary block often holds the very fact the question asks for —
+                # vendor-volume-contribution carries top1/top5/top10 concentration shares
+                # that no SQL needs to rediscover.
+                _tot = ((out.get("payload") or {}).get("data") or {}).get("totals")
+                if isinstance(_tot, dict) and _tot:
+                    _flat = {k: v for k, v in _tot.items() if isinstance(v, (int, float, str))}
+                    if _flat:
+                        lessons.append(f"Canonical {kpi_key} headline figures (authoritative, "
+                                       f"quote directly): {json.dumps(_flat, default=str)[:400]}")
+
     yield {"type": "step", "text": f"Investigating {len(subs)} lines of enquiry"}
 
 
@@ -512,7 +614,7 @@ def answer(query: str, history: list | None = None):
                 + (f"\nSuggested starting table (a hint, not a constraint): {sub.get('table')}" if sub.get("table") else ""))
 
         msgs = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}]
-        ctx = {"entity_tokens": entity_tokens}
+        ctx = {"entity_tokens": entity_tokens, "question": query}
         last_result = None
         last_sql = ""
         last_kpi = None          # a canonical KPI payload, flattened for presentation
@@ -557,7 +659,7 @@ def answer(query: str, history: list | None = None):
                                 "purpose": args.get("what_it_shows") or sub.get("question")}
                         break
                     if sql and (last_result is None or sql != last_sql):
-                        last_result = tools.run_query(sql, entity_tokens)
+                        last_result = tools.run_query(sql, entity_tokens, query)
                         last_sql = sql
                     if last_result and last_result.get("_full") is not None:
                         _note_lesson(args.get("what_it_shows", "")[:180])
@@ -607,6 +709,11 @@ def answer(query: str, history: list | None = None):
         return {"sub": sub, "skipped": "ran out of steps without a usable result"}
 
 
+    def _evidence(fs):
+        return "\n\n".join(
+            f"[{f['sub'].get('id','?')}] {_hospitalise(f['purpose'])}\n{_compact(f['res'])}"
+            for f in fs)
+
     # TWO WAVES. Everything that stands alone runs first and in parallel; what depends on
     # knowing a specific entity runs second, with the first wave's results handed to it as
     # concrete values. This is the difference between "what is the top vendor's lead time"
@@ -644,6 +751,29 @@ def answer(query: str, history: list | None = None):
             else:
                 yield {"type": "step", "text": f"Ruled out: {out['sub'].get('question','')[:60]}"}
 
+    # DIRECT FALLBACK. If decomposition produced nothing, answer the question ITSELF
+    # before declaring it unanswerable. This is what a person does when their plan falls
+    # apart: they stop planning and just write the obvious query.
+    #
+    # Without it the engine reported "I couldn't establish anything" for "what is our
+    # single biggest selling product?" — one ORDER BY over one table — and claimed no
+    # table links hospitals to inventory value while fact_inventory carries plant and
+    # total_cost. Both were failures of the PLAN, reported as limits of the DATA, which is
+    # the most damaging thing this system can do: it teaches the user their data is worse
+    # than it is.
+    if not findings:
+        yield {"type": "step", "text": "Answering it directly instead"}
+        direct = investigate({"id": "direct", "question": query,
+                              "why": "answer the question as asked, without decomposing it",
+                              "table": ""})
+        if direct.get("res") is not None:
+            findings.append(direct)
+            queries.append({"purpose": direct["purpose"], "sql": direct["sql"],
+                            "rows": direct["res"]["row_count"]})
+            yield {"type": "sql", "purpose": direct["purpose"], "sql": direct["sql"],
+                   "rows": direct["res"]["row_count"]}
+            evidence = _evidence(findings)
+
     if not findings:
         text = ((f"That isn't answerable from this data. {blocked_reason}" if blocked_reason else
                  "I couldn't establish anything solid enough to report — every line of enquiry "
@@ -660,11 +790,6 @@ def answer(query: str, history: list | None = None):
     # offered "the material ID for Keytruda is 101313" as a driver: given a query, a writer
     # describes the query. The SQL is provenance for the reader (the "N queries run"
     # disclosure), not context for the author.
-    def _evidence(fs):
-        return "\n\n".join(
-            f"[{f['sub'].get('id','?')}] {_hospitalise(f['purpose'])}\n{_compact(f['res'])}"
-            for f in fs)
-
     evidence = _evidence(findings)
 
     # ── PHASE 4 · CORROBORATE (different model, different route) ─────────────
@@ -770,6 +895,11 @@ def answer(query: str, history: list | None = None):
                 f"THIS ANSWER MUST: {shape['answer_must']}.\n"
                 "STRUCTURE: lead with the answer and its number; then WHAT DRIVES IT, ranked; then "
                 "WHAT YOU RULED OUT; then the limits.\n"
+                "NEVER state a percentage or a share unless that exact percentage appears in "
+                "the DERIVED FACTS. Do not compute one from the rows: a query returns the rows it "
+                "was asked for, not the whole company, so dividing a number by the rows beside it "
+                "produces confident nonsense — '100% of procurement value from one vendor' when the "
+                "real figure is 45.8%. If the derived facts carry no share, give the values alone.\n"
                 "NEVER describe the data or the query. 'The data is grouped by year, month and "
                 "hospital', 'the evidence provides', 'the material ID is 101313' — these are notes "
                 "about plumbing, not findings, and they are the difference between an analyst and "
@@ -839,16 +969,37 @@ def answer(query: str, history: list | None = None):
         # "To calculate the stock change for 'keytruda 100mg INJ vial'" — an intention,
         # which is what was being printed above the chart.
         title = _chart_title(best, val)
-        spec = {"type": "bar", "x": cat, "y": [val], "title": title,
-                "value_format": _kind(val, res["rows"]),
-                # a time series reads left-to-right, a ranking reads top-down
-                "horizontal": cat.lower() not in ("month", "month_name", "period", "year")}
+
+        # CHART THE ANSWER, NOT THE QUERY.
+        #
+        # Two problems with always drawing a bar of the raw rows. A time series is a LINE —
+        # drawn as bars it reads as a ranking, and sorted by value it stops being a trend at
+        # all. And the raw result is often a grid (hospital x month) while the prose
+        # describes the series derived FROM it, so the chart and the words disagreed: a
+        # "trend" answer sat above a chart of hospitals.
+        #
+        # The derived series is what the answer is about, so that is what gets drawn, and
+        # the shape decides how.
+        series = next((d for d in derived if d.get("series")), None)
+        if shape_name == "trend" and series:
+            rows_for_chart = [{"period": p["period"], series["measure"]: p["value"]}
+                              for p in series["series"]]
+            spec = {"type": "line", "x": "period", "y": [series["measure"]],
+                    "title": title, "value_format": _kind(series["measure"], res["rows"])}
+        else:
+            rows_for_chart = res["rows"][:14]
+            spec = {"type": "bar", "x": cat, "y": [val], "title": title,
+                    "value_format": _kind(val, res["rows"]),
+                    # a ranking reads top-down; a banded exposure reads in band order
+                    "horizontal": cat.lower() not in ("month", "month_name", "period", "year",
+                                                      "bucket", "band")}
         try:
-            fig = charts.build(res["rows"][:14], spec)
+            fig = charts.build(rows_for_chart, spec)
             if fig:
                 yield {"type": "chart", "plotly": fig}
         except Exception:
             pass
+
         yield {"type": "table", "table": _table_payload(res, _hospitalise(title)), "note": ""}
 
     verified = "flagged" if crit.get("refuted") else (

@@ -148,19 +148,81 @@ def derive_ranking(res: dict) -> dict:
     cols, rows = res.get("columns") or [], res.get("rows") or []
     mcol = _measure_col(cols, rows)
     lcol = _label_col(cols, rows)
-    if not (mcol and lcol and len(rows) >= 2):
+    if not (mcol and lcol and rows):
         return {}
     pairs = [(str(r.get(lcol)), _num(r.get(mcol))) for r in rows]
     pairs = [(l, v) for l, v in pairs if v is not None]
-    if len(pairs) < 2:
+    # A single row still gets a derivation — precisely so it can carry the warning that
+    # there is nothing to take a percentage of. Returning {} left the model to compute the
+    # share itself, which is where "100% of ₹649.91 Cr from one vendor" came from.
+    if not pairs:
         return {}
     pairs.sort(key=lambda x: -x[1])
     total = sum(v for _, v in pairs) or 1.0
-    return {"measure": mcol, "dimension": lcol, "n": len(pairs),
-            "top": [{"label": l, "value": v, "share_pct": v / total * 100} for l, v in pairs[:5]],
-            "top1_share_pct": pairs[0][1] / total * 100,
-            "top3_share_pct": sum(v for _, v in pairs[:3]) / total * 100,
-            "tail_n": max(0, len(pairs) - 3)}
+    out: dict[str, Any] = {"measure": mcol, "dimension": lcol, "n": len(pairs),
+                           "top": [{"label": l, "value": v} for l, v in pairs[:5]]}
+
+    # A SHARE NEEDS A REAL DENOMINATOR.
+    #
+    # These percentages were computed over the rows the query happened to RETURN, so a
+    # single-row result scored 100% and the brief said "100% of the total procurement value
+    # of ₹649.91 Cr is sourced from one vendor" (the true leader is 45.8%) and "GLASS PAPER
+    # accounts for 100.0% of out-of-stock demand". Both are false, both sound authoritative,
+    # and both came from dividing a number by itself. Below three rows there is nothing to
+    # take a share OF, and even above it the denominator is only the returned set — which is
+    # said out loud rather than implied.
+    if len(pairs) >= 3:
+        for i, item in enumerate(out["top"]):
+            item["share_of_returned_pct"] = pairs[i][1] / total * 100
+        out["top1_share_of_returned_pct"] = pairs[0][1] / total * 100
+        out["top3_share_of_returned_pct"] = sum(v for _, v in pairs[:3]) / total * 100
+        out["tail_n"] = max(0, len(pairs) - 3)
+        out["share_note"] = (f"Percentages are shares of the {len(pairs)} rows returned, NOT of the "
+                             f"company total, unless this query covered everything. Say 'of the top "
+                             f"{len(pairs)}' or run an unfiltered total before claiming a share of all.")
+    else:
+        out["share_note"] = (f"Only {len(pairs)} row(s) returned — there is no denominator here, so do "
+                             f"NOT state any percentage share. Report the values alone.")
+    return out
+
+
+_DAY_BAND = re.compile(r"^(\d+)\s*[-–]\s*(\d+)\s*d?$|^(\d+)\s*d?\+$", re.I)
+
+
+def _cumulative_bands(rows: list[dict], lcol: str, cols: list[str]) -> dict:
+    """Cumulative totals for day-banded results, computed rather than left to the model.
+
+    "How much is expiring in the next 90 days" is answered by 0-30d + 31-90d — and NOT by
+    the 'Expired' band, which is stock that expired months ago. Handed the four canonical
+    buckets, the model summed all of them and reported 101,005 units against a true 45,223,
+    then 87,775 on the next run. The arithmetic is trivial and the judgement is not; doing
+    it here removes both the error and the variance, and makes 'expired' vs 'expiring' a
+    property of the answer rather than of the model's mood.
+    """
+    out: dict[str, Any] = {}
+    bands: list[tuple[int, dict]] = []
+    expired = None
+    for r in rows:
+        label = str(r.get(lcol) or "").strip()
+        if label.lower().startswith("expired"):
+            expired = r
+            continue
+        m = _DAY_BAND.match(label.replace(" ", ""))
+        if m:
+            upper = int(m.group(2) or m.group(3) or 0)
+            bands.append((upper, r))
+    if not bands:
+        return out
+    bands.sort(key=lambda x: x[0])
+    measures = [c for c in cols if c != lcol and any(isinstance(r.get(c), (int, float)) for r in rows)]
+    for upper, _ in bands:
+        agg = {m: sum(_num(r.get(m)) or 0 for u, r in bands if u <= upper) for m in measures}
+        out[f"within_{upper}_days"] = agg
+    if expired is not None:
+        out["already_expired"] = {m: _num(expired.get(m)) or 0 for m in measures}
+        out["note"] = ("'within_N_days' EXCLUDES already-expired stock, which is reported "
+                       "separately as already_expired. Do not add them together.")
+    return out
 
 
 def derive_exposure(res: dict) -> dict:
@@ -176,9 +238,14 @@ def derive_exposure(res: dict) -> dict:
         return {}
     total = sum(v for _, v in vals)
     worst = max(vals, key=lambda x: x[1])
-    return {"measure": mcol, "total": total, "bands": len(vals),
-            "worst": {"label": worst[0], "value": worst[1],
-                      "share_pct": (worst[1] / total * 100) if total else None}}
+    out = {"measure": mcol, "total": total, "bands": len(vals),
+           "worst": {"label": worst[0], "value": worst[1],
+                     "share_pct": (worst[1] / total * 100) if total else None}}
+    if lcol:
+        cum = _cumulative_bands(rows, lcol, cols)
+        if cum:
+            out["cumulative"] = cum
+    return out
 
 
 SHAPES: dict[str, dict[str, Any]] = {

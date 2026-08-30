@@ -5,11 +5,16 @@ to be parsed out of prose is a phase that degrades silently — and silent degra
 exact failure mode this whole engine exists to remove.
 """
 
-FRAME = """Return: {"shape": str, "intent": str, "entity": str|null, "entity_family":
+FRAME = """Return: {"shape": str, "kpi_key": str, "intent": str, "entity": str|null, "entity_family":
 "material"|"manufacturer"|"vendor"|"hospital"|"category"|null, "needs_time_series": bool,
 "answerable": bool, "blocked_reason": str}. `shape` is the KIND of answer this question
 needs, chosen from the catalogue given — it decides what a complete answer owes the reader,
-so pick the one the question really is rather than the one the words resemble. Set answerable=false ONLY if the schema
+so pick the one the question really is rather than the one the words resemble.
+
+`kpi_key` is the canonical dashboard metric that already answers this, from the list given,
+or "" if none does. These are the SAME calculations the dashboard cards use, so when one
+covers the question its figure is authoritative and re-deriving it in SQL can only produce
+a number that disagrees with what the user sees on their screen. Set answerable=false ONLY if the schema
 provided genuinely cannot support the question (e.g. the measure and the requested
 breakdown never appear on the same table); put the specific reason in blocked_reason."""
 

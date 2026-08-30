@@ -26,82 +26,7 @@ except Exception:
     pass
 
 
-def has(*subs):
-    return lambda t: all(s.lower() in t.lower() for s in subs)
-
-
-def lacks(*subs):
-    return lambda t: not any(s.lower() in t.lower() for s in subs)
-
-
-def all_of(*checks):
-    return lambda t: all(c(t) for c in checks)
-
-
-# Every expectation below is grounded in a figure verified directly against the warehouse.
-CASES = [
-    {
-        "id": "keytruda-trend",
-        "q": 'get me the sales trend of "KEYTRUDA 100MG INJ VIAL"',
-        # There is no material x month SALES grain. The only correct behaviours are to
-        # substitute a real grain AND say so, or to say plainly it does not exist. What is
-        # NOT acceptable is inventing one, or reporting company-wide totals as this item's.
-        # A check must encode what is ACCEPTABLE, not what is ideal. Two behaviours are
-        # acceptable: substitute a real grain and say so (better), or refuse honestly
-        # (weaker, still correct). Scoring the honest refusal as a failure would push
-        # someone to "fix" it by inventing a trend — the very thing this case exists to
-        # prevent. What is NOT acceptable: a fabricated monthly series, or the
-        # ALL-material total reported as this item's.
-        "check": all_of(
-            lambda t: any(k in t.lower() for k in
-                          ("purchas", "consumption", "no monthly sales", "not available",
-                           "no real trend", "doesn't hold", "does not hold")),
-            lacks("89.52"),        # sales_monthly's ALL-material December total
-            lacks("47.48 cr in december", "47.48 cr for december"),  # 6-month total as one month
-            lacks("plant "),       # must read "hospital"
-        ),
-        "why": "substitute a real grain and say so, or refuse honestly — never fabricate a trend",
-    },
-    {
-        "id": "bangalore-top-drugs",
-        "q": "get me top 5 most selling drugs in bangalore",
-        # Bangalore is a VALUE inside dim_plant.plant_name, not a column. Answerable.
-        "check": all_of(has("bangalore"), lacks("not answerable", "does not include")),
-        # A clarifying question that happens to contain the word "Bangalore" passed this
-        # case while answering nothing. Asking the user which hospital they meant is a
-        # legitimate move in general, but this question IS answerable from the data, so
-        # here it is a dodge — and a harness that scores a dodge as a pass is worse than
-        # no harness.
-        "must_answer": True,
-        "why": "city lives inside plant_name; requires a join, must not refuse or deflect",
-    },
-    {
-        "id": "msd-procurement",
-        "q": "Show procurement details for MSD items",
-        # 614 lines, Rs 42.34 Cr, via manufacturer_desc. Filtering vendor_name gives 0.
-        "check": lacks("no recorded procurement", "no procurement details", "not available"),
-        "why": "MSD is a manufacturer, not a vendor — must not report absence",
-    },
-    {
-        "id": "msd-lead-times",
-        "q": "List lead times for MSD supplies",
-        "check": lacks("no recorded lead times", "no lead times"),
-        "why": "lead times are keyed by vendor; must hop manufacturer -> its vendors",
-    },
-    {
-        "id": "vendor-concentration",
-        "q": ("Our procurement spend is concentrated in one vendor. How risky is that and "
-              "which categories would hurt most if that vendor failed?"),
-        "check": all_of(has("vardhman"), lacks("evidence does not allow", "not answerable")),
-        "why": "must identify the vendor and reach a conclusion, not report an empty investigation",
-    },
-    {
-        "id": "expiry-90d",
-        "q": "How much stock is expiring in 90 days?",
-        "check": has("39.97"),   # canonical KPI figure, verified
-        "why": "a canonical figure must come back exactly",
-    },
-]
+from evals.cases import CASES  # the question bank + its ground truth
 
 
 def run(case, mode="deep"):
@@ -139,23 +64,41 @@ def run(case, mode="deep"):
 def main():
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     mode = sys.argv[2] if len(sys.argv) > 2 else "deep"
-    print(f"golden set · mode={mode} · {runs} run(s) each · {len(CASES)} cases\n")
+    only = sys.argv[3] if len(sys.argv) > 3 else ""
+    cases = [c for c in CASES if not only or only in c["id"]]
+    print(f"golden set · mode={mode} · {runs} run(s) each · {len(cases)} cases\n", flush=True)
+
+    # 30 cases x N runs is an hour of wall clock run one at a time, which is long enough
+    # that nobody runs it — and an eval nobody runs is not a safety net.
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = [(c, i) for c in cases for i in range(runs)]
+    # 3, not 6: each deep run fans out to 4 workers of its own, so 6 concurrent cases put
+    # ~24 requests on Azure at once and the eval started failing itself with 429s —
+    # measuring the harness, not the engine.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        done = list(pool.map(lambda j: (j[0]["id"], run(j[0], mode)), jobs))
+    by_id: dict = {}
+    for cid, r in done:
+        by_id.setdefault(cid, []).append(r)
+
     total = passed = 0
-    for c in CASES:
-        results = [run(c, mode) for _ in range(runs)]
+    for c in cases:
+        results = by_id.get(c["id"], [])
         ok = sum(1 for r in results if r["ok"])
         total += runs
         passed += ok
-        secs = sum(r["secs"] for r in results) / runs
-        q = sum(r["queries"] for r in results) / runs
+        if not results:
+            continue
+        secs = sum(r["secs"] for r in results) / len(results)
+        q = sum(r["queries"] for r in results) / len(results)
         mark = "PASS" if ok == runs else ("FLAKY" if ok else "FAIL")
         kinds = {r.get("kind") for r in results} - {"answer"}
         tag = f"  [{'/'.join(sorted(kinds))}]" if kinds else ""
-        print(f"  [{mark:5s}] {c['id']:22s} {ok}/{runs}   {secs:5.1f}s  {q:.1f} queries{tag}")
+        print(f"  [{mark:5s}] {c['id']:26s} {ok}/{len(results)}   {secs:5.1f}s  {q:.1f}q{tag}", flush=True)
         if ok < runs:
             bad = next(r for r in results if not r["ok"])
             print(f"           why it should pass: {c['why']}")
-            print(f"           got: {(bad.get('err') or bad['text'])[:170].strip()}")
+            print(f"           got: {(bad.get('err') or bad['text'])[:200].strip()}", flush=True)
     print(f"\n  OVERALL {passed}/{total} = {100 * passed / max(total, 1):.0f}%")
     return 0 if passed == total else 1
 
