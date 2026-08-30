@@ -85,3 +85,57 @@ def test_format_kpi_payload_handles_none_and_non_numeric_leaves():
     assert out["value"] is None
     assert out["name"] == "M065-INJECTIONS"
     assert out["nested"]["cost"] is None
+
+
+# ── deterministic number verification ────────────────────────────────────────
+# The LLM auditor is measurably unreliable on figure errors: prompted 5x with a
+# mislabelled metric it caught it only 2/5, and it costs ~2.1s of serial latency. Every
+# figure the model sees has already been rendered by _fmt(), so "is this number supported"
+# is decidable by string membership. These lock that in — especially the real 10x bug that
+# reached production (₹300.21 Cr printed for a ₹30.02 Cr figure) in a get_kpi-only turn
+# that the audit was skipping entirely.
+from app.ai.orchestrator import _unsupported_numbers, _canon_num, _evidence_numbers
+
+_RES = [{"columns": ["label", "value", "share"],
+         "rows": [{"label": "critical", "value": 300210253.64, "share": 49.6},
+                  {"label": "low", "value": 55290098.93, "share": 9.1}],
+         "row_count": 2}]
+
+
+def test_catches_the_real_10x_error():
+    bad = _unsupported_numbers("Critical stock is ₹300.21 Cr (49.6%) and low is ₹55.29 Cr.", _RES)
+    assert "₹300.21 Cr" in bad and "₹55.29 Cr" in bad
+
+
+def test_passes_the_correct_figures():
+    assert _unsupported_numbers("Critical is ₹30.02 Cr (49.6%) and low is ₹5.53 Cr (9.1%).", _RES) == []
+
+
+def test_money_is_zero_tolerance_even_when_most_figures_are_right():
+    # an earlier draft used a flat tolerance of 2 and let the 10x bug through, because that
+    # answer contained exactly two bad figures. A rupee magnitude is never "derived".
+    bad = _unsupported_numbers("Critical ₹30.02 Cr, low ₹5.53 Cr, total ₹999.00 Cr.", _RES)
+    assert bad == ["₹999.00 Cr"]
+
+
+def test_derived_percentages_do_not_false_flag():
+    # an analyst legitimately says "up 25%" without 25 appearing in any cell; a guard that
+    # bounces those gets switched off, so percentages carry a small tolerance
+    assert _unsupported_numbers("Critical is ₹30.02 Cr, up 25% on the ₹5.53 Cr low band.", _RES) == []
+
+
+def test_prose_without_numbers_is_never_flagged():
+    assert _unsupported_numbers("Most of the stock sits in the critical band.", _RES) == []
+    assert _unsupported_numbers("", _RES) == []
+    assert _unsupported_numbers("₹30.02 Cr", []) == []      # no evidence => nothing to check against
+
+
+def test_canonicalisation_ignores_formatting_noise():
+    assert _canon_num("₹ 30.02 Cr") == _canon_num("₹30.02 Cr") == "30.02cr"
+    assert _canon_num("72.0%") == _canon_num("72%") == "72%"   # model rounds legitimately
+    assert _canon_num("1,234") == "1234"
+
+
+def test_evidence_set_is_built_from_formatted_values():
+    ev = _evidence_numbers(_RES)
+    assert "30.02cr" in ev and "5.53cr" in ev and "49.6%" in ev

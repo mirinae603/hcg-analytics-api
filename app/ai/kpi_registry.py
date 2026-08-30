@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional
 from fastapi.params import Query as _QueryParam
 
 from app.api import legacy_kpi
+from app.core import data_access as da
 
 # Every entry: key -> (callable, display label, accepts Plant?, accepts Category?, one-line
 # description for the model). The callable is the REAL FastAPI route handler, called directly
@@ -184,6 +185,21 @@ def call_kpi(key: str, plant: Optional[str] = None, category: Optional[str] = No
     if entry["plant"]:
         kwargs["Plant"] = plant if plant else "All Plants"
     if entry["category"]:
+        # Fail loudly on a category this KPI cannot actually filter on. filter_category
+        # equality-matches the six derived buckets, so anything else (a material_group like
+        # "Injections", a drug class, a typo) silently yields an EMPTY frame and the KPI
+        # returns a confident 0.0 with no indication anything went wrong. A raised error
+        # reaches the model as a tool error it can correct from; a zero does not.
+        # NB: resolve_category returns an UNRECOGNISED value unchanged (deliberately — see
+        # its docstring; that makes filter_category yield empty rather than silently
+        # unfiltered for the dashboard, whose selector is driven off /meta/categories).
+        # So `is None` never fires here — membership in CATEGORIES is the real test.
+        if category and da.resolve_category(category) not in da.CATEGORIES:
+            raise ValueError(
+                f"'{category}' is not a material category. Valid categories: {list(da.CATEGORIES)}. "
+                f"If you meant a material_group / dosage form (e.g. 'M065-INJECTIONS', 'Tablets') "
+                f"or a drug class, use run_sql instead — get_kpi cannot filter on those."
+            )
         kwargs["Category"] = category or None
     result = entry["fn"](**kwargs)
     # Provenance tag: how the caller (orchestrator) knows this came from the canonical
@@ -215,6 +231,19 @@ def tool_schema() -> dict:
             "parameters": {"type": "object", "required": ["kpi"], "properties": {
                 "kpi": {"type": "string", "enum": keys, "description": "Which canonical KPI to fetch."},
                 "plant": {"type": "string", "description": "A specific hospital code (e.g. 'HC05') to scope to, or omit/leave blank for the company-wide figure. Ignored for KPIs that don't support it."},
-                "category": {"type": "string", "description": "A specific category to scope to (e.g. 'Injections'), or omit for all categories. Ignored for KPIs that don't support it."},
+                # HARD ENUM, not a free string. The old description's own example was
+                # "e.g. 'Injections'" — but Injections is a MATERIAL GROUP, not one of the six
+                # derived categories filter_category matches on, so following this tool's own
+                # documentation returned an empty frame and the KPI answered `median_doh: 0.0,
+                # total_skus: 0`. A confident zero, and because the turn was canonical-only the
+                # audit was skipped and the UI showed no badge. Constraining the enum makes the
+                # wrong value unsendable rather than silently wrong.
+                "category": {
+                    "type": "string", "enum": list(da.CATEGORIES),
+                    "description": ("Derived material category to scope to, or omit for all. These six are the ONLY "
+                                    "valid values. NOT the same as material_group — for a dosage-form filter like "
+                                    "'M065-INJECTIONS'/'Injections'/'Tablets' use run_sql, not this argument. "
+                                    "Ignored for KPIs that don't support it."),
+                },
             }}},
     }

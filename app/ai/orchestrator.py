@@ -394,6 +394,100 @@ def _pick_result(results, chart):
     return results[-1] if results else None
 
 
+# ── deterministic number check ────────────────────────────────────────────────
+# Every figure the model is shown has already been rendered to a string by _fmt() before
+# it reaches the model ("₹30.02 Cr", "16.6 d", "72.0%"). That makes "is this number
+# supported?" a DECIDABLE question — string membership — rather than something to ask a
+# second LLM about. Worth doing because the LLM auditor is measurably unreliable on
+# exactly this: prompted with a figure that contradicted its evidence it caught the
+# mislabelled-metric case only 2 times in 5 runs, and it costs ~2.1s of serial latency
+# even on a 1,071-token payload. This check is exact and runs in microseconds.
+#
+# It deliberately answers ONLY "does this figure appear in the evidence". It cannot judge
+# scope or labelling, so it does not replace _verify — it runs first and catches the class
+# _verify is worst at (fabricated/mis-transcribed magnitudes), leaving the LLM to do the
+# judgment work it is actually good at.
+_NUM_TOKEN = re.compile(r"""
+    (?:₹\s?[\d,]+(?:\.\d+)?\s*(?:Cr|L|K)?)   # money, with or without a scale suffix
+  | (?:[\d,]+(?:\.\d+)?\s*%)                  # percentages
+  | (?:\b[\d,]+(?:\.\d+)?\s*(?:d|days)\b)     # day counts
+""", re.X | re.I)
+
+_NUM_ONLY = re.compile(r"[\d.]+")
+
+
+def _canon_num(tok: str) -> str | None:
+    """'₹ 30.02 Cr' -> '30.02cr'; '72.0%' -> '72%'; '16.6 d' -> '16.6d'. Trailing zeros are
+    dropped so 72.0 and 72 compare equal — the model legitimately rounds for prose."""
+    m = _NUM_ONLY.search(tok.replace(",", ""))
+    if not m:
+        return None
+    try:
+        v = float(m.group(0))
+    except ValueError:
+        return None
+    unit = ""
+    low = tok.lower()
+    for u in ("cr", "l", "k", "%", "d"):
+        if u in low.split(m.group(0))[-1]:
+            unit = u
+            break
+    return f"{v:g}{unit}"
+
+
+def _evidence_numbers(results: list[dict]) -> set[str]:
+    """Every pre-formatted figure across every query result this turn, canonicalised."""
+    out: set[str] = set()
+    for res in results or []:
+        cols = res.get("columns") or []
+        kinds = {c: col_kind(c, res.get("rows") or []) for c in cols}
+        for row in (res.get("rows") or []):
+            for c in cols:
+                s = _fmt(row.get(c), kinds[c])
+                if s is None:
+                    continue
+                for tok in _NUM_TOKEN.findall(str(s)) or [str(s)]:
+                    cn = _canon_num(str(tok))
+                    if cn:
+                        out.add(cn)
+    return out
+
+
+def _unsupported_numbers(answer: str, results: list[dict], pct_allow: int = 2) -> list[str]:
+    """Figures in the prose that appear nowhere in the evidence.
+
+    MONEY is zero-tolerance. A rupee magnitude cannot be legitimately "derived" in prose —
+    if "₹300.21 Cr" is not in the evidence, it is wrong, full stop. That is precisely the
+    error class this exists for (the real 10x bug printed ₹300.21 Cr for a ₹30.02 Cr
+    figure), and an earlier draft of this function let it through because a flat tolerance
+    of 2 swallowed the two bad figures in that very answer.
+
+    PERCENTAGES AND DAY COUNTS get a small tolerance, because those genuinely are derivable
+    from supported numbers ("up 25%", "about a third") without appearing verbatim in a cell.
+    Being strict there would produce constant false bounces on correct answers, and a guard
+    that cries wolf gets switched off."""
+    if not answer or not results:
+        return []
+    have = _evidence_numbers(results)
+    bad_money: list[str] = []
+    bad_other: list[str] = []
+    for tok in _NUM_TOKEN.findall(answer):
+        s = str(tok).strip()
+        cn = _canon_num(s)
+        if cn is None or cn in have:
+            continue
+        if "₹" in s:
+            bad_money.append(s)
+        else:
+            # a bare small integer is almost always a count/rank in prose ("top 5", "3 months")
+            if cn.rstrip("d%").replace(".", "").isdigit() and float(_NUM_ONLY.search(cn).group(0)) <= 12:
+                continue
+            bad_other.append(s)
+    if bad_money:
+        return bad_money + bad_other
+    return bad_other if len(bad_other) > pct_allow else []
+
+
 _AUDITOR_SYS = """You are a STRICT data auditor for a hospital supply-chain analyst. You get the user's question, the exact SQL queries that ran (with their results and stated purpose), and a proposed answer. Catch answers that are WRONG or MISLEADING before they reach the user. Judge whether each number is correct FOR WHAT IT IS LABELLED AS — not whether it is the user's first-choice metric.
 
 FAIL the answer (ok=false) if ANY of these hold:
@@ -779,9 +873,25 @@ def answer(query: str, history: list | None = None):
             # isn't guaranteed correct just because a canonical call also happened.)
             is_canonical_only = bool(canonical_kpis_used) and free_sql_result_count == 0
             ok, issue, fix = True, "", ""
-            if is_canonical_only and cand_ans:
+
+            # DETERMINISTIC FIRST, on every turn including canonical-only ones. "Canonical =
+            # correct by construction" is true of the FIGURES the tool returns and false of
+            # the PROSE the model writes about them — _format_kpi_payload's own docstring
+            # records a live 10x error (₹300.21 Cr printed for ₹30.02 Cr) that happened in
+            # exactly a get_kpi-only turn, which this branch was skipping the audit for. This
+            # check costs microseconds, so there is no reason to exempt anyone from it.
+            bad_nums = _unsupported_numbers(cand_ans, results)
+            if bad_nums:
+                ok = False
+                issue = ("NUMBER MISMATCH — these figures appear in the answer but in none of the "
+                         f"query results: {', '.join(bad_nums[:6])}.")
+                fix = ("Re-read the figures in the tool results and quote them EXACTLY as given "
+                       "(they are already formatted as ₹Cr/₹L/%/days). Do not convert or restate "
+                       "magnitudes yourself.")
+
+            if ok and is_canonical_only and cand_ans:
                 verified = "canonical"
-            elif results and cand_ans:
+            elif ok and results and cand_ans:
                 yield {"type": "step", "text": "Cross-checking the answer against the data"}
                 ok, issue, fix = _verify(client, query, results, cand_ans, history)
             if ok or present_attempts >= MAX_AUDIT_RETRIES:
