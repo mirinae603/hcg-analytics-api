@@ -531,7 +531,9 @@ def answer(query: str, history: list | None = None):
     # and returned 101,005 units against the canonical 45,223. A chatbot that disagrees
     # with the dashboard is worse than one that says nothing, and the definition of
     # "expiring" lives in exactly one place.
-    kpi_key = (frame.get("kpi_key") or "").strip()
+    # Deterministic first, the model's suggestion only as a fallback.
+    canonical_totals: dict = {}
+    kpi_key = capability.kpi_for(query) or (frame.get("kpi_key") or "").strip()
     if kpi_key and kpi_key in tools.kpi_keys():
         yield {"type": "step", "text": f"Taking the canonical figure for {kpi_key}"}
         out = tools.get_kpi(kpi_key)
@@ -553,10 +555,18 @@ def answer(query: str, history: list | None = None):
                 # that no SQL needs to rediscover.
                 _tot = ((out.get("payload") or {}).get("data") or {}).get("totals")
                 if isinstance(_tot, dict) and _tot:
-                    _flat = {k: v for k, v in _tot.items() if isinstance(v, (int, float, str))}
+                    # FORMAT THEM. Handed the raw float 604679341.2 the model wrote
+                    # "₹604.68 Cr" — a clean 10x overstatement of ₹60.47 Cr, because it
+                    # divided by 1e6 instead of 1e7. Fast mode learned this exact lesson
+                    # (see _format_kpi_payload and its regression test: ₹300.21 Cr printed
+                    # for ₹30.02 Cr); every number handed to the model must already be in
+                    # the form it should quote, so it never has to convert anything.
+                    _flat = {k: (_fmt(v, _kind(k, [{k: v}])) if isinstance(v, (int, float)) else v)
+                             for k, v in _tot.items() if isinstance(v, (int, float, str))}
                     if _flat:
                         lessons.append(f"Canonical {kpi_key} headline figures (authoritative, "
                                        f"quote directly): {json.dumps(_flat, default=str)[:400]}")
+                        canonical_totals = {"canonical_metric": kpi_key, "totals": _flat}
 
     yield {"type": "step", "text": f"Investigating {len(subs)} lines of enquiry"}
 
@@ -862,7 +872,21 @@ def answer(query: str, history: list | None = None):
     # word. It gets facts to explain rather than tables to describe, which is the
     # difference between "the trend shows variability across hospitals and months" and
     # "purchasing fell 68% from December to April, peaking in January".
-    derived = shapes.derive_all(shape_name, findings)
+    # When a canonical metric answered the question, derive ONLY from it. Otherwise the
+    # headline has two sources competing for it and the model splices them: "101,005 units
+    # valued at ₹39.70 L" took the quantity from a SQL re-derivation (which includes stock
+    # that expired months ago) and the value from the canonical bands. The other findings
+    # stay as EVIDENCE for the drivers; they just stop bidding for the headline figure.
+    canonical_findings = [f for f in findings if f.get("canonical")]
+    derived = shapes.derive_all(shape_name, canonical_findings or findings)
+    if canonical_totals:
+        # A KPI's `totals` ARE the headline. Left only in the lesson board they were read
+        # past, and the model summed the twelve category rows it could see instead —
+        # ₹48.69 Cr of a top-12 breakdown reported as the total stock value of ₹60.47 Cr.
+        derived.insert(0, {**canonical_totals,
+                           "note": "These are the dashboard's own totals. Use them for the "
+                                   "headline figure; do NOT sum the breakdown rows, which "
+                                   "are a top-N slice and will undercount."})
     # FORMAT the derived numbers before the writer ever sees them. shapes.py works in raw
     # floats so it stays pure and testable, but handing those straight over produced
     # "sales started at 80,663,366" — a rupee figure written as a bare integer, in the very

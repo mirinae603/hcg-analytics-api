@@ -75,7 +75,7 @@ def main():
     # 3, not 6: each deep run fans out to 4 workers of its own, so 6 concurrent cases put
     # ~24 requests on Azure at once and the eval started failing itself with 429s —
     # measuring the harness, not the engine.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         done = list(pool.map(lambda j: (j[0]["id"], run(j[0], mode)), jobs))
     by_id: dict = {}
     for cid, r in done:

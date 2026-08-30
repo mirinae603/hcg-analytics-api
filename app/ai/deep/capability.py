@@ -272,3 +272,48 @@ def grain_notes(max_tables: int = 18) -> list[str]:
                          f"{e} PER SITE. COUNT(*) here is NOT an item count; use "
                          f"COUNT(DISTINCT {e}).")
     return notes
+
+
+# Words that unambiguously name a canonical metric. Deliberately narrow: a wrong KPI is
+# worse than none, so only phrases that can only mean one metric appear here.
+_KPI_TRIGGERS: list[tuple[str, tuple[str, ...]]] = [
+    ("near-expiry", ("expiring", "near expiry", "near-expiry", "about to expire", "expire soon",
+                     "expired", "expiry risk")),
+    ("non-moving-inventory", ("non-moving", "non moving", "slow moving", "slow-moving", "dead stock",
+                              "not moved", "idle stock")),
+    ("vendor-volume-contribution", ("vendor concentration", "concentrated in one vendor",
+                                    "vendor dependency", "supplier concentration",
+                                    "spend the most with", "biggest vendor", "top vendor")),
+    ("vendor-lead-time", ("lead time", "lead-time")),
+    ("reorder-priority", ("reorder", "re-order", "what should we order", "order first")),
+    ("stock-out-rate", ("out of stock", "stock-out", "stockout")),
+    ("fill-rate", ("fill rate", "fill-rate")),
+    ("days-on-hand", ("days on hand", "days-on-hand", "doh", "cover in days")),
+    ("inventory-valuation", ("stock value", "inventory value", "value of stock", "value of inventory",
+                             "holding value")),
+    ("revenue-margin", ("total sales", "sales revenue and margin", "overall margin", "revenue and margin")),
+    ("cashflow-forecast", ("cash do we need", "cash required", "budget to restock", "cashflow")),
+    ("aging-distribution", ("aging", "ageing")),
+    ("wastage-rate", ("wastage", "write-off", "write off")),
+    ("inventory-turnover-ratio", ("turnover ratio", "inventory turnover")),
+    ("consumption-by-department", ("by department", "department consumption")),
+    ("billable-consumption", ("billable", "non-billable", "billed consumption")),
+]
+
+
+def kpi_for(question: str) -> str:
+    """Pick the canonical metric deterministically, where the wording is unambiguous.
+
+    This was an LLM decision, and it varied run to run: the same expiry question routed to
+    the canonical KPI once and re-derived it in SQL the next time, giving 45,223 units then
+    101,005. Every LLM decision removed from the chain multiplies reliability instead of
+    adding another thing to get right — and which metric answers "how much is expiring" is
+    not a judgement call.
+    """
+    q = (question or "").lower()
+    for key, triggers in _KPI_TRIGGERS:
+        if any(t in q for t in triggers):
+            from app.ai import kpi_registry
+            if key in kpi_registry.KPI_REGISTRY:
+                return key
+    return ""

@@ -143,8 +143,26 @@ def derive_trend(res: dict) -> dict:
             "swing_pct_trough_to_peak": _pct(hi[1], lo[1])}
 
 
+# Measures you can add up, and measures you cannot. Days, percentages, averages, medians,
+# rates and scores are NOT additive: summing them produces a number with no meaning, and
+# taking a share of that number produces a statistic that sounds precise and says nothing.
+_NON_ADDITIVE = re.compile(
+    r"(days?|_pct|percent|share|rate|ratio|avg|average|median|mean|score|index|per_)", re.I)
+
+
+def _is_additive(measure: str) -> bool:
+    return not _NON_ADDITIVE.search(measure or "")
+
+
 def derive_ranking(res: dict) -> dict:
-    """Concentration facts: what the top one and top three actually account for."""
+    """Concentration facts — but only where concentration is a real idea.
+
+    A live brief said "these top three vendors account for 43.2% of the total lead time".
+    Lead time is measured in days: the sum of everyone's days is not a quantity anyone
+    holds, and a share of it is arithmetic without meaning. Concentration applies to value,
+    quantity and counts; for a rate or an average the useful facts are the spread — the
+    slowest, the fastest, the middle.
+    """
     cols, rows = res.get("columns") or [], res.get("rows") or []
     mcol = _measure_col(cols, rows)
     lcol = _label_col(cols, rows)
@@ -171,6 +189,17 @@ def derive_ranking(res: dict) -> dict:
     # and both came from dividing a number by itself. Below three rows there is nothing to
     # take a share OF, and even above it the denominator is only the returned set — which is
     # said out loud rather than implied.
+    if not _is_additive(mcol):
+        vals = sorted(v for _, v in pairs)
+        mid = vals[len(vals) // 2]
+        out["spread"] = {"highest": {"label": pairs[0][0], "value": pairs[0][1]},
+                         "lowest": {"label": pairs[-1][0], "value": pairs[-1][1]},
+                         "median": mid}
+        out["share_note"] = (f"'{mcol}' is a rate/average, not an additive quantity — do NOT "
+                             f"sum it or express any share of it. Compare the values, the "
+                             f"spread and the median instead.")
+        return out
+
     if len(pairs) >= 3:
         for i, item in enumerate(out["top"]):
             item["share_of_returned_pct"] = pairs[i][1] / total * 100

@@ -155,3 +155,36 @@ def test_two_rows_still_refuse_to_produce_a_share():
     d = shapes.derive_ranking({"columns": ["k", "v"], "rows": [{"k": "a", "v": 2}, {"k": "b", "v": 1}]})
     assert "top1_share_of_returned_pct" not in d
     assert "no denominator" in d["share_note"]
+
+
+# ── shares only mean something for additive measures ─────────────────────────
+def test_no_share_is_computed_for_a_rate_or_average():
+    # A live brief said "these top three vendors account for 43.2% of the total lead time".
+    # Lead time is days: the sum of everyone's days is not a quantity anyone holds, and a
+    # share of it is arithmetic without meaning. It reads as precision and carries none.
+    d = shapes.derive_ranking({"columns": ["vendor_name", "avg_lead_time"],
+                               "rows": [{"vendor_name": "SP", "avg_lead_time": 28},
+                                        {"vendor_name": "Axon", "avg_lead_time": 23},
+                                        {"vendor_name": "Medicare", "avg_lead_time": 23},
+                                        {"vendor_name": "Quick", "avg_lead_time": 2}]})
+    assert "top1_share_of_returned_pct" not in d
+    assert "not an additive quantity" in d["share_note"]
+    # what IS useful about a rate: the spread
+    assert d["spread"]["highest"]["label"] == "SP"
+    assert d["spread"]["lowest"]["value"] == 2.0
+    assert d["spread"]["median"] == 23.0
+
+
+def test_additive_measures_still_get_their_concentration():
+    d = shapes.derive_ranking({"columns": ["vendor_name", "spend"],
+                               "rows": [{"vendor_name": "A", "spend": 100},
+                                        {"vendor_name": "B", "spend": 50},
+                                        {"vendor_name": "C", "spend": 25}]})
+    assert round(d["top1_share_of_returned_pct"], 1) == 57.1
+
+
+def test_percentage_and_score_columns_are_treated_as_rates_too():
+    for col in ("margin_pct", "fill_rate", "health_score", "median_lead_time_days"):
+        d = shapes.derive_ranking({"columns": ["k", col],
+                                   "rows": [{"k": "a", col: 9}, {"k": "b", col: 5}, {"k": "c", col: 1}]})
+        assert "top1_share_of_returned_pct" not in d, col

@@ -71,8 +71,13 @@ def num_within(target: float, tol_pct: float = 2.0):
 CASES: list[dict] = [
     # ── canonical figures: these must be exact ───────────────────────────────
     {"id": "expiry-90d", "q": "How much stock is expiring in the next 90 days?",
-     "check": all_of(num_within(39.97), lacks("83.13", "101,005")),
-     "why": "canonical: ₹39.97 L / 45,223 units (0-30d + 31-90d). 83.13 L would mean already-expired stock was included"},
+     # Require BOTH canonical figures rather than banning other numbers: naming the
+     # already-expired stock separately is correct analysis, and the previous check failed
+     # an answer that led with 45,223 / ₹39.97 L and then properly distinguished the
+     # expired band. What matters is that the HEADLINE is right, not that other figures
+     # are absent.
+     "check": all_of(num_within(39.97), num_within(45223, 1)),
+     "why": "canonical: ₹39.97 L AND 45,223 units (0-30d + 31-90d), excluding already-expired"},
 
     {"id": "total-sales", "q": "What is our total sales revenue and margin?",
      "check": all_of(num_within(521.67, 3), num_within(213.43, 3)),
@@ -84,8 +89,19 @@ CASES: list[dict] = [
     {"id": "stock-value", "q": "What is the total value of stock we are holding right now?",
      "check": num_within(60.47, 5), "why": "₹60.47 Cr across 18,080 SKUs"},
 
+    # MY EXPECTATION WAS THE OUTLIER. `kpi_non_moving` holds 16,872 rows and 10,501
+    # DISTINCT materials, and the canonical KPI reports `blocked_skus: 16872` — so the
+    # dashboard's "SKUs" are really material x hospital lines. The chatbot agreeing with
+    # the dashboard is correct behaviour; an eval demanding 10,501 would train it to
+    # contradict the screen the user is looking at. Both figures accepted; what matters is
+    # that it does not invent a third.
+    #
+    # WORTH RAISING WITH THE BUSINESS: "16,872 non-moving SKUs" overstates the item count
+    # by 61% if a reader takes SKU to mean a product.
     {"id": "non-moving-count", "q": "How many SKUs are non-moving?",
-     "check": num_within(10501, 3), "why": "10,501 non-moving SKUs"},
+     "check": lambda t: num_within(16872, 2)(t) or num_within(10501, 2)(t),
+     "why": "canonical blocked_skus = 16,872 (material x hospital lines); 10,501 distinct "
+            "materials also acceptable — but not a third number"},
 
     # ── rankings: the leader AND its concentration ───────────────────────────
     {"id": "top-vendor", "q": "Which vendor do we spend the most with, and how exposed are we to them?",
