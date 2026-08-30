@@ -610,10 +610,35 @@ def item_footprint(name: str, limit: int = 8) -> dict:
                     footprint[name_] = int(n)
                 except Exception:
                     pass
+    # IS THIS EVEN AN ITEM? "MSD" matched STICKER-MSDS and "GYNAEC EXAMINATN TABL
+    # CUSTMSD FULL" on a description substring, and the assistant answered about a
+    # stationery sticker — while MSD is a MANUFACTURER with 614 procurement lines worth
+    # ₹42.34 Cr. A name that matches two junk descriptions but appears strongly in a
+    # manufacturer or vendor column is not an item, and saying so here fixes it for every
+    # caller instead of once per question.
+    elsewhere = []
+    if q:
+        for tbl, col in (("dim_material", "manufacturer_desc"), ("dim_vendor", "vendor_name"),
+                         ("mart_procurement", "manufacturer_desc"), ("mart_procurement", "vendor_name"),
+                         ("sales_by_manufacturer", "manufacturer"), ("dim_plant", "plant_name")):
+            try:
+                with _lock:
+                    n = c.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE upper(CAST({col} AS VARCHAR)) LIKE '%' || upper(?) || '%'",
+                        [q]).fetchone()[0]
+            except Exception:
+                continue
+            if n:
+                elsewhere.append({"table": tbl, "column": col, "rows": int(n)})
+    weak = len(resolved) <= 2 and not any(
+        (r.get("material_desc") or "").upper().startswith(q.upper()) for r in resolved)
+
     return {
         "query": q,
         "match_count": len(resolved),
         "matches": resolved,
+        "also_found_in": elsewhere,
+        "probably_not_an_item": bool(elsewhere and weak),
         "footprint": footprint,
         "tables_with_data": sorted([t for t, n in footprint.items() if n > 0]),
         "note": ("No catalog match — try a looser name or ask about the brand family."

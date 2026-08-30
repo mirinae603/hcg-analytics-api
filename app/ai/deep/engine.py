@@ -382,6 +382,12 @@ def answer(query: str, history: list | None = None):
                         entity_tokens.append(v)
                         entity_tokens += re.findall(r"[A-Za-z]{4,}", v)[:2]
             fp_counts = fp.get("footprint") or {}
+            if fp.get("probably_not_an_item") and fp.get("also_found_in"):
+                where = ", ".join(f"{e['table']}.{e['column']} ({e['rows']:,} rows)"
+                                  for e in fp["also_found_in"][:3])
+                lessons.append(f"'{name}' is NOT a product — it is held in {where}. Filter that "
+                               f"column, not material_desc. Any item-name match on it is a "
+                               f"coincidental substring.")
             footprint = json.dumps(fp)[:1800]
             yield {"type": "sql", "purpose": f"footprint of “{name}”",
                    "sql": f"-- lookup_item('{name}')", "rows": fp.get("match_count", 0)}
