@@ -232,7 +232,7 @@ def rename_session(db: Session, session_id: int, title: str) -> Dict:
     return {"id": session.id, "title": session.title}
 
 
-def stream_message_events(db: Session, session_id: int, query: str):
+def stream_message_events(db: Session, session_id: int, query: str, mode: str = "fast"):
     """Generator of SSE-shaped event dicts for a session-backed turn — the live-progress
     counterpart to post_message(). Reuses orchestrator.answer() exactly as post_message
     does (same history, same audit gate), but yields step/sql/answer/chart/table/done AS
@@ -255,6 +255,14 @@ def stream_message_events(db: Session, session_id: int, query: str):
     if not query:
         raise HTTPException(status_code=400, detail="Message text is required")
 
+    # The ONLY place the two answer paths meet. `deep` is a separate package with its own
+    # client, its own loop and its own prompts; it exposes the same generator contract, so
+    # nothing below this line — accumulation, persistence, the event vocabulary — differs
+    # between modes, and nothing in deep mode can regress the fast path.
+    engine = orchestrator
+    if str(mode).lower() == "deep":
+        from app.ai.deep import engine as engine  # noqa: PLC0415
+
     history = _history_for_orchestrator(session)
 
     user_msg = ChatMessage(session_id=session.id, role="user", content=query)
@@ -273,7 +281,7 @@ def stream_message_events(db: Session, session_id: int, query: str):
     scope: Optional[str] = None
 
     try:
-        for ev in orchestrator.answer(query, history):
+        for ev in engine.answer(query, history):
             t = ev.get("type")
             if t == "answer":
                 text = ev.get("text"); verified = ev.get("verified")

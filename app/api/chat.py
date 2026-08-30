@@ -32,6 +32,9 @@ class RenameSessionRequest(BaseModel):
 
 class PostMessageRequest(BaseModel):
     query: str = Field(..., min_length=1)
+    # "fast" (default) = the single-pass orchestrator. "deep" = the reasoning swarm.
+    # Defaulted so every existing caller, and the non-streaming route, are unaffected.
+    mode: str = Field("fast", pattern="^(fast|deep)$")
 
 
 @router.post("/chat/sessions")
@@ -109,7 +112,7 @@ async def post_chat_message_stream(
         raise HTTPException(status_code=400, detail="Message text is required")
 
     def gen():
-        for ev in chat_service.stream_message_events(db, session_id, req.query):
+        for ev in chat_service.stream_message_events(db, session_id, req.query, mode=req.mode):
             yield f"data: {json.dumps(ev)}\n\n"
         yield "data: {\"type\": \"end\"}\n\n"
 

@@ -20,7 +20,8 @@ import os
 import re
 import time
 
-from app.ai import warehouse, semantics, charts, routing, kpi_registry
+from app.ai import warehouse
+from app.ai import scope as _scope, semantics, charts, routing, kpi_registry
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
@@ -826,6 +827,10 @@ def answer(query: str, history: list | None = None):
     canonical_scope_hint: str = ""
 
     any_sql_failed = False
+    fabricated_breakdown = False   # the model tried to invent a dimension the table lacks
+    # Identifiers of whatever specific entity this turn resolved. Every subsequent query
+    # has to mention one of them — see scope.missing_entity_scope for why.
+    bound_entity: list[str] = []
     # Prose survives the round it was written in. `streamed_prose` is per-round (it has to
     # be — each round streams separately), but the model does not always put its answer in
     # the SAME round as the present() call: on a canonical get_kpi turn it wrote the answer
@@ -952,6 +957,17 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "step", "text": f"Locating “{name}” across all tables"}
                 try:
                     fp = warehouse.item_footprint(name)
+                    # BIND the resolved item to the turn. From here on, a query that does
+                    # not mention it is answering about the whole warehouse instead — which
+                    # is exactly how "sales trend of KEYTRUDA" came back as ₹89.52 Cr of
+                    # company-wide December revenue.
+                    for _m in (fp.get("matches") or [])[:1]:
+                        for _k in ("material", "material_desc"):
+                            _v = str(_m.get(_k) or "").strip()
+                            if _v:
+                                bound_entity.append(_v)
+                                for _w in re.findall(r"[A-Za-z]{4,}", _v)[:2]:
+                                    bound_entity.append(_w)
                     yield {"type": "sql", "purpose": f"footprint of “{name}”", "sql": f"-- lookup_item('{name}')", "rows": fp["match_count"]}
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(fp)[:5000]})
                 except Exception as e:
@@ -962,7 +978,21 @@ def answer(query: str, history: list | None = None):
             sql = args.get("sql", "")
             yield {"type": "step", "text": purpose[:80]}
             try:
+                _off = _scope.missing_entity_scope(sql, bound_entity)
+                if _off:
+                    raise warehouse.SqlError(_off)
                 res = warehouse.run_sql(sql)
+                if not res.get("row_count"):
+                    # "no rows" and "no such data" are different claims, and the model
+                    # reports the first as the second. If the value it filtered on lives
+                    # somewhere else, say so rather than let it announce an absence.
+                    _hint = _scope.explain_zero_rows(sql)
+                    if _hint:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": json.dumps({"error": _hint})})
+                        any_sql_failed = True
+                        yield {"type": "step", "text": "Checking that against the other tables"}
+                        continue
                 res["purpose"] = purpose
                 results.append(res)
                 free_sql_result_count += 1
@@ -972,6 +1002,8 @@ def answer(query: str, history: list | None = None):
                 # Keep internal self-corrections invisible: feed the error back to the model
                 # so it fixes the query, but don't surface a scary errored query to the user.
                 any_sql_failed = True
+                if "made-up breakdown" in str(e):
+                    fabricated_breakdown = True
                 yield {"type": "step", "text": "Refining the query"}
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
@@ -1015,7 +1047,18 @@ def answer(query: str, history: list | None = None):
                 yield {"type": "step", "text": "Cross-checking the answer against the data"}
                 ok, issue, fix = _verify(client, query, results, cand_ans, history)
             if ok or present_attempts >= MAX_AUDIT_RETRIES:
-                present_args = pending_present
+                # Carry the AUDITED prose onto the accepted call. `cand_ans` already resolves
+                # where the answer actually lives — streamed prose first, the tool's own
+                # `answer` argument only as a fallback — and everything downstream reads
+                # `present_args["answer"]`. Without this line that read went straight back to
+                # the deprecated argument, so a model that followed its instruction (write the
+                # prose as message text, call present() for the visuals) shipped a turn with a
+                # chart, a table and NO WORDS. Reproduced end to end: session 13's answer row
+                # persisted as {"text": ""} while session 12's identical question, answered in
+                # the older style, came through at 4,864 characters.
+                present_args = dict(pending_present)
+                if cand_ans:
+                    present_args["answer"] = cand_ans
                 if verified != "canonical":
                     verified = ("corrected" if present_attempts > 0 else "ok") if (results and cand_ans) else None
                 if not ok:
@@ -1038,14 +1081,56 @@ def answer(query: str, history: list | None = None):
 
     ans = _sanitize_prose((present_args.get("answer") or "").strip())
 
+    # GUARANTEE WORDS. `answer` on present() is deprecated — the model is told to write the
+    # answer as message text — but a tool-calling model routinely emits a FINAL round that
+    # is nothing but the tool call, with no content at all. When that happens there is no
+    # prose anywhere: not streamed, not on the tool argument, not in an earlier round. The
+    # turn then ships a chart and a table with no words, which is exactly how it looked
+    # (session 14 persisted `{"text": ""}` alongside a full 10-row vendor table, and its
+    # stream carried zero answer_delta events).
+    #
+    # Rather than un-deprecate `answer` and lose streaming, ask for the prose in one more
+    # round with NO tools available, so the only thing it can do is write. Costs an extra
+    # call only in the case that would otherwise have shipped empty, and it streams like
+    # any other answer.
+    if not ans and results:
+        yield {"type": "step", "text": "Writing the answer"}
+        recovered = ""
+        try:
+            for _kind, _payload in _chat_stream(
+                client, model=AZURE_DEPLOYMENT, temperature=0,
+                messages=messages + [{"role": "user", "content":
+                    "Write the answer now, as plain prose, using only the figures already "
+                    "returned by the tools above — quote them exactly as they were formatted. "
+                    "Lead with the number that answers the question. Do not call any tool and "
+                    "do not end with a rhetorical question."}],
+            ):
+                if _kind == "delta":
+                    recovered += _payload
+                    yield {"type": "answer_delta", "text": _payload}
+        except Exception:
+            pass
+        ans = _sanitize_prose(recovered.strip())
+
     # HONEST FAILURE: if the model gave up as free-text (no present() call) having gathered
     # ZERO successful query results after a SQL error, its prose is an ungrounded excuse —
     # this is where it used to fabricate a plausible "permissions / file access" reason. Do
     # not ship that; say plainly that the query didn't run. (A legitimate "no data" answer
     # always comes through present() WITH results, so this never suppresses a real answer.)
     if present_from_content and not results and (any_sql_failed or not ans):
+        # Name the actual obstacle when we know it. The generic "repeated error" line is
+        # true but useless: a reader cannot tell whether the question was bad, the data is
+        # missing, or something broke. When the guard fired, we know exactly which it was —
+        # the model kept trying to manufacture a breakdown the table does not carry — and
+        # saying so lets the reader ask the question the data CAN answer.
         yield {"type": "answer",
-               "text": "I ran into a repeated error building the query for that and couldn't complete it — please try rephrasing, or ask it a slightly different way.",
+               "text": ("That table doesn't hold a breakdown along the dimension you asked for — the "
+                        "figures exist only as a single total, so there is no real trend to show. Ask "
+                        "for the total instead, or for a split by a field the data actually carries "
+                        "(hospital, category, vendor)."
+                        if fabricated_breakdown else
+                        "I ran into a repeated error building the query for that and couldn't complete "
+                        "it — please try rephrasing, or ask it a slightly different way."),
                "verified": None, "options": []}
         yield {"type": "done"}
         return

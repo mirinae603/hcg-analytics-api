@@ -325,12 +325,49 @@ class SqlError(Exception):
     pass
 
 
+_WS_RE = re.compile(r"\s+")
+
+
+def _fabricated_dimension(sql: str) -> str | None:
+    """Detect a UNION ALL that INVENTS a dimension the table does not have.
+
+    A live answer to "sales trend of KEYTRUDA 100MG INJ VIAL" came back as a confident
+    six-month trend — "consistent performance", ₹47.48 Cr every month. It was fiction.
+    `sales_by_material_hospital` has no month column, so the model wrote six UNION ALL
+    branches with hardcoded month LITERALS over the identical unfiltered FROM/WHERE, and
+    every row was the same grand total wearing a different label.
+
+    Nothing else catches this. The number check passes (each figure IS in the evidence),
+    and the auditor passed it too. But it is decidable from the SQL alone: if the branches
+    are byte-identical once their leading literal aliases are stripped, the query is not
+    reading a dimension, it is manufacturing one. A UNION ALL of genuinely identical
+    SELECTs has no legitimate use — it can only ever repeat the same number N times.
+    """
+    parts = re.split(r"(?i)\bunion\s+all\b", sql)
+    if len(parts) < 3:                      # need 3+ branches to be sure it is a "trend"
+        return None
+    shapes = []
+    for part in parts:
+        # drop the leading `'2025-12' AS month,` style literal that is the only difference
+        body = re.sub(r"(?is)^\s*select\s+.*?(?=\bfrom\b)", "", part, count=1)
+        shapes.append(_WS_RE.sub(" ", body).strip().lower())
+    if len(set(shapes)) > 1 or not shapes[0]:
+        return None
+    return ("This query UNIONs the same FROM/WHERE together with hardcoded labels, so every "
+            "row would return the identical total under a different name — that is a made-up "
+            "breakdown, not a real one. Either GROUP BY a column that actually exists in the "
+            "table, or tell the user plainly that this table has no such breakdown.")
+
+
 def validate(sql: str) -> str:
     s = sql.strip().rstrip(";").strip()
     if not s:
         raise SqlError("Empty query.")
     if ";" in s:
         raise SqlError("Only a single statement is allowed (no ';').")
+    fabricated = _fabricated_dimension(s)
+    if fabricated:
+        raise SqlError(fabricated)
     if not _ALLOWED_START.match(s):
         raise SqlError("Only read-only SELECT / WITH queries are allowed.")
     bad = _FORBIDDEN.search(s)

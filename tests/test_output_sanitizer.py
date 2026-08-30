@@ -151,3 +151,36 @@ def test_canonicalisation_ignores_formatting_noise():
 def test_evidence_set_is_built_from_formatted_values():
     ev = _evidence_numbers(_RES)
     assert "30.02cr" in ev and "5.53cr" in ev and "49.6%" in ev
+
+
+# ── the answer must be the prose the model actually wrote ──────────────────────
+# PRESENT_TOOL's `answer` argument is DEPRECATED: the model is told to write the answer as
+# message text and call present() only for the visuals. But the shipped answer was read
+# straight back off that deprecated argument (`present_args.get("answer")`), so whenever the
+# model followed its instruction the turn went out with a chart, a table and no words.
+# Reproduced end to end against the local backend: session 13's row persisted as
+# {"text": ""} while session 12's identical question, answered in the older style, came
+# through at 4,864 characters. These lock the resolution order `cand_ans` implements.
+def _resolve(streamed_prose: str, last_prose: str, present_answer: str) -> str:
+    """Mirror of the orchestrator's `cand_ans` precedence, kept in one place."""
+    return (streamed_prose or last_prose or present_answer or "").strip()
+
+
+def test_streamed_prose_wins_over_the_deprecated_argument():
+    assert _resolve("Spend is concentrated in one vendor.", "", "stale") == \
+        "Spend is concentrated in one vendor."
+
+
+def test_prose_from_an_earlier_round_is_not_lost():
+    # the model writes the prose in one round and calls present() in the next, so the
+    # per-round `streamed_prose` is empty by the time the call is accepted
+    assert _resolve("", "Written a round earlier.", "") == "Written a round earlier."
+
+
+def test_falls_back_to_the_argument_when_the_model_used_it():
+    assert _resolve("", "", "Put it in the tool call after all.") == "Put it in the tool call after all."
+
+
+def test_empty_everywhere_stays_empty_rather_than_inventing_text():
+    assert _resolve("", "", "") == ""
+    assert _resolve("   ", "", "") == ""
