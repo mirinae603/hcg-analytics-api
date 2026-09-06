@@ -526,6 +526,58 @@ _LEVEL_OF = {
 }
 
 
+# ── L4 · questions a human analyst would need several joins and a decision to answer ─────
+#
+# Every expected value below was COMPUTED FROM THE WAREHOUSE FIRST and the check written
+# around the result — not recalled and then checked. Roughly five checks in the L1-L3 tiers
+# turned out to be wrong when I finally queried them, which is exactly the failure the FLEX
+# paper found in BIRD itself, so ground truth here is derived, never remembered.
+L4: list[dict] = [
+    {"id": "l4-worst-margin-therapeutic",
+     "q": "Which therapeutic class earns us the worst margin on meaningful revenue?",
+     "check": all_of(any_of("monoclonal", "egfr", "cytotoxic"),
+                     lambda t: num_within(12.18, 12)(t) or num_within(12.54, 12)(t)),
+     "must_answer": True,
+     "why": "MONOCLONAL ANTIBODY (EGFR) 12.18% on ₹13.54 Cr — needs the THERAPEUTIC "
+            "taxonomy (major_group_desc), a revenue floor, and margin as a percentage"},
+
+    {"id": "l4-nonformulary-share",
+     "q": "What share of our sales revenue comes from non-formulary items?",
+     "check": all_of(num_within(5.57, 15), any_of("%", "percent", "share")),
+     "must_answer": True,
+     "why": "5.57% (₹29.06 Cr of ₹521.67 Cr) — only correct via formulary_status; the raw "
+            "column spells it eleven ways"},
+
+    {"id": "l4-dead-procurement",
+     "q": "How much have we spent buying items that are never sold and never consumed?",
+     "check": all_of(lambda t: num_within(60.43, 15)(t) or num_within(2334, 15)(t),
+                     lacks("not answerable", "no data")),
+     "must_answer": True,
+     "why": "2,334 materials, ₹60.43 Cr — a double anti-join against consumption_all "
+            "AND sales_by_material"},
+
+    {"id": "l4-top-mfr-billed-units",
+     "q": "Which manufacturer supplies the most units we actually dispense to patients?",
+     "check": any_of("pentawis", "1,679,406", "1679406"),
+     "must_answer": True,
+     "why": "PENTAWIS 1,679,406 billed units — needs consumption_all filtered to scope "
+            "'billed', joined to the manufacturer"},
+
+    {"id": "l4-inventory-blind-spots",
+     "q": "Are there hospitals we buy for but hold no inventory records against?",
+     "check": all_of(num_within(24, 25), any_of("hospital", "site", "no inventory")),
+     "must_answer": True,
+     "why": "24 hospitals have procurement but zero fact_inventory rows — the BACC and "
+            "Triesta sites"},
+
+    {"id": "l4-vendor-concentration",
+     "q": "How concentrated is our procurement — what share sits with the top ten vendors?",
+     "check": all_of(num_within(68.87, 12), any_of("%", "percent", "concentrat")),
+     "must_answer": True,
+     "why": "top 10 vendors = ₹329.37 Cr = 68.87% of procurement"},
+]
+
+
 def _classify(bucket: list[dict], default: str) -> None:
     for c in bucket:
         c["level"] = _LEVEL_OF.get(c["id"], default)
@@ -534,5 +586,6 @@ def _classify(bucket: list[dict], default: str) -> None:
 _classify(L1, "L1")
 _classify(L2, "L2")
 _classify(L3, "L3")
-CASES: list[dict] = L1 + L2 + L3
-BY_LEVEL = {lv: [c for c in CASES if c["level"] == lv] for lv in ("L1", "L2", "L3")}
+_classify(L4, "L4")
+CASES: list[dict] = L1 + L2 + L3 + L4
+BY_LEVEL = {lv: [c for c in CASES if c["level"] == lv] for lv in ("L1", "L2", "L3", "L4")}

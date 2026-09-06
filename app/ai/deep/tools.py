@@ -185,6 +185,24 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
     unnamed = _sanity.placeholder_won_a_ranking(sql, r, question)
     if unnamed:
         return {"error": unnamed}
+    # An empty fact_consumption result is the expected result for a patient-billed item,
+    # not evidence that the item has no consumption.
+    billed = scope.billed_not_internal(sql, r)
+    if billed:
+        return {"error": billed}
+    # Partial coverage is not an error — the number is right for what it covers. It is
+    # attached to the RESULT so the answer can disclose which half of the estate it
+    # describes. fact_inventory holds 26 of 53 hospitals; nothing used to say so.
+    from app.ai import coverage as _coverage
+    note = _coverage.disclosure(sql)
+    if note:
+        r["coverage_note"] = note
+    # What the QUESTION demands of the SQL. "What share of revenue is non-formulary" was
+    # answered "₹29.06 Cr" — the right numerator, never divided, so no share was given.
+    from app.ai.deep import constraints as _constraints
+    unmet = _constraints.check(question, sql)
+    if unmet:
+        return {"error": unmet}
     # SUM() over zero matching rows returns ONE row containing NULL, which looks like a
     # result and is not: "SELECT SUM(revenue) FROM sales_by_manufacturer WHERE manufacturer
     # = 'MSD'" matched nothing (the value is stored 'Msd') and the answer became "there is

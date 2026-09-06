@@ -117,7 +117,7 @@ def main():
             print(f"           got: {(bad.get('err') or bad['text'])[:200].strip()}", flush=True)
     # per level, because an average hides which KIND of question is failing
     print()
-    for lv in ("L1", "L2", "L3"):
+    for lv in ("L1", "L2", "L3", "L4"):
         rows = [(c, by_id.get(c["id"], [])) for c in cases if c.get("level") == lv]
         n = sum(len(r) for _, r in rows)
         ok = sum(1 for _, rs in rows for r in rs if r["ok"])

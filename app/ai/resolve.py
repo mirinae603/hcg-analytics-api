@@ -35,9 +35,6 @@ from functools import lru_cache
 # (kind, table, column, max_distinct) — the dimensions worth indexing. A column with tens of
 # thousands of values is still fine: the index is inverted, so lookup cost is per QUESTION
 # token, not per value.
-# A token matching more than this many values is a fragment, not a name.
-_FAMILY_MAX = 12
-
 _SOURCES: list[tuple[str, str, str, int]] = [
     ("material",     "dim_material", "material_desc",     40000),
     ("material",     "dim_material", "material",           40000),
@@ -53,6 +50,11 @@ _SOURCES: list[tuple[str, str, str, int]] = [
     ("vendor",       "mart_procurement", "vendor_name",         8000),
     ("hospital",     "dim_plant",    "plant_name",           200),
     ("hospital",     "dim_plant",    "plant",                200),
+    # The sales tables use their OWN site codes (APONG, GJHCA, MHHIK) which share no value
+    # with dim_plant. They were never indexed, so all 23 of them resolved to nothing —
+    # "how much revenue did GJHCA generate" was an unanswerable question about a real site.
+    ("hospital",     "sales_by_hospital", "hospital",        200),
+    ("hospital",     "sales_by_material_hospital", "hospital", 200),
     ("department",   "dim_costcenter", "department_name",   2000),
 ]
 
@@ -94,9 +96,28 @@ _STOP = {
     # A4 200 PAGE and CHART-CRITICAL CARE UNIT, at ₹2,700.
     "critical", "essential", "important", "vital", "key", "core", "main", "primary",
     "strategic", "risky", "problem", "problematic", "urgent",
+    # Common verbs, or a fuzzy matcher offers "generate" -> "generatr" off some product
+    # description and calls it a spelling correction.
+    "generate", "generates", "generated", "generating", "produce", "produced", "provide",
+    "deliver", "delivered", "return", "returns", "returned", "include", "includes",
+    "compare", "compared", "increase", "increased", "decrease", "decreased", "reduce",
+    "reduced", "improve", "improved", "change", "changed", "happen", "happened",
+    "cover", "covers", "covered", "covering", "coverage", "record", "recorded",
+    "show", "shows", "shown", "given", "gives", "spent", "spend", "hold", "holds",
+    "quarter", "quarters", "annual", "yearly", "monthly", "weekly", "daily", "trend",
+    "trends", "overall", "average", "median', 'today", "yesterday", "tomorrow",
     "line", "lines", "side", "sides", "way", "ways", "point", "points", "area", "areas",
 }
 _MAX_DF = 250          # a token in more than this many values identifies nothing
+
+# How many values a token may match and still be treated as naming a family.
+#
+# This was 12, which rejected exactly the cases it exists to serve: "vicryl" matches 77
+# suture SKUs, "sutures" 66, "catheters" 38, "pentasure" 17 — every one a precise
+# identification of a product family, all discarded for being too successful. The index
+# has already dropped anything above _MAX_DF as non-identifying, so a token that survives
+# indexing is by construction distinctive enough to name something.
+_FAMILY_MAX = _MAX_DF
 
 
 @lru_cache(maxsize=1)
@@ -122,8 +143,21 @@ def _index() -> tuple[dict, dict]:
                 if len(tok) < 3 or tok in _NOISE_TOKENS:
                     continue
                 postings[tok].append((kind, v, table, column))
-    # drop tokens that appear everywhere — they cannot identify anything
-    return ({t: p for t, p in postings.items() if len(p) <= _MAX_DF}, exact)
+    # Drop postings that cannot identify anything — but decide that PER KIND. "ROCHE"
+    # appears in 272 material descriptions (every "-ROCHE" suffix) and in exactly ONE
+    # manufacturer value. Filtering the token globally deleted the manufacturer posting
+    # too, so a major pharma company was invisible precisely BECAUSE it is big. A token
+    # that is noise as a product name can still be a perfect manufacturer name.
+    kept: dict[str, list[tuple]] = {}
+    for tok, plist in postings.items():
+        by_kind: dict[str, list[tuple]] = defaultdict(list)
+        for post in plist:
+            by_kind[post[0]].append(post)
+        survivors = [post for kind, group in by_kind.items() if len(group) <= _MAX_DF
+                     for post in group]
+        if survivors:
+            kept[tok] = survivors
+    return (kept, exact)
 
 
 @lru_cache(maxsize=1)
@@ -173,6 +207,16 @@ _MEASURE_NOTES: dict[str, str] = {
                "revenue is a rounding error wearing the clothes of a finding."),
     "price":  ("Price compared across items must be per-unit. Summing price across rows is "
                "meaningless — it adds rates, not amounts."),
+    "consumption": ("USE `consumption_all` — it is the only table that holds both scopes. "
+                    "Consumption here is TWO events: `fact_consumption` is materials ISSUED "
+                    "FROM STORES (11,225 materials), and materials dispensed against a "
+                    "patient's bill are not in it at all (13,706 more). consumption_all "
+                    "unions them at material grain with a `scope` column ('internal' or "
+                    "'billed'), covering 25,153 materials. Always report which scope a "
+                    "figure is, and never read an empty fact_consumption result as proof an "
+                    "item is unused. NOTE: the billed side has no plant and no date, so "
+                    "consumption_all cannot give a monthly or per-hospital trend — say that "
+                    "plainly rather than implying one."),
     "expiry": ("This warehouse buckets expiry as Expired / 0-30d / 31-90d / 91-180d. Stock "
                "that has ALREADY expired is not \"expiring in the next N days\" — it has "
                "expired. A 90-day question is 0-30d + 31-90d only; adding the expired "
@@ -194,6 +238,34 @@ _QUALIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
                              "strategic", "core")),
     ("fast-moving",        ("fast-moving", "fast moving", "high-volume", "high volume")),
     ("slow-moving",        ("slow-moving", "slow moving", "non-moving", "non moving", "dead")),
+)
+
+# Where a grain word means more than one real column, and picking silently is how two
+# defensible answers to the same question get produced on different runs.
+_GRAIN_NOTES: dict[str, str] = {
+    "category": ("\"Category\" is THREE different taxonomies here, and they give different "
+                 "answers: dim_material.material_group is the SUPPLY form (139 values — "
+                 "M065-INJECTIONS, M113-TABLETS); major_group_desc is the THERAPEUTIC class "
+                 "(1,221 — ANTINEOPLASTIC, ALKYLATING AGENT); minor_group_desc is the "
+                 "MOLECULE (3,237 — ABIRATERONE). Pick the one the question means, and name "
+                 "which you used. For clinical or spend questions the therapeutic class is "
+                 "usually intended; for stores and inventory, the supply form."),
+}
+
+# Notes tied to a WORD in the question rather than to its grain. The formulary warning was
+# briefly attached to the material grain, which meant it appeared on "what is our biggest
+# selling product" — true, irrelevant, and one more line to read past.
+_KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
+    (r"\bformular",
+     "Use dim_material.formulary_status, NOT `formulary`. The raw column spells three "
+     "concepts eleven ways (NON FORMULARY, NON FORMUL, NON-FORMULARY, NON FORMUALRY, "
+     "NONFORMULARY, NON  FORMULARY, OUT OF FOR …), so an equality filter on it silently "
+     "drops 123 items and a GROUP BY returns eleven buckets for three things. The clean "
+     "values are FORMULARY (4,024), NON FORMULARY (7,090), OUT OF FORMULARY (3,504), "
+     "UNSPECIFIED (10,313)."),
+    (r"\bgeneric\b|\bmolecule\b|\bsalt\b",
+     "The molecule is dim_material.minor_group_desc (3,237 values) or generic_name; "
+     "major_group_desc is the therapeutic CLASS, not the molecule."),
 )
 
 _GRAINS: list[tuple[str, tuple[str, ...]]] = [
@@ -243,10 +315,19 @@ def resolve(question: str, limit: int = 8) -> dict:
     qtokens = [t.lower() for t in _WORD.findall(q)]
     intent = _intent_words()
     def _asks_rather_than_names(t: str) -> bool:
-        # the vocabulary lists "item"; the question says "items". Comparing the singular too
-        # is what stops "which items do we buy from MSD" resolving "items" to a product.
-        stem = t[:-1] if t.endswith("s") and len(t) > 3 else t
-        return any(w in bag for w in (t, stem) for bag in (_STOP, _NOISE_TOKENS, intent))
+        # The vocabulary lists "item" and "consumed"; questions say "items" and "consume".
+        # Without matching those forms, "how much X did we consume" bound "consume" as a
+        # NAME — which then suppressed the misspelling check for X, because that only runs
+        # when nothing resolved. One stray verb hid a real typo correction.
+        forms = _forms(t)
+        # _NOISE_TOKENS exists to strip dosage forms out of PRODUCT NAMES, so that "INJ"
+        # and "SYRUP" inside a description carry no identifying weight. Applying it to the
+        # QUESTION as well made "how many syrups do we stock" unanswerable — while
+        # M119-SYRUPS is a real category. A word the warehouse files as a CLASS is a
+        # legitimate thing to ask about, whatever it does inside a product name.
+        if any(post[0] == "category" for f in forms for post in postings.get(f, ())):
+            return False
+        return any(f in bag for f in forms for bag in (_STOP, _NOISE_TOKENS, intent))
 
     interesting = [t for t in qtokens if len(t) >= 3 and not _asks_rather_than_names(t)]
 
@@ -425,8 +506,9 @@ def brief(question: str) -> str:
     asks_about_time = bool(re.search(
         r"\b(period|window|range|cover|covers|coverage|timeframe|time frame|history)\b",
         question or "", re.I))
+    typos = spelling_suggestions(question, r)
     if not (r["entities"] or r["families"] or r["cities"] or r["measures"] or r["grains"]
-            or asks_about_time):
+            or asks_about_time or typos):
         return ""
     lines = ["WHAT THIS QUESTION IS ABOUT (resolved against the actual dimension values — "
              "use these exact columns, do not guess where a name lives):"]
@@ -434,6 +516,12 @@ def brief(question: str) -> str:
         where = ", ".join(e.get("locations") or [f"{e['table']}.{e['column']}"])
         lines.append(f"- \"{e['text']}\" is a {e['kind'].upper()}, held in {where}"
                      + ("" if e["exact"] else f" (confidence {e['confidence']})"))
+    for t in typos:
+        lines.append(
+            f"- LIKELY MISSPELLING: \"{t['typed']}\" matches nothing, but \"{t['meant']}\" "
+            f"does ({t['similarity']:.0%} similar) — a {'/'.join(k.upper() for k in t['kinds'])}"
+            f", e.g. {', '.join(t['examples'][:2])}. Proceed on that reading and SAY you read "
+            f"it that way; do not stop and ask, and do not report the item as unknown.")
     for la in r["lookalikes"]:
         ex = ", ".join(la["examples"])
         lines.append(
@@ -444,6 +532,16 @@ def brief(question: str) -> str:
             f"and if the question asks what {la['of']} IS, that is the answer.")
     for f in r["families"]:
         ex = ", ".join(f["examples"][:4]) + (" …" if f["n"] > 4 else "")
+        if f["n"] == 1:
+            # ONE match is an identification. "keytruda" covers 1 of the 4 tokens in
+            # "KEYTRUDA 100MG INJ VIAL" and so arrives here rather than as an entity —
+            # but there is exactly one such item, and hedging about it helps nobody.
+            lines.append(
+                f"- \"{f['token']}\" IS {f['examples'][0]} — a {f['kind'].upper()} in "
+                f"{f['table']}.{f['column']}. Treat it as identified; filter with "
+                f"upper({f['column']}) LIKE '%{f['token'].upper()}%'."
+                + (f" Also in {', '.join(f['also_in'])}." if f["also_in"] else ""))
+            continue
         lines.append(
             f"- \"{f['token']}\" is not one value: it matches {f['n']} {f['kind'].upper()} "
             f"value(s) in {f['table']}.{f['column']} — {ex}. Cover the whole family with "
@@ -487,6 +585,21 @@ def brief(question: str) -> str:
             lines.append(f"  {_MEASURE_NOTES[m]}")
     if r["grains"]:
         lines.append(f"- BROKEN DOWN BY: {', '.join(r['grains'])}")
+        for g in r["grains"]:
+            if _GRAIN_NOTES.get(g):
+                lines.append(f"  {_GRAIN_NOTES[g]}")
+    for pat, note in _KEYWORD_NOTES:
+        if re.search(pat, question or "", re.I):
+            lines.append(f"- {note}")
+    # "biggest selling" is revenue to a CFO and units to a storekeeper, and both readings
+    # have a real answer: KEYTRUDA at ₹47.48 Cr, EXAMINATION GLOVES at 1,347,643 units.
+    if re.search(r"\b(best|biggest|top|highest)[- ]?(selling|seller)\b|\bmoves? the most\b",
+                 question or "", re.I) and not re.search(
+                     r"\b(revenue|value|units|quantity|volume|\u20b9)\b", question or "", re.I):
+        lines.append(
+            "- AMBIGUOUS: \"biggest selling\" is REVENUE or UNITS, and they give different "
+            "answers — KEYTRUDA leads on revenue, EXAMINATION GLOVES on units. Pick one, say "
+            "which, and mention the other exists.")
     if "month" in r["grains"] or re.search(
             r"\b(period|window|range|cover|covers|coverage|timeframe|time frame|history)\b",
             question or "", re.I):
@@ -529,13 +642,22 @@ def brief(question: str) -> str:
 # So measures are resolved against the real schema exactly as entity names are resolved
 # against real values: by matching the actual column names, not by hoping the model guesses
 # a column it has never been shown. Adding a column later needs no change here.
+# The one table that should answer a measure, when the warehouse has a purpose-built one.
+# Pattern-matching column names alone ranked `kpi_doh.consumption_qty` above the view that
+# actually holds both consumption scopes.
+_MEASURE_PREFERRED: dict[str, tuple[str, ...]] = {
+    "consumption": ("consumption_all.qty", "consumption_all.cost"),
+}
+
 _MEASURE_COLUMNS: dict[str, tuple[str, ...]] = {
     "margin":      (r"margin", r"profit"),
     "revenue":     (r"revenue", r"sales_value", r"net_sales", r"^sales$", r"turnover",
                     r"billed_value", r"^value$"),
     "purchasing":  (r"line_value", r"po_value", r"purchase_value", r"spend", r"net_value",
                     r"grn_value"),
-    "consumption": (r"consum", r"issued", r"usage"),
+    "consumption": (r"consum", r"issued", r"usage", r"billed_qty", r"internal_units"),
+    # consumption_all.qty is the answer to almost every consumption question; it sorts
+    # first because measure_locations prefers marts and short names over kpi_ tables.
     "stock":       (r"stock", r"on_hand", r"closing", r"inventory_value", r"total_cost"),
     "expiry":      (r"expiry", r"expir", r"shelf"),
     "lead_time":   (r"lead_time", r"lead_months", r"turnaround"),
@@ -573,10 +695,17 @@ def measure_locations(measure: str, limit: int = 6) -> tuple[str, ...]:
     if not pats:
         return ()
     rx = re.compile("|".join(pats), re.I)
-    hits = [f"{t}.{c}" for t, c in _schema_columns() if rx.search(c)]
-    # a mart beats a raw fact beats a pre-aggregated KPI, so the first ones offered are the
-    # ones a person would actually reach for
-    hits.sort(key=lambda h: (h.startswith("kpi_"), len(h)))
+    # `_pydf_*` are pandas frames registered into DuckDB as an implementation detail of the
+    # billable/non-billable rebuild. Offering them as places a measure "lives" sent the
+    # model at internals instead of at the real table.
+    hits = [f"{t}.{c}" for t, c in _schema_columns()
+            if rx.search(c) and not t.startswith("_pydf")]
+    preferred = _MEASURE_PREFERRED.get(measure, ())
+    # a purpose-built view beats a mart beats a raw fact beats a pre-aggregated KPI
+    hits.sort(key=lambda h: (h not in preferred, h.startswith("kpi_"), len(h)))
+    for p in reversed(preferred):
+        if p not in hits and any(f"{t}.{c}" == p for t, c in _schema_columns()):
+            hits.insert(0, p)
     return tuple(hits[:limit])
 
 
@@ -752,3 +881,100 @@ def reporting_window() -> str:
                 f"forecast horizons run past this and do NOT extend the reporting period; "
                 f"neither does any earlier date sitting in a master table.")
     return ""
+
+
+# ── SPELLING ─────────────────────────────────────────────────────────────────────────────
+# "how does the consumption trend of keytuda look?" resolved to nothing at all. One dropped
+# letter, and an index built on exact tokens has no opinion whatsoever — while a person
+# reads it as Keytruda without pausing. The two strings score 0.98 on Jaro-Winkler.
+#
+# This runs ONLY when a token matched nothing exactly, so it can never override a real
+# match, and it returns a SUGGESTION rather than a binding: the whole point of this module
+# is that a near-miss is not an identity. "MSD" reaching STICKER-MSDS is the failure this
+# system exists to prevent, and a fuzzy matcher that binds silently would rebuild it.
+_MIN_FUZZY_LEN = 5      # shorter tokens are too easy to confuse: 'msd' vs 'mds' vs 'msdc'
+_MIN_SIMILARITY = 0.86
+
+
+
+def _inflections(t: str) -> set[str]:
+    """Only real grammatical inflections: plural and tense.
+
+    Narrower than _forms on purpose. _forms also strips a bare trailing "e" so that
+    "consume" reaches "consumed"; using that same set to decide "this is merely an
+    inflection, not a typo" threw away "Rochee" -> "roche", where the doubled letter IS
+    the typo.
+    """
+    out = {t}
+    for suf in ("s", "es", "ed", "ing"):
+        if t.endswith(suf) and len(t) - len(suf) >= 3:
+            out.add(t[: -len(suf)])
+    out.update({t + "s", t + "es", t + "ed", t + "ing"})
+    return out
+
+
+def _forms(t: str) -> set[str]:
+    """A token and its ordinary inflections — "items"/"item", "consume"/"consumed"."""
+    out = {t}
+    for suf in ("s", "es", "ed", "ing", "d", "e"):
+        if t.endswith(suf) and len(t) - len(suf) >= 3:
+            out.add(t[: -len(suf)])
+    out.update({t + "d", t + "s", t + "es", t + "ed"})
+    return out
+
+@lru_cache(maxsize=1)
+def _vocabulary() -> tuple[str, ...]:
+    """Every distinct token that appears in an indexed dimension value."""
+    postings, _ = _index()
+    return tuple(postings.keys())
+
+
+@lru_cache(maxsize=512)
+def _did_you_mean(token: str, limit: int = 3) -> tuple[tuple[str, float], ...]:
+    from difflib import SequenceMatcher
+    tok = (token or "").lower()
+    if len(tok) < _MIN_FUZZY_LEN:
+        return ()
+    # prefilter before scoring: a real misspelling keeps its first letter and its length
+    near = [w for w in _vocabulary()
+            if abs(len(w) - len(tok)) <= 2 and w[:1] == tok[:1] and w != tok]
+    scored = []
+    for w in near:
+        ratio = SequenceMatcher(None, tok, w).ratio()
+        if ratio >= _MIN_SIMILARITY:
+            scored.append((w, round(ratio, 3)))
+    scored.sort(key=lambda x: -x[1])
+    return tuple(scored[:limit])
+
+
+def spelling_suggestions(question: str, resolved: dict) -> list[dict]:
+    """Near-miss tokens worth offering back, for a question that resolved to nothing."""
+    # Judged PER TOKEN, not per question. Gating on "nothing resolved at all" meant a
+    # single incidental match anywhere in the sentence silenced a real misspelling — the
+    # word "consume" did exactly that, and so did "last quarter". A token that matched
+    # nothing is worth a suggestion even when its neighbours matched something.
+    claimed = {t.lower() for e in resolved.get("entities", []) for t in _WORD.findall(e["text"])}
+    claimed |= {f["token"] for f in resolved.get("families", [])}
+    intent = _intent_words()
+    out = []
+    for tok in {t.lower() for t in _WORD.findall(question or "")}:
+        forms = _forms(tok)
+        if (len(tok) < _MIN_FUZZY_LEN or tok in claimed
+                or any(f in bag for f in forms
+                       for bag in (_STOP, _NOISE_TOKENS, intent, _schema_vocabulary()))):
+            continue
+        postings, _ = _index()
+        if postings.get(tok):
+            continue                       # it matched exactly; not a misspelling
+        for word, score in _did_you_mean(tok):
+            if word in _inflections(tok):
+                continue          # "vendors" -> "vendor" is an inflection, not a typo
+            cands = postings.get(word) or ()
+            if not cands:
+                continue
+            kinds = sorted({c[0] for c in cands})
+            examples = sorted({c[1] for c in cands})[:3]
+            out.append({"typed": tok, "meant": word, "similarity": score,
+                        "kinds": kinds, "examples": examples,
+                        "n": len({c[1] for c in cands})})
+    return out[:4]

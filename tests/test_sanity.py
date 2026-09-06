@@ -126,3 +126,20 @@ def test_an_unordered_query_is_not_a_ranking():
     assert sanity.placeholder_won_a_ranking(
         "SELECT category, SUM(v) FROM t GROUP BY 1",
         {"rows": [{"category": "Unknown", "s": 2}]}, "spend by category") is None
+
+
+def test_gen_is_treated_as_a_placeholder_manufacturer():
+    # "GEN" sits on 3,171 materials as a stand-in for "generic"; asked which manufacturer
+    # supplies the most units, the engine answered "GEN, 10,581,027"
+    res = {"rows": [{"manufacturer": "GEN", "u": 10_581_027},
+                    {"manufacturer": "PENTAWIS INNOVATIONS PRIVATE LIMITED", "u": 1_679_406}]}
+    assert sanity.placeholder_leader(res)
+    assert sanity.sink_placeholders(res) is True
+    assert res["rows"][0]["manufacturer"].startswith("PENTAWIS")
+
+
+def test_a_real_name_containing_those_letters_is_untouched():
+    # whole-value match only — GENERAL MEDICAL is a company, not a placeholder
+    for name in ("GENERAL MEDICAL", "GENERIC HEALTH LTD", "MISCO PHARMA"):
+        assert sanity.placeholder_leader(
+            {"rows": [{"m": name, "v": 2}, {"m": "X", "v": 1}]}) is None, name

@@ -152,6 +152,37 @@ def _fix_material_duplicate_keys(con: duckdb.DuckDBPyConnection) -> None:
 _MART_NAMES = ("mart_material_price_stats", "mart_material_vendor_price_stats", "mart_procurement")
 
 
+
+def _normalise_formulary(con: duckdb.DuckDBPyConnection) -> None:
+    """Collapse 11 spellings of 3 concepts into one column that can be grouped on.
+
+    `dim_material.formulary` holds NON FORMULARY (6,967), NON FORMUL (56), NON-FORMULARY
+    (51), NON FORMUALRY (12 — a typo), NONFORMULARY (2), NON  FORMULARY (1, double space),
+    OUT OF FORMULARY (3,495), OUT OF FOR (9), NO (1), FORMULARY (4,024) and 10,313 NULLs.
+
+    So `WHERE formulary = 'NON FORMULARY'` silently misses 122 items, and GROUP BY formulary
+    returns eleven buckets for what a pharmacist would call three. No amount of prompting
+    fixes that; the column has to be made groupable. The raw column is kept untouched beside
+    it, because the spellings themselves are a data-quality finding worth being able to see.
+    """
+    con.execute("CREATE OR REPLACE TABLE _dim_material_raw AS SELECT * FROM dim_material")
+    con.execute("""
+        CREATE OR REPLACE VIEW dim_material AS
+        SELECT *,
+               CASE
+                 WHEN formulary IS NULL OR trim(formulary) = '' THEN 'UNSPECIFIED'
+                 WHEN regexp_replace(upper(formulary), '[^A-Z]', '', 'g') LIKE 'OUTOFFOR%'
+                   THEN 'OUT OF FORMULARY'
+                 WHEN regexp_replace(upper(formulary), '[^A-Z]', '', 'g') LIKE 'NON%'
+                   OR regexp_replace(upper(formulary), '[^A-Z]', '', 'g') = 'NO'
+                   THEN 'NON FORMULARY'
+                 WHEN regexp_replace(upper(formulary), '[^A-Z]', '', 'g') LIKE 'FORMUL%'
+                   THEN 'FORMULARY'
+                 ELSE 'UNSPECIFIED'
+               END AS formulary_status
+        FROM _dim_material_raw
+    """)
+
 def _build_procurement_mart(con: duckdb.DuckDBPyConnection) -> None:
     # 1. material-grain clean price stats (materialized — the outlier-clean two-pass, once)
     con.execute("""
@@ -230,6 +261,33 @@ def _build_procurement_mart(con: duckdb.DuckDBPyConnection) -> None:
         LEFT JOIN mart_material_price_stats ps ON g.material = ps.material
         LEFT JOIN kpi_vendor_lead_time lt ON g.vendor_name = lt.vendor_name
     """)
+    # ── ONE HONEST PLACE TO ASK "HOW MUCH WAS CONSUMED" ──────────────────────
+    # `fact_consumption` is materials ISSUED FROM STORES. Materials dispensed against a
+    # patient's bill are not in it — 13,706 of 24,931, permanently — which is how "how does
+    # the consumption trend of Keytruda look" was answered "there is no recorded
+    # consumption" for a drug with 2,193 units billed and Rs 47.48 Cr of revenue.
+    #
+    # Disclosing that gap after the fact helps, but the real fix is a table where the
+    # question can be asked correctly in the first place. Both scopes, one grain, with the
+    # scope named on every row so no total can silently mean half of what a reader thinks.
+    #
+    # Deliberately at MATERIAL grain only: the billed side has no plant and no date, so a
+    # union carrying those columns would invent a precision that does not exist.
+    con.execute("""
+        CREATE OR REPLACE VIEW consumption_all AS
+        SELECT c.material, dm.material_desc, dm.material_group AS category,
+               'internal' AS scope, SUM(c.qty) AS qty, SUM(c.amount_lc) AS cost
+        FROM fact_consumption c
+        LEFT JOIN dim_material dm ON c.material = dm.material
+        GROUP BY 1, 2, 3
+        UNION ALL
+        SELECT b.material, b.material_desc, b.material_group AS category,
+               'billed' AS scope, b.billed_qty AS qty, b.billed_cost AS cost
+        FROM kpi_billable_consumption b
+        WHERE b.billed_qty > 0
+    """)
+    _tables["consumption_all"] = ""
+
     for name in _MART_NAMES:
         _tables[name] = ""   # register so schema_text()/grain_text() expose them to the model
 
@@ -294,6 +352,7 @@ def con() -> duckdb.DuckDBPyConnection:
         if _con is None:
             _con = _connect()
             _fix_material_duplicate_keys(_con)
+            _normalise_formulary(_con)
             _build_procurement_mart(_con)
             _fix_billable_nonbillable_scope(_con)
     return _con

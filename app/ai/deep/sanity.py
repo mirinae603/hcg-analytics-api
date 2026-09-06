@@ -89,8 +89,12 @@ def part_exceeds_whole(sql: str, res: dict) -> str | None:
             f"instead of joining out to a name.")
 
 
+# Whole-value match only. "GEN" sits on 3,171 materials as a stand-in for "generic" and is
+# not a manufacturer, so "which manufacturer supplies the most units" came back "GEN,
+# 10,581,027". Matching the whole value keeps real names containing these letters safe.
 _PLACEHOLDER = re.compile(
-    r"^\s*(uncategori[sz]ed|unclassified|unknown|others?|n/?a|none|null|blank|not assigned|-|)\s*$",
+    r"^\s*(uncategori[sz]ed|unclassified|unknown|others?|n/?a|none|null|blank|not assigned|"
+    r"gen|generic|misc|miscellaneous|various|tbd|undefined|not specified|unspecified|-|)\s*$",
     re.I)
 
 

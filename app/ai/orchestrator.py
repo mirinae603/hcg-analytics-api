@@ -1025,7 +1025,9 @@ def answer(query: str, history: list | None = None):
                     # "no rows" and "no such data" are different claims, and the model
                     # reports the first as the second. If the value it filtered on lives
                     # somewhere else, say so rather than let it announce an absence.
-                    _hint = _scope.explain_zero_rows(sql)
+                    # 55% of materials never appear in fact_consumption at all
+                    _hint = (_scope.billed_not_internal(sql, res)
+                             or _scope.explain_zero_rows(sql))
                     if _hint:
                         messages.append({"role": "tool", "tool_call_id": tc.id,
                                          "content": json.dumps({"error": _hint})})
@@ -1037,19 +1039,28 @@ def answer(query: str, history: list | None = None):
                 # deliberate: a note gets read past, an error makes the model rewrite the
                 # query. ₹649.57 Cr of Bangalore procurement — against ₹478.27 Cr that
                 # exists — was a JOIN fan-out that read as a perfectly ordinary figure.
+                from app.ai.deep import constraints as _constraints
                 _bad = (_sanity.part_exceeds_whole(sql, res)
-                        or _sanity.placeholder_won_a_ranking(sql, res, query))
+                        or _sanity.placeholder_won_a_ranking(sql, res, query)
+                        or _constraints.check(query, sql))
                 if _bad:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
                                      "content": json.dumps({"error": _bad})})
                     any_sql_failed = True
                     yield {"type": "step", "text": "That total was impossible — re-deriving it"}
                     continue
+                from app.ai import coverage as _coverage
+                _cov = _coverage.disclosure(sql)
+                if _cov:
+                    res["coverage_note"] = _cov
                 res["purpose"] = purpose
                 results.append(res)
                 free_sql_result_count += 1
                 yield {"type": "sql", "sql": res["sql"], "purpose": purpose, "rows": res["row_count"]}
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_result(res))})
+                _payload = _format_result(res)
+                if res.get("coverage_note"):
+                    _payload["coverage"] = res["coverage_note"]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_payload)})
             except Exception as e:
                 # Keep internal self-corrections invisible: feed the error back to the model
                 # so it fixes the query, but don't surface a scary errored query to the user.

@@ -848,6 +848,8 @@ def answer(query: str, history: list | None = None):
                      f"{_compact(f['res'], sql=f.get('sql') or '')}")
             for w in f.get("warnings") or ():
                 block += f"\n!! {w}"
+            if (f.get("res") or {}).get("coverage_note"):
+                block += f"\n!! {f['res']['coverage_note']}"
             out.append(block)
         return "\n\n".join(out)
 
