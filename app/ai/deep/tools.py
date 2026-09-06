@@ -170,10 +170,21 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
     off = scope.missing_entity_scope(sql, entity_tokens or [])
     if off:
         return {"error": off}
+    # A city filter on a sales table cannot be satisfied — the code systems are disjoint.
+    # Saying so in the prompt did not stop it; failing the query does.
+    from app.ai.deep import sanity as _sanity
+    unreachable = _sanity.city_on_unreachable_table(sql)
+    if unreachable:
+        return {"error": unreachable}
     try:
         r = warehouse.run_sql(sql, row_cap=200)
     except Exception as e:
         return {"error": str(e)[:300]}
+    # `ORDER BY spend DESC LIMIT 1` returning "Uncategorized" cannot be repaired by
+    # reordering — there is nothing left to promote. Send it back to be re-queried.
+    unnamed = _sanity.placeholder_won_a_ranking(sql, r, question)
+    if unnamed:
+        return {"error": unnamed}
     # SUM() over zero matching rows returns ONE row containing NULL, which looks like a
     # result and is not: "SELECT SUM(revenue) FROM sales_by_manufacturer WHERE manufacturer
     # = 'MSD'" matched nothing (the value is stored 'Msd') and the answer became "there is

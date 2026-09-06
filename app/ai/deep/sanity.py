@@ -124,3 +124,90 @@ def placeholder_leader(res: dict) -> str | None:
 def check(sql: str, res: dict) -> list[str]:
     """Every warning that applies to one finding."""
     return [w for w in (part_exceeds_whole(sql, res), placeholder_leader(res)) if w]
+
+
+def sink_placeholders(res: dict) -> bool:
+    """Move unnamed buckets to the BOTTOM of a result. True if anything moved.
+
+    placeholder_leader() warns, and the warning was read past: "our biggest spend category
+    is Uncategorized, ₹173.31 Cr" appeared with the caution sitting right beside it. Every
+    consumer of a result — the ranking shape, the chart, the writer skimming row one —
+    treats position as rank, so the fix belongs in the rows.
+
+    The bucket is not dropped. It is real, and its size is a finding about data quality;
+    it just stops being the answer to "which category is biggest".
+    """
+    rows = (res or {}).get("rows") or []
+    if len(rows) < 2:
+        return False
+    label_col = next((k for k, v in rows[0].items() if isinstance(v, str)), None)
+    if not label_col:
+        return False
+    named = [r for r in rows if not _PLACEHOLDER.match(str(r.get(label_col) or ""))]
+    unnamed = [r for r in rows if _PLACEHOLDER.match(str(r.get(label_col) or ""))]
+    if not unnamed or not named:
+        return False
+    res["rows"] = named + unnamed
+    return True
+
+
+def city_on_unreachable_table(sql: str) -> str | None:
+    """Block a city filter on a table whose site codes cannot reach dim_plant.
+
+    The brief says plainly that sales_by_hospital.hospital shares ZERO codes with dim_plant
+    and that no sales figure can be scoped to a city. "KEYTRUDA, ₹10.78 Cr in Bangalore
+    hospitals" was written anyway, three runs apart, because a statement in a prompt is a
+    preference and the query still ran. This makes it a precondition: the query fails and
+    the model is told why, in the one place it cannot skim past.
+    """
+    if not sql:
+        return None
+    from app.ai import resolve as _resolve
+    _, blocked = _resolve.city_reachability()
+    tables = {t.split(".")[0] for t in blocked}
+    hit = next((t for t in tables if re.search(rf"\b{re.escape(t)}\b", sql, re.I)), None)
+    if not hit:
+        return None
+    city = next((c for c in _resolve.cities()
+                 if re.search(rf"\b{re.escape(c)}\b", sql, re.I)), None)
+    if not city:
+        return None
+    return (f"IMPOSSIBLE FILTER — {hit} cannot be scoped to a city. Its site codes share no "
+            f"value with dim_plant, where city names live, so there is no join and no filter "
+            f"that yields {city}'s sales. Any number this query returns is some other scope "
+            f"wearing {city}'s label. Answer at the level the data supports — company-wide, "
+            f"or per hospital using that table's own site codes — and say why the city cut "
+            f"is not available.")
+
+
+def placeholder_won_a_ranking(sql: str, res: dict, question: str = "") -> str | None:
+    """Refuse a ranking whose winner is an unnamed bucket.
+
+    sink_placeholders fixes a result that CONTAINS the named categories. It cannot fix
+    `ORDER BY spend DESC LIMIT 1`, which returns one row reading "Uncategorized, ₹173.31
+    Cr" — there is nothing left to promote. The query itself is the wrong query: nobody
+    asking for their biggest spend category is asking how much of the spend is unclassified.
+
+    Left alone when the question really is about the gap, because then it is the answer.
+    """
+    if not sql or not re.search(r"\bORDER\s+BY\b", sql, re.I):
+        return None
+    if re.search(r"uncategori[sz]ed|unclassified|unknown|missing|blank|null|not assigned",
+                 question or "", re.I):
+        return None                       # they asked about the gap; that is legitimate
+    rows = (res or {}).get("rows") or []
+    if not rows:
+        return None
+    label_col = next((k for k, v in rows[0].items() if isinstance(v, str)), None)
+    if not label_col or not _PLACEHOLDER.match(str(rows[0].get(label_col) or "")):
+        return None
+    named = next((r for r in rows[1:]
+                  if not _PLACEHOLDER.match(str(r.get(label_col) or ""))), None)
+    if named:
+        return None                       # a real category is present; ordering handles it
+    return (f"WRONG QUERY — the top row is \"{rows[0][label_col]}\", which is an absence of "
+            f"data, not a category. Re-run this with the unnamed buckets excluded — add "
+            f"WHERE {label_col} IS NOT NULL AND trim({label_col}) <> '' AND upper({label_col}) "
+            f"NOT IN ('UNCATEGORIZED','UNCLASSIFIED','UNKNOWN','OTHER','N/A','NONE') — so the "
+            f"ranking is of things that have names. Report the unclassified share separately "
+            f"as a data-quality point; it is worth saying, but it is not the answer.")

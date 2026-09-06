@@ -1016,7 +1016,8 @@ def answer(query: str, history: list | None = None):
             sql = args.get("sql", "")
             yield {"type": "step", "text": purpose[:80]}
             try:
-                _off = _scope.missing_entity_scope(sql, bound_entity)
+                _off = (_scope.missing_entity_scope(sql, bound_entity)
+                        or _sanity.city_on_unreachable_table(sql))
                 if _off:
                     raise warehouse.SqlError(_off)
                 res = warehouse.run_sql(sql)
@@ -1036,7 +1037,8 @@ def answer(query: str, history: list | None = None):
                 # deliberate: a note gets read past, an error makes the model rewrite the
                 # query. ₹649.57 Cr of Bangalore procurement — against ₹478.27 Cr that
                 # exists — was a JOIN fan-out that read as a perfectly ordinary figure.
-                _bad = _sanity.part_exceeds_whole(sql, res)
+                _bad = (_sanity.part_exceeds_whole(sql, res)
+                        or _sanity.placeholder_won_a_ranking(sql, res, query))
                 if _bad:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
                                      "content": json.dumps({"error": _bad})})

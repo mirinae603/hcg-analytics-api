@@ -830,9 +830,14 @@ def answer(query: str, history: list | None = None):
         if last_result is not None and last_result.get("_full") is not None:
             # Check the arithmetic before the result is allowed to be evidence. A number
             # that cannot be true is worse than no number, because it reads as an answer.
-            return {"sub": sub, "sql": last_sql, "res": last_result["_full"],
+            full = last_result["_full"]
+            # An unnamed bucket is demoted IN THE ROWS, not just warned about. The warning
+            # was there and "our biggest spend category is Uncategorized, ₹173.31 Cr" was
+            # written anyway — whatever reads the first row has to see a real category.
+            sanity.sink_placeholders(full)
+            return {"sub": sub, "sql": last_sql, "res": full,
                     "purpose": sub.get("question"),
-                    "warnings": sanity.check(last_sql, last_result["_full"])}
+                    "warnings": sanity.check(last_sql, full)}
         return {"sub": sub, "skipped": "ran out of steps without a usable result"}
 
 
@@ -1028,7 +1033,13 @@ def answer(query: str, history: list | None = None):
     # figure the brief leads with. ₹649.57 Cr of Bangalore procurement, against ₹478.27 Cr
     # of procurement that exists, was a JOIN fan-out that no wording could have caught.
     sound = [f for f in findings if not _impossible(f)]
-    derived = shapes.derive_all(shape_name, canonical_findings or sound or findings)
+    # The grain filter was applied only to CANONICAL findings, so when none of them served
+    # the requested level the fallback quietly re-admitted everything — and "which products
+    # move the most units" came back "M070-STATIONARY, 7,782,689 units", a category wearing
+    # a product's answer. Preferring grain-serving findings here closes that door; the plain
+    # `sound` list is still the last resort, because refusing to answer is worse.
+    at_grain = [f for f in sound if _serves_grain(f["res"], _want)] if _want else sound
+    derived = shapes.derive_all(shape_name, canonical_findings or at_grain or sound or findings)
     if canonical_totals:
         # A KPI's `totals` ARE the headline. Left only in the lesson board they were read
         # past, and the model summed the twelve category rows it could see instead —
