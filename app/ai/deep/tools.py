@@ -174,6 +174,17 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
         r = warehouse.run_sql(sql, row_cap=200)
     except Exception as e:
         return {"error": str(e)[:300]}
+    # SUM() over zero matching rows returns ONE row containing NULL, which looks like a
+    # result and is not: "SELECT SUM(revenue) FROM sales_by_manufacturer WHERE manufacturer
+    # = 'MSD'" matched nothing (the value is stored 'Msd') and the answer became "there is
+    # no sales figure for MSD" for a manufacturer with ₹47.57 Cr.
+    rows = r.get("rows") or []
+    if r.get("row_count") == 1 and rows and all(v is None for v in rows[0].values()):
+        hint = scope.explain_zero_rows(sql)
+        return {"row_count": 0, "columns": r["columns"],
+                "note": (hint or "") + " Every value came back NULL, which means the filter "
+                        "matched no rows — check the spelling and CASE of the value you "
+                        "filtered on (use upper()/ILIKE), not the aggregate."}
     if not r.get("row_count"):
         hint = scope.explain_zero_rows(sql)
         return {"row_count": 0, "columns": r["columns"],

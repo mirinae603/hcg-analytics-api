@@ -26,7 +26,7 @@ except Exception:
     pass
 
 
-from evals.cases import CASES  # the question bank + its ground truth
+from evals.cases import CASES  # the 90-question bank + its ground truth
 
 
 def run(case, mode="deep"):
@@ -65,7 +65,9 @@ def main():
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     mode = sys.argv[2] if len(sys.argv) > 2 else "deep"
     only = sys.argv[3] if len(sys.argv) > 3 else ""
-    cases = [c for c in CASES if not only or only in c["id"]]
+    # a third arg filters by case id OR by level ("L1"/"L2"/"L3")
+    cases = [c for c in CASES
+             if not only or only in c["id"] or c.get("level", "") == only.upper()]
     print(f"golden set · mode={mode} · {runs} run(s) each · {len(cases)} cases\n", flush=True)
 
     # 30 cases x N runs is an hour of wall clock run one at a time, which is long enough
@@ -99,6 +101,14 @@ def main():
             bad = next(r for r in results if not r["ok"])
             print(f"           why it should pass: {c['why']}")
             print(f"           got: {(bad.get('err') or bad['text'])[:200].strip()}", flush=True)
+    # per level, because an average hides which KIND of question is failing
+    print()
+    for lv in ("L1", "L2", "L3"):
+        rows = [(c, by_id.get(c["id"], [])) for c in cases if c.get("level") == lv]
+        n = sum(len(r) for _, r in rows)
+        ok = sum(1 for _, rs in rows for r in rs if r["ok"])
+        if n:
+            print(f"  {lv}: {ok}/{n} = {100 * ok / n:.0f}%")
     print(f"\n  OVERALL {passed}/{total} = {100 * passed / max(total, 1):.0f}%")
     return 0 if passed == total else 1
 

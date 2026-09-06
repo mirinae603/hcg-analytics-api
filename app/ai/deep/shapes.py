@@ -177,8 +177,26 @@ def derive_ranking(res: dict) -> dict:
         return {}
     pairs.sort(key=lambda x: -x[1])
     total = sum(v for _, v in pairs) or 1.0
+
+    # "The largest spend category is Uncategorized (₹173.31 Cr)" is not an answer, it is a
+    # data-quality finding wearing one. A placeholder bucket is reported separately so the
+    # ranking is of things that actually have names.
+    placeholder = re.compile(r"^\s*(uncategori[sz]ed|unknown|other|others|n/?a|none|blank|-|)\s*$", re.I)
+    unknown = [(l, v) for l, v in pairs if placeholder.match(l or "")]
+    named = [(l, v) for l, v in pairs if not placeholder.match(l or "")]
+    if unknown and named:
+        out_unknown = {"label": unknown[0][0] or "(blank)", "value": sum(v for _, v in unknown),
+                       "share_of_returned_pct": sum(v for _, v in unknown) / total * 100}
+        pairs = named
+        total = sum(v for _, v in pairs) or 1.0
     out: dict[str, Any] = {"measure": mcol, "dimension": lcol, "n": len(pairs),
                            "top": [{"label": l, "value": v} for l, v in pairs[:5]]}
+    if unknown and named:
+        out["unclassified"] = out_unknown
+        out["unclassified_note"] = (
+            "A large bucket has no category. Report the ranking of NAMED categories, and "
+            "mention the unclassified share separately as a data-quality point — never as "
+            "the answer to which category is biggest.")
 
     # A SHARE NEEDS A REAL DENOMINATOR.
     #

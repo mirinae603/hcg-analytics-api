@@ -403,6 +403,23 @@ def answer(query: str, history: list | None = None):
     # what ONE ROW means: COUNT(*) on a material-per-site table is not an item count
     lessons.extend(capability.grain_notes())
 
+    # TYPED RESOLUTION, before anything is framed or planned. find_value() below says
+    # WHERE a literal lives; this says WHAT IT IS — a drug, a city, a manufacturer, a
+    # category — and what the question is measuring. Naming the things first is the step a
+    # human never skips and this engine had no equivalent of.
+    try:
+        from app.ai import resolve as _resolve
+        _rb = _resolve.brief(query)
+        if _rb:
+            lessons.append(_rb)
+            _r = _resolve.resolve(query)
+            # bind every confidently-typed entity so a query claiming to be about it must
+            # actually reference it
+            entity_tokens.extend(e["text"] for e in _r["entities"] if e.get("exact"))
+            entity_tokens.extend(_r["cities"])
+    except Exception:
+        pass
+
     # RESOLVE THE ENTITIES THE QUESTION NAMES, whatever kind they are.
     #
     # Entity binding only ever triggered on a QUOTED item, so "Bangalore", "MSD" and vendor
@@ -424,13 +441,16 @@ def answer(query: str, history: list | None = None):
         if hits:
             resolved_where[cand] = [f"{h['table']}.{h['column']}" for h in hits[:4]]
     if resolved_where:
-        # BIND them, do not merely mention them. A lesson saying "'Bangalore' exists only in
+        # NOTE them, but do NOT bind them. Binding every capitalised word bound the word
+        # "Rank" — capitalised only because it starts the sentence — and then rejected every
+        # query that failed to mention it, so "Rank our hospitals by sales revenue" returned
+        # "I couldn't establish anything". Binding is now done from resolve.py, which types
+        # what it finds and ignores verbs and question words. A lesson saying "'Bangalore' exists only in
         # dim_plant.plant_name" was read past, and the engine still reported "KEYTRUDA
         # ₹10.78 Cr in Bangalore hospitals" from a sales table a city cannot reach. Adding
         # the names to entity_tokens makes missing_entity_scope REJECT any query that does
         # not reference them, so a sales query claiming to be city-filtered cannot run at
         # all — which is the only way this stops being a matter of the model's attention.
-        entity_tokens.extend(resolved_where.keys())
         for name, places in resolved_where.items():
             lessons.append(f"'{name}' exists ONLY in {', '.join(places)} — any figure claimed to be "
                            f"about it must come from a query that filters one of those columns. "
@@ -890,7 +910,15 @@ def answer(query: str, history: list | None = None):
     # valued at ₹39.70 L" took the quantity from a SQL re-derivation (which includes stock
     # that expired months ago) and the value from the canonical bands. The other findings
     # stay as EVIDENCE for the drivers; they just stop bidding for the headline figure.
-    canonical_findings = [f for f in findings if f.get("canonical")]
+    # A canonical metric owns the headline only when the question is ABOUT the whole
+    # business. Asked "what is Vardhman's average lead time" the vendor-lead-time KPI
+    # returns company-wide medians with no row for Vardhman — and because canonical
+    # findings had been made to own the headline unconditionally, the answer became "there
+    # is no lead time figure for Vardhman", for a vendor whose figure is 4.8 days. Same for
+    # MSD's ₹47.57 Cr of sales. When a specific entity is named, the KPI is context; the
+    # entity-scoped query is the answer.
+    entity_specific = bool(entity_tokens)
+    canonical_findings = [] if entity_specific else [f for f in findings if f.get("canonical")]
     derived = shapes.derive_all(shape_name, canonical_findings or findings)
     if canonical_totals:
         # A KPI's `totals` ARE the headline. Left only in the lesson board they were read

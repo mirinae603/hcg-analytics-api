@@ -779,6 +779,16 @@ def answer(query: str, history: list | None = None):
     # wait with nothing to show otherwise, and users read a long instant silence as "stuck".
     yield {"type": "step", "text": "Understanding your question"}
 
+    # IDENTIFY BEFORE QUERYING. Every wrong answer this assistant produced came from acting
+    # on a word before typing it: "MSD" answered as a stationery sticker, "Bangalore" as a
+    # sales filter that cannot exist. resolve.brief() names each thing in the question and
+    # the exact column that holds it, so the SQL has nowhere to misfile it.
+    try:
+        from app.ai import resolve as _resolve
+        _brief = _resolve.brief(query)
+    except Exception:
+        _brief = ""   # resolution is an aid, never a gate
+
     # Facts about THIS warehouse that are derived from the data, not asserted — the same
     # ones deep mode learned the hard way. Each of these was, at some point, reported to a
     # user as a limit of their DATA when it was a limit of the assistant's knowledge:
@@ -794,6 +804,8 @@ def answer(query: str, history: list | None = None):
         pass   # never let an enrichment break the fast path
 
     messages = [{"role": "system", "content": SYSTEM.format(context=ctx)}]
+    if _brief:
+        messages.append({"role": "system", "content": _brief})
     for h in (history or [])[-HISTORY_MESSAGES:]:
         if h.get("role") in ("user", "assistant") and h.get("content"):
             messages.append({"role": h["role"], "content": str(h["content"])[:1500]})

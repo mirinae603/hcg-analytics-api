@@ -68,7 +68,7 @@ def num_within(target: float, tol_pct: float = 2.0):
 
 
 # `must_answer` = a clarifying question does not count; the data supports a real answer.
-CASES: list[dict] = [
+L1: list[dict] = [
     # ── canonical figures: these must be exact ───────────────────────────────
     {"id": "expiry-90d", "q": "How much stock is expiring in the next 90 days?",
      # Require BOTH canonical figures rather than banning other numbers: naming the
@@ -242,3 +242,250 @@ CASES: list[dict] = [
      "check": lacks("not answerable", "no data"), "why": "sales_by_material_hospital has revenue and cost",
      "must_answer": True},
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEVEL 1 — a single fact. One metric, no breakdown, no reasoning. If these fail
+# nothing else matters, so their expectations are exact figures.
+# ═══════════════════════════════════════════════════════════════════════════
+L1 += [
+    {"id": "l1-hospital-count", "q": "How many hospitals do we operate?",
+     "check": num_within(53, 2), "why": "53 in dim_plant"},
+    {"id": "l1-material-count", "q": "How many distinct materials are in the catalogue?",
+     "check": lambda t: num_within(24931, 3)(t) or num_within(24805, 3)(t),
+     "why": "24,931 material codes / 24,805 distinct descriptions"},
+    {"id": "l1-stocked-skus", "q": "How many SKUs do we currently hold stock for?",
+     "check": num_within(18080, 3), "why": "18,080 distinct materials in fact_inventory"},
+    {"id": "l1-top-mfr-sales", "q": "How much did MSD sell?",
+     "check": num_within(47.57, 4), "why": "MSD ₹47.57 Cr — and MSD is a MANUFACTURER"},
+    {"id": "l1-vendor-count", "q": "How many vendors do we buy from?",
+     "check": lambda t: num_within(3468, 5)(t) or num_within(3416, 5)(t), "why": "~3,4xx vendors"},
+    {"id": "l1-total-procurement", "q": "What is our total procurement spend?",
+     "check": num_within(649.91, 4), "why": "₹649.91 Cr"},
+    {"id": "l1-expired-value", "q": "What is the value of stock that has already expired?",
+     "check": lambda t: num_within(43.16, 8)(t) or num_within(83.13, 8)(t),
+     "why": "canonical ₹43.16 L (raw ₹83.13 L also defensible)"},
+    {"id": "l1-median-lead-time", "q": "What is our median vendor lead time?",
+     "check": num_within(3.6, 30), "why": "3.6 days"},
+    {"id": "l1-top-vendor-name", "q": "Who is our largest supplier?",
+     "check": has("vardhman"), "why": "Vardhman Health Specialities"},
+    {"id": "l1-top-category-name", "q": "What is our biggest spend category?",
+     "check": any_of("injection", "m065"), "why": "M065-INJECTIONS"},
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEVEL 2 — one dimension. A ranking, a filter, a breakdown, a trend. This is
+# where entity typing starts to matter: a name has to land in the right column.
+# ═══════════════════════════════════════════════════════════════════════════
+L2: list[dict] = [
+    {"id": "l2-top5-vendors", "q": "Give me the top 5 vendors by procurement spend.",
+     "check": all_of(has("vardhman"), num_within(297.77, 4)), "must_answer": True,
+     "why": "Vardhman ₹297.77 Cr leads"},
+    {"id": "l2-sales-by-hospital", "q": "Rank our hospitals by sales revenue.",
+     "check": all_of(has("kabhk"), num_within(104.70, 5)), "must_answer": True, "why": "KABHK ₹104.70 Cr"},
+    {"id": "l2-stock-by-hospital", "q": "Which hospitals hold the most inventory value?",
+     "check": all_of(any_of("hm01", "hc05"), num_within(8.39, 10)), "must_answer": True, "why": "HM01 ₹8.39 Cr"},
+    {"id": "l2-nonmoving-by-group", "q": "Which product groups have the most non-moving stock value?",
+     "check": all_of(any_of("m017", "endo"), num_within(2.32, 12)), "must_answer": True,
+     "why": "M017-ENDO SURG ACCES ₹2.32 Cr"},
+    {"id": "l2-nonmoving-by-site", "q": "Which hospitals are sitting on the most non-moving stock?",
+     # ₹145.03 L IS ₹1.45 Cr. The answer said "HM01 (₹1.45 Cr)" and was correct; the check
+     # demanded the lakh-scaled digits and failed it. A check must not care which unit a
+     # correct figure is expressed in.
+     "check": all_of(any_of("hm01", "ah01"),
+                     lambda t: num_within(145.03, 12)(t) or num_within(1.45, 12)(t)),
+     "must_answer": True, "why": "HM01 ₹1.45 Cr (₹145.03 L), AH01 ₹1.44 Cr"},
+    {"id": "l2-procurement-by-category", "q": "Break our procurement spend down by category.",
+     "check": all_of(any_of("m065", "injection"), num_within(234.06, 6)), "must_answer": True,
+     "why": "M065-INJECTIONS ₹234.06 Cr"},
+    {"id": "l2-bangalore-procurement", "q": "How much do our Bangalore hospitals spend on procurement?",
+     # Bangalore covers FOUR hospitals, so both the citywide total (~₹174 Cr) and the
+     # largest single site (₹90.82 Cr) are right answers depending on the reading.
+     "check": all_of(any_of("hc05", "bangalore"),
+                     lambda t: num_within(90.82, 10)(t) or num_within(174.02, 12)(t)),
+     "must_answer": True, "why": "citywide ~₹174 Cr, or HCG KR ₹90.82 Cr — via plant_name"},
+    {"id": "l2-top-units-sold", "q": "Which products move the most units?",
+     "check": all_of(any_of("gloves", "examination"), num_within(1347643, 3)), "must_answer": True,
+     "why": "EXAMINATION GLOVES 1,347,643 units — units, not revenue"},
+    {"id": "l2-revenue-trend", "q": "How has monthly revenue moved over the period?",
+     "check": all_of(num_within(89.52, 4), any_of("rose", "fell", "flat", "stable", "declin", "increas", "%")),
+     "must_answer": True, "why": "Dec 89.52 → May 87.93 Cr, must state a direction"},
+    {"id": "l2-expiry-by-band", "q": "Break down our near-expiry stock by ageing band.",
+     "check": all_of(any_of("0-30", "31-90", "91-180"), num_within(39.97, 8)), "must_answer": True,
+     "why": "0-30d ₹16.79 L, 31-90d ₹23.18 L"},
+    {"id": "l2-thin-margin-hospitals", "q": "Which hospitals run the thinnest sales margins?",
+     "check": all_of(any_of("gjhca", "mhhik"), num_within(31.28, 15)), "must_answer": True,
+     "why": "GJHCA 31.3%, MHHIK 32.5%"},
+    {"id": "l2-msd-items", "q": "Which items do we buy from MSD?",
+     "check": lacks("no procurement", "not available", "sticker", "no data"), "must_answer": True,
+     "why": "MSD is a manufacturer — 614 procurement lines"},
+    {"id": "l2-vendor-lead-spread", "q": "Which vendors are slowest to deliver?",
+     "check": lacks("not answerable", "no lead time"), "must_answer": True,
+     "why": "kpi_vendor_lead_time; a rate — no share of it should be claimed"},
+    {"id": "l2-oncology-stock", "q": "How much inventory value sits in oncology drugs?",
+     "check": lacks("not answerable", "no data"), "must_answer": True, "why": "material_type ZOC"},
+    {"id": "l2-keytruda-hospitals", "q": 'Which hospitals sell the most "KEYTRUDA 100MG INJ VIAL"?',
+     "check": all_of(has("keytruda"), lacks("not answerable", "no data")), "must_answer": True,
+     "why": "sales_by_material_hospital carries both"},
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEVEL 3 — multi-step, diagnostic, or a trap. These need the question UNDERSTOOD
+# before it is queried: the right entity type, the right grain, and an honest
+# answer when the warehouse genuinely cannot connect two things.
+# ═══════════════════════════════════════════════════════════════════════════
+L3: list[dict] = [
+    {"id": "l3-vendor-failure", "q": "If Vardhman failed tomorrow, which categories would hurt most and why?",
+     "check": all_of(has("vardhman"), lacks("not answerable", "evidence does not allow"),
+                     lambda t: "100%" not in t and "100.0%" not in t),
+     "must_answer": True, "why": "must name categories and quantify exposure, no false 100%"},
+    {"id": "l3-margin-vs-volume",
+     "q": "Are our highest-volume products also our highest-margin ones, or is it the opposite?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "needs volume and margin compared, and a stated conclusion"},
+    {"id": "l3-expiry-concentration",
+     "q": "Is our expiry risk concentrated in a few hospitals or spread evenly, and what would reduce it?",
+     "check": lacks("not answerable", "no data"), "must_answer": True, "why": "distribution + recommendation"},
+    {"id": "l3-sales-stock-link",
+     "q": "For each hospital, compare sales revenue against the stock it holds.",
+     "check": any_of("cannot", "can't", "not possible", "no mapping", "no linkage", "no link",
+                     "does not", "doesn't", "different code", "separate", "unable", "not answerable"),
+     "why": "TRAP: sales and plant hospital codes share zero rows and nothing maps them"},
+    {"id": "l3-bangalore-sales-trap", "q": "What sold the most in Bangalore last month?",
+     "check": any_of("purchas", "procurement", "cannot", "can't", "no city", "plant_name",
+                     "not possible", "consumption", "no monthly"),
+     "why": "TRAP: no city reaches sales, and there is no material x month sales grain"},
+    {"id": "l3-msd-lead-time-hop",
+     "q": "How reliable are the vendors who supply MSD's products?",
+     "check": all_of(lacks("no lead times", "no data", "not answerable"),
+                     any_of("vardhman", "vendor", "day")),
+     "must_answer": True, "why": "manufacturer -> its vendors -> lead times"},
+    {"id": "l3-price-outliers",
+     "q": "Are we overpaying anyone? Show me where the same item costs very different amounts.",
+     "check": lacks("not answerable", "no pricing"), "must_answer": True,
+     "why": "mart_material_vendor_price_stats / is_price_outlier"},
+    {"id": "l3-cash-vs-expiry",
+     "q": "We need to free up cash. Should we cut reordering or clear near-expiry stock first?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "must weigh two figures and recommend"},
+    {"id": "l3-dead-stock-cost",
+     "q": "What is non-moving stock actually costing us, and which sites are worst?",
+     "check": all_of(lacks("not answerable"), any_of("hm01", "ah01", "hospital")), "must_answer": True,
+     "why": "value + worst sites"},
+    {"id": "l3-consumption-vs-purchase",
+     "q": 'For "KEYTRUDA 100MG INJ VIAL", does what we buy match what we use?',
+     "check": any_of("billed", "no internal consumption", "0", "purchas", "consumption"),
+     "why": "TRAP: billed-only item — fact_consumption has 0 rows for it"},
+    {"id": "l3-category-margin-drop",
+     "q": "Which category is dragging our overall margin down the most?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "margin by category, ranked by drag"},
+    {"id": "l3-stockout-vs-leadtime",
+     "q": "Are our stock-outs caused by slow vendors or by under-ordering?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "must test two explanations and rule one out"},
+    {"id": "l3-hospital-outlier",
+     "q": "Is any hospital behaving very differently from the others on inventory?",
+     "check": lacks("not answerable", "no data"), "must_answer": True, "why": "outlier detection"},
+    {"id": "l3-top-drug-economics",
+     "q": "KEYTRUDA is our biggest seller — is it also our most profitable, and what does it cost us to hold?",
+     "check": all_of(has("keytruda"), lacks("not answerable")), "must_answer": True,
+     "why": "revenue + margin + holding, one item, several tables"},
+    {"id": "l3-seasonality",
+     "q": "Is there any seasonality in our procurement, or is it flat?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "monthly purchase value exists; must state a conclusion either way"},
+]
+
+
+# ── topping each level to thirty ─────────────────────────────────────────────
+L1 += [
+    {"id": "l1-total-margin-pct-again", "q": "What margin percentage are we running overall?",
+     "check": num_within(40.9, 6), "why": "40.9%"},
+    {"id": "l1-inventory-mrp", "q": "What is our stock worth at MRP?",
+     "check": num_within(120.89, 6), "why": "₹120.89 Cr at MRP vs ₹60.47 Cr at cost"},
+    {"id": "l1-material-groups", "q": "How many material groups are there?",
+     "check": lambda t: num_within(139, 8)(t) or num_within(136, 8)(t), "why": "139 groups"},
+    {"id": "l1-generic-count", "q": "How many distinct generic molecules do we stock?",
+     "check": num_within(3224, 8), "why": "3,224 generic names"},
+    {"id": "l1-manufacturer-count", "q": "How many manufacturers supply us?",
+     "check": num_within(1321, 8), "why": "1,321 manufacturers"},
+    {"id": "l1-expiring-qty", "q": "How many units are expiring in the next 90 days?",
+     "check": all_of(num_within(45223, 2), lacks("101,005", "101005")),
+     "why": "45,223 units, excluding already-expired"},
+    {"id": "l1-po-lines-vardhman", "q": "How many purchase order lines do we have with Vardhman?",
+     "check": num_within(111582, 5), "why": "111,582 PO lines"},
+    {"id": "l1-data-window", "q": "What period does our data cover?",
+     "check": all_of(any_of("dec", "december", "2025"), any_of("may", "2026")),
+     "why": "December 2025 to May 2026"},
+    {"id": "l1-keytruda-qty", "q": 'How many units of "KEYTRUDA 100MG INJ VIAL" were sold?',
+     "check": num_within(2193, 4), "why": "2,193 units"},
+    {"id": "l1-avg-lead-vardhman", "q": "What is Vardhman's average lead time?",
+     "check": num_within(4.8, 30), "why": "4.8 days average"},
+    {"id": "l1-departments", "q": "How many departments consume stock?",
+     "check": num_within(730, 10), "why": "730 department names"},
+    {"id": "l1-second-selling-item", "q": "What is our second biggest selling product?",
+     "check": any_of("trasturel", "19.3"), "why": "TRASTUREL 440MG ₹19.31 Cr"},
+]
+
+L2 += [
+    {"id": "l2-generic-concentration", "q": "Which generic molecules account for most of our spend?",
+     "check": lacks("not answerable", "no data"), "must_answer": True, "why": "generic_name exists in dim_material"},
+]
+
+L3 += [
+    {"id": "l3-mfr-vs-vendor-confusion",
+     "q": "Is Reliance a supplier we buy from directly, or just a manufacturer of things we buy?",
+     "check": any_of("manufacturer", "not a vendor", "brand", "maker"),
+     "why": "TRAP: entity typing — Reliance is a MANUFACTURER, not in dim_vendor"},
+    {"id": "l3-city-vs-hospital",
+     "q": "Compare procurement spend between our Bangalore and Ahmedabad hospitals.",
+     "check": lacks("not answerable", "no location", "no city"), "must_answer": True,
+     "why": "cities resolve through dim_plant.plant_name — this one IS answerable"},
+    {"id": "l3-margin-erosion-driver",
+     "q": "Our margin is 40.9%. Which products or categories are pulling it below that?",
+     "check": all_of(lacks("not answerable"), num_within(40.9, 12)), "must_answer": True,
+     "why": "must anchor on the real overall margin then decompose"},
+    {"id": "l3-reorder-vs-expiry-conflict",
+     "q": "Are we reordering anything that we already have sitting near expiry?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "reorder list intersected with near-expiry — a real operational question"},
+    {"id": "l3-vendor-price-vs-speed",
+     "q": "Do our cheapest vendors also take the longest to deliver?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "price stats vs lead time; a rate — no share of lead time should be claimed"},
+    {"id": "l3-single-source-risk",
+     "q": "Which critical items do we buy from only one vendor?",
+     "check": lacks("not answerable", "no data"), "must_answer": True,
+     "why": "count distinct vendors per material"},
+    {"id": "l3-what-changed",
+     "q": "What changed most between December and May across our procurement?",
+     "check": all_of(lacks("not answerable"), any_of("dec", "may", "%")), "must_answer": True,
+     "why": "period comparison with a stated direction"},
+]
+
+# The first thirty cases predate the levels, so they are classified here by what they
+# actually demand rather than by the order they were written in.
+_LEVEL_OF = {
+    # L2 — one dimension: a ranking, a breakdown, a trend
+    "top-vendor": "L2", "top-selling-item": "L2", "top-category": "L2",
+    "top-manufacturer": "L2", "top-hospital-sales": "L2", "top-stock-site": "L2",
+    "revenue-trend": "L2", "slow-movers-by-site": "L2", "lead-time-risk": "L2",
+    "margin-by-hospital": "L2", "cash-to-restock": "L2", "stockout-impact": "L2",
+    "price-variance": "L2", "oncology-exposure": "L2",
+    # L3 — multi-step, diagnostic, or a trap that needs the entity TYPED first
+    "keytruda-trend": "L3", "msd-procurement": "L3", "msd-lead-times": "L3",
+    "sales-vs-stock-by-hospital": "L3", "bangalore-sales": "L3",
+    "vendor-concentration": "L3", "worst-margin-drugs": "L3", "keytruda-consumption": "L3",
+}
+
+
+def _classify(bucket: list[dict], default: str) -> None:
+    for c in bucket:
+        c["level"] = _LEVEL_OF.get(c["id"], default)
+
+
+_classify(L1, "L1")
+_classify(L2, "L2")
+_classify(L3, "L3")
+CASES: list[dict] = L1 + L2 + L3
+BY_LEVEL = {lv: [c for c in CASES if c["level"] == lv] for lv in ("L1", "L2", "L3")}
