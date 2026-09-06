@@ -77,8 +77,22 @@ def main():
     # 3, not 6: each deep run fans out to 4 workers of its own, so 6 concurrent cases put
     # ~24 requests on Azure at once and the eval started failing itself with 429s —
     # measuring the harness, not the engine.
+    # Report each case AS IT LANDS. Printing only the final table made a 90-case run opaque
+    # for half an hour, and when one stalled there was no way to tell a slow run from a hung
+    # one without attaching a profiler to the process.
+    from threading import Lock
+    seen, tick = [0], Lock()
+
+    def _one(j):
+        cid, r = j[0]["id"], run(j[0], mode)
+        with tick:
+            seen[0] += 1
+            print(f"  · {seen[0]:>3}/{len(jobs)} {'ok ' if r['ok'] else 'FAIL'} "
+                  f"{cid[:34]:36s} {r['secs']:5.1f}s", file=sys.stderr, flush=True)
+        return cid, r
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        done = list(pool.map(lambda j: (j[0]["id"], run(j[0], mode)), jobs))
+        done = list(pool.map(_one, jobs))
     by_id: dict = {}
     for cid, r in done:
         by_id.setdefault(cid, []).append(r)

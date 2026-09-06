@@ -39,8 +39,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-from app.ai import charts, scope, warehouse
-from app.ai.deep import capability, llm, schemas, shapes, tools
+from app.ai import charts, resolve as resolver, scope, warehouse
+from app.ai.deep import capability, llm, sanity, schemas, shapes, tools
 
 MAX_SUBQUESTIONS = 6
 MAX_ROUNDS = 2          # investigate → critique → (one more investigate) → stop
@@ -224,12 +224,41 @@ def _table_payload(res: dict, title: str) -> dict:
             "rows": rows[:50]}
 
 
-def _compact(res: dict, limit: int = 25) -> str:
+# An alias carries no unit. `SELECT SUM(line_value) AS total_procurement` produced a column
+# called "total_procurement", which matches no money pattern, so ₹174 Cr of Bangalore
+# procurement was handed to the writer as the bare integer 1740233400.36 and printed that
+# way. The SQL already says what it is: the alias inherits the unit of the column it
+# aggregates, whatever the model chose to call it.
+_AGG_ALIAS = re.compile(
+    r"\b(?:SUM|AVG|MIN|MAX|ROUND|TOTAL)\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)[^()]*\)"
+    r"\s*(?:AS\s+)?([A-Za-z_]\w*)", re.I)
+_SQL_WORDS = {"as", "from", "where", "group", "order", "having", "limit", "join", "on",
+              "and", "or", "then", "else", "end", "when", "desc", "asc", "by"}
+
+
+def _alias_units(sql: str) -> dict:
+    """{alias: kind} for aggregates whose SOURCE column names a unit."""
+    out = {}
+    for src, alias in _AGG_ALIAS.findall(sql or ""):
+        if alias.lower() in _SQL_WORDS:
+            continue
+        # a numeric sample is supplied because _kind falls back to "text" when it has no
+        # rows to look at, and an alias inheriting "text" would suppress formatting entirely
+        col = src.split(".")[-1]
+        kind = _kind(col, [{col: 0.0}])
+        if kind in ("inr", "pct", "days"):
+            out[alias.lower()] = kind
+    return out
+
+
+def _compact(res: dict, limit: int = 25, sql: str = "") -> str:
     """A result as the model should see it: already formatted, so it quotes rather than
     converts. Prose that converts raw rupees itself is where the 10x errors came from."""
     cols = res.get("columns") or []
     rows = res.get("rows") or []
-    kinds = {c: _kind(c, rows) for c in cols}
+    inherited = _alias_units(sql)
+    kinds = {c: (inherited.get(c.lower()) if _kind(c, rows) == "num" else None) or _kind(c, rows)
+             for c in cols}
     out = [" | ".join(cols)]
     for r in rows[:limit]:
         out.append(" | ".join(_fmt(r.get(c), kinds[c]) for c in cols))
@@ -250,6 +279,28 @@ def _hospitalise(text: str) -> str:
         word = "hospital" + (m.group(2) or "")
         return word.capitalize() if m.group(1)[0].isupper() else word
     return _PLANT_RE.sub(sub, text or "")
+
+
+# A rupee sign is an assertion that the number is money, so the house format can be applied
+# without knowing anything about where it came from. This is the backstop for the alias rule
+# in _alias_units: that one needs to recognise the SQL shape, and `SUM(line_value) OVER ()
+# AS total` defeated it — leaving "Bangalore hospitals spend ₹1,743,233,400.48" in a brief
+# whose every other figure was in crores. Nobody reads nine digits.
+_RUPEES = re.compile(r"₹\s?(\d[\d,]*(?:\.\d+)?)(?!\s*(?:Cr|L\b|lakh|crore|k\b))", re.I)
+
+
+def _rupees_in_scale(text: str) -> str:
+    def sub(m):
+        try:
+            n = float(m.group(1).replace(",", ""))
+        except ValueError:
+            return m.group(0)
+        if n >= 1e7:
+            return f"₹{n / 1e7:.2f} Cr"
+        if n >= 1e5:
+            return f"₹{n / 1e5:.2f} L"
+        return m.group(0)
+    return _RUPEES.sub(sub, text or "")
 
 
 # Which measure family a table belongs to. Kept as prefixes so a new mart lands in the
@@ -346,6 +397,31 @@ def _format_derived(derived: list[dict]) -> list[dict]:
     return out
 
 
+# Which column names satisfy a requested grain. "Which products move the most units"
+# answered "M070-STATIONARY" — a CATEGORY — and "which manufacturer sells most" answered
+# from purchasing. The question says what it wants broken down by; a finding that cannot
+# provide it is context, never the headline.
+_GRAIN_COLUMNS = {
+    # `name` is deliberately NOT here. The units-per-SKU KPI has a column literally called
+    # `name` holding CATEGORY labels, so accepting it let "which products move the most
+    # units" answer "M070-STATIONARY" and still pass the grain check.
+    "material":     re.compile(r"^(material|material_id|material_desc|generic_name|item|sku)$", re.I),
+    "hospital":     re.compile(r"^(hospital|plant|plant_name|site)$", re.I),
+    "vendor":       re.compile(r"^(vendor|vendor_name|vendor_code)$", re.I),
+    "manufacturer": re.compile(r"^(manufacturer|manufacturer_desc)$", re.I),
+    "category":     re.compile(r"^(category|material_group|major_group_desc|minor_group_desc|group|name)$", re.I),
+    "month":        re.compile(r"^(month|month_name|period|posting_date|year)$", re.I),
+    "department":   re.compile(r"^(department|department_name|cost_ctr|costcenter)$", re.I),
+}
+
+
+def _serves_grain(res: dict, grain: str) -> bool:
+    pat = _GRAIN_COLUMNS.get(grain)
+    if not pat:
+        return True
+    return any(pat.match(c) for c in (res.get("columns") or []))
+
+
 def _num_tokens(text: str) -> set[str]:
     return {t.replace(",", "") for t in re.findall(r"\d[\d,]*\.?\d*", text or "")}
 
@@ -407,12 +483,16 @@ def answer(query: str, history: list | None = None):
     # WHERE a literal lives; this says WHAT IT IS — a drug, a city, a manufacturer, a
     # category — and what the question is measuring. Naming the things first is the step a
     # human never skips and this engine had no equivalent of.
+    requested_grains: list[str] = []
+    requested_measures: list[str] = []
     try:
         from app.ai import resolve as _resolve
         _rb = _resolve.brief(query)
         if _rb:
             lessons.append(_rb)
             _r = _resolve.resolve(query)
+            requested_grains = _r.get("grains") or []
+            requested_measures = _r.get("measures") or []
             # bind every confidently-typed entity so a query claiming to be about it must
             # actually reference it
             entity_tokens.extend(e["text"] for e in _r["entities"] if e.get("exact"))
@@ -748,14 +828,32 @@ def answer(query: str, history: list | None = None):
                 return stop
 
         if last_result is not None and last_result.get("_full") is not None:
-            return {"sub": sub, "sql": last_sql, "res": last_result["_full"], "purpose": sub.get("question")}
+            # Check the arithmetic before the result is allowed to be evidence. A number
+            # that cannot be true is worse than no number, because it reads as an answer.
+            return {"sub": sub, "sql": last_sql, "res": last_result["_full"],
+                    "purpose": sub.get("question"),
+                    "warnings": sanity.check(last_sql, last_result["_full"])}
         return {"sub": sub, "skipped": "ran out of steps without a usable result"}
 
 
     def _evidence(fs):
-        return "\n\n".join(
-            f"[{f['sub'].get('id','?')}] {_hospitalise(f['purpose'])}\n{_compact(f['res'])}"
-            for f in fs)
+        out = []
+        for f in fs:
+            block = (f"[{f['sub'].get('id','?')}] {_hospitalise(f['purpose'])}\n"
+                     f"{_compact(f['res'], sql=f.get('sql') or '')}")
+            for w in f.get("warnings") or ():
+                block += f"\n!! {w}"
+            out.append(block)
+        return "\n\n".join(out)
+
+    def _source_words(fs) -> str:
+        """The verbs the evidence licenses, from the tables it was actually read out of."""
+        tabs = {t for f in fs for t in re.findall(r"\bFROM\s+([A-Za-z_]\w*)|\bJOIN\s+([A-Za-z_]\w*)",
+                                                  f.get("sql") or "") for t in (t if isinstance(t, tuple) else (t,)) if t}
+        return resolver.source_vocabulary(sorted(tabs))
+
+    def _impossible(f) -> bool:
+        return any(w.startswith("IMPOSSIBLE") for w in f.get("warnings") or ())
 
     # TWO WAVES. Everything that stands alone runs first and in parallel; what depends on
     # knowing a specific entity runs second, with the first wave's results handed to it as
@@ -784,7 +882,8 @@ def answer(query: str, history: list | None = None):
             yield {"type": "step", "text": f"Ruled out: {out['sub'].get('question','')[:60]}"}
 
     if wave2:
-        facts = "\n\n".join(f"{f['purpose']}:\n{_compact(f['res'], 10)}" for f in findings)
+        facts = "\n\n".join(
+            f"{f['purpose']}:\n{_compact(f['res'], 10, sql=f.get('sql') or '')}" for f in findings)
         yield {"type": "step", "text": f"Following the {len(wave2)} dependent question(s)"}
         for out in run_wave(wave2, facts):
             if out.get("res") is not None:
@@ -918,8 +1017,18 @@ def answer(query: str, history: list | None = None):
     # MSD's ₹47.57 Cr of sales. When a specific entity is named, the KPI is context; the
     # entity-scoped query is the answer.
     entity_specific = bool(entity_tokens)
-    canonical_findings = [] if entity_specific else [f for f in findings if f.get("canonical")]
-    derived = shapes.derive_all(shape_name, canonical_findings or findings)
+    # A canonical KPI also loses the headline when it cannot answer at the grain asked for:
+    # the units-per-SKU KPI returns CATEGORIES, so "which products move the most units"
+    # came back "M070-STATIONARY".
+    _want = (requested_grains or [None])[0]
+    canonical_findings = [] if entity_specific else [
+        f for f in findings if f.get("canonical") and (not _want or _serves_grain(f["res"], _want))]
+    # A result that failed the arithmetic check is still shown as evidence, warning attached,
+    # because the reader deserves to know a route was tried — but it may not become the
+    # figure the brief leads with. ₹649.57 Cr of Bangalore procurement, against ₹478.27 Cr
+    # of procurement that exists, was a JOIN fan-out that no wording could have caught.
+    sound = [f for f in findings if not _impossible(f)]
+    derived = shapes.derive_all(shape_name, canonical_findings or sound or findings)
     if canonical_totals:
         # A KPI's `totals` ARE the headline. Left only in the lesson board they were read
         # past, and the model summed the twelve category rows it could see instead —
@@ -958,7 +1067,12 @@ def answer(query: str, history: list | None = None):
         cl, role="synthesise",
         system=("You are a hospital supply-chain analyst writing a short brief for an executive.\n"
                 f"THIS ANSWER MUST: {shape['answer_must']}.\n"
-                "STRUCTURE: lead with the answer and its number; then WHAT DRIVES IT, ranked; then "
+                + (f"The question asks for this broken down by {requested_grains[0].upper()} — "
+                   f"answer at that level. A category is not a product and a vendor is not a "
+                   f"manufacturer; answering one level up is a different question.\n"
+                   if requested_grains else "")
+                + (_source_words(findings) + "\n" if _source_words(findings) else "")
+                + "STRUCTURE: lead with the answer and its number; then WHAT DRIVES IT, ranked; then "
                 "WHAT YOU RULED OUT; then the limits.\n"
                 "NEVER state a percentage or a share unless that exact percentage appears in "
                 "the DERIVED FACTS. Do not compute one from the rows: a query returns the rows it "
@@ -994,11 +1108,12 @@ def answer(query: str, history: list | None = None):
         pending += tok
         cut = max(pending.rfind(" "), pending.rfind("\n"))
         if cut >= 0:
-            ready, pending = _hospitalise(pending[:cut + 1]), pending[cut + 1:]
+            # chunks are cut at a space, so a rupee figure arrives whole and can be rescaled
+            ready, pending = _rupees_in_scale(_hospitalise(pending[:cut + 1])), pending[cut + 1:]
             prose += ready
             yield {"type": "answer_delta", "text": ready}
     if pending:
-        ready = _hospitalise(pending)
+        ready = _rupees_in_scale(_hospitalise(pending))
         prose += ready
         yield {"type": "answer_delta", "text": ready}
 
@@ -1025,6 +1140,13 @@ def answer(query: str, history: list | None = None):
     ranked = sorted(
         [f for f in findings if _showable(f)],
         key=lambda f: (0 if f["sub"].get("id") in cited else 1, findings.index(f)))
+
+    # Prefer a finding that actually provides the grain the question asked for.
+    want = (requested_grains or [None])[0]
+    if want:
+        matching = [f for f in ranked if _serves_grain(f["res"], want)]
+        if matching:
+            ranked = matching + [f for f in ranked if f not in matching]
 
     if ranked:
         best = ranked[0]

@@ -52,6 +52,20 @@ def all_of(*checks):
     return lambda t: all(c(t) for c in checks)
 
 
+def head_lacks(*bad):
+    """Ban words from the HEADLINE only.
+
+    `lacks` reads the whole brief, which punished the right behaviour: a breakdown that
+    ranks ANTINEOPLASTIC first and then honestly notes an unclassified bucket further down
+    was failing on the word "uncategorized". Leading with the unnamed bucket is the error;
+    disclosing it is not.
+    """
+    def _check(t):
+        head = (t or "")[:260].lower()
+        return not any(b.lower() in head for b in bad)
+    return _check
+
+
 def num_within(target: float, tol_pct: float = 2.0):
     """Some number in the answer is within tolerance of the truth — tolerant of ₹/Cr/L
     formatting and of the model rounding, strict about the magnitude being right."""
@@ -258,7 +272,11 @@ L1 += [
     {"id": "l1-top-mfr-sales", "q": "How much did MSD sell?",
      "check": num_within(47.57, 4), "why": "MSD ₹47.57 Cr — and MSD is a MANUFACTURER"},
     {"id": "l1-vendor-count", "q": "How many vendors do we buy from?",
-     "check": lambda t: num_within(3468, 5)(t) or num_within(3416, 5)(t), "why": "~3,4xx vendors"},
+     # 2,251 distinct vendor_codes actually appear in procurement; dim_vendor lists 3,576
+     # including ones we have never bought from. The question says "buy from", so 2,251 is
+     # the better answer and my earlier ~3,4xx was simply wrong.
+     "check": lambda t: num_within(2251, 3)(t) or num_within(3576, 3)(t),
+     "why": "2,251 vendors actually bought from (3,576 on the master list)"},
     {"id": "l1-total-procurement", "q": "What is our total procurement spend?",
      "check": num_within(649.91, 4), "why": "₹649.91 Cr"},
     {"id": "l1-expired-value", "q": "What is the value of stock that has already expired?",
@@ -269,7 +287,10 @@ L1 += [
     {"id": "l1-top-vendor-name", "q": "Who is our largest supplier?",
      "check": has("vardhman"), "why": "Vardhman Health Specialities"},
     {"id": "l1-top-category-name", "q": "What is our biggest spend category?",
-     "check": any_of("injection", "m065"), "why": "M065-INJECTIONS"},
+     "check": all_of(any_of("injection", "m065", "antineoplastic"),
+                     head_lacks("uncategorized", "uncategorised")),
+     "why": "two real taxonomies — M065-INJECTIONS (material group) or ANTINEOPLASTIC "
+            "(therapeutic, what the dashboard shows). Never 'Uncategorized'."},
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -295,23 +316,44 @@ L2: list[dict] = [
                      lambda t: num_within(145.03, 12)(t) or num_within(1.45, 12)(t)),
      "must_answer": True, "why": "HM01 ₹1.45 Cr (₹145.03 L), AH01 ₹1.44 Cr"},
     {"id": "l2-procurement-by-category", "q": "Break our procurement spend down by category.",
-     "check": all_of(any_of("m065", "injection"), num_within(234.06, 6)), "must_answer": True,
-     "why": "M065-INJECTIONS ₹234.06 Cr"},
+     "check": all_of(any_of("m065", "injection", "antineoplastic"),
+                     lambda t: num_within(234.06, 6)(t) or num_within(84.45, 6)(t),
+                     head_lacks("uncategorized", "uncategorised")),
+     "must_answer": True,
+     "why": "M065-INJECTIONS ₹234.06 Cr (material group) or ANTINEOPLASTIC ₹84.45 Cr "
+            "(therapeutic) — both real; never the unclassified bucket"},
     {"id": "l2-bangalore-procurement", "q": "How much do our Bangalore hospitals spend on procurement?",
      # Bangalore covers FOUR hospitals, so both the citywide total (~₹174 Cr) and the
      # largest single site (₹90.82 Cr) are right answers depending on the reading.
      "check": all_of(any_of("hc05", "bangalore"),
                      lambda t: num_within(90.82, 10)(t) or num_within(174.02, 12)(t)),
      "must_answer": True, "why": "citywide ~₹174 Cr, or HCG KR ₹90.82 Cr — via plant_name"},
+    # "Move" is genuinely ambiguous between SOLD and CONSUMED, and both have a real answer:
+    # EXAMINATION GLOVES 1,347,643 units sold, LEAFLET A5 1,203,000 units consumed. The
+    # test is that it answers at PRODUCT level (not category) and says which measure it
+    # used — not that it picks the reading I happened to have in mind.
     {"id": "l2-top-units-sold", "q": "Which products move the most units?",
-     "check": all_of(any_of("gloves", "examination"), num_within(1347643, 3)), "must_answer": True,
-     "why": "EXAMINATION GLOVES 1,347,643 units — units, not revenue"},
+     "check": all_of(lambda t: num_within(1347643, 3)(t) or num_within(1203000, 3)(t),
+                     any_of("sold", "sales", "consum", "used", "issued"),
+                     head_lacks("m070", "stationary", "uncategorized")),  # category, not a product
+     "must_answer": True,
+     "why": "must answer at PRODUCT level and name the measure it used"},
     {"id": "l2-revenue-trend", "q": "How has monthly revenue moved over the period?",
      "check": all_of(num_within(89.52, 4), any_of("rose", "fell", "flat", "stable", "declin", "increas", "%")),
      "must_answer": True, "why": "Dec 89.52 → May 87.93 Cr, must state a direction"},
+    # "Near-expiry stock" is the dashboard's own metric: FOUR buckets totalling ₹1.98 Cr,
+    # expired included. Demanding ₹39.97 L here was my error — that is the 90-day SUBSET,
+    # which is what l1-expiring-qty asks for. A breakdown should show the buckets.
     {"id": "l2-expiry-by-band", "q": "Break down our near-expiry stock by ageing band.",
-     "check": all_of(any_of("0-30", "31-90", "91-180"), num_within(39.97, 8)), "must_answer": True,
-     "why": "0-30d ₹16.79 L, 31-90d ₹23.18 L"},
+     "check": all_of(any_of("0-30", "31-90", "91-180"),
+                     # each bucket is quoted in whichever unit reads better, so accept both
+                     # spellings of the same number: ₹114.94 L IS ₹1.15 Cr
+                     lambda t: sum(bool(num_within(v, 8)(t))
+                                   for v in (1.98, 43.16, 0.43, 16.79, 0.17,
+                                             23.18, 0.23, 114.94, 1.15)) >= 2),
+     "must_answer": True,
+     "why": "four buckets — Expired ₹43.16 L, 0-30d ₹16.79 L, 31-90d ₹23.18 L, "
+            "91-180d ₹114.94 L, ₹1.98 Cr total"},
     {"id": "l2-thin-margin-hospitals", "q": "Which hospitals run the thinnest sales margins?",
      "check": all_of(any_of("gjhca", "mhhik"), num_within(31.28, 15)), "must_answer": True,
      "why": "GJHCA 31.3%, MHHIK 32.5%"},
@@ -423,8 +465,13 @@ L1 += [
      "check": num_within(4.8, 30), "why": "4.8 days average"},
     {"id": "l1-departments", "q": "How many departments consume stock?",
      "check": num_within(730, 10), "why": "730 department names"},
+    # "Biggest selling" is units or revenue, and both readings have a real second place:
+    # TRASTUREL 440MG at ₹19.31 Cr, PANONIC 40MG TAB at 408,181 units. Either is a correct
+    # answer as long as it names a PRODUCT and says which measure it used.
     {"id": "l1-second-selling-item", "q": "What is our second biggest selling product?",
-     "check": any_of("trasturel", "19.3"), "why": "TRASTUREL 440MG ₹19.31 Cr"},
+     "check": all_of(any_of("trasturel", "19.3", "panonic", "408,181"),
+                     any_of("revenue", "sales", "units", "sold")),
+     "why": "TRASTUREL ₹19.31 Cr by revenue, or PANONIC 408,181 by units — name the measure"},
 ]
 
 L2 += [

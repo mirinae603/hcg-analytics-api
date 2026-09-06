@@ -54,7 +54,13 @@ def client():
     key = os.getenv("AZURE_OPENAI_API_KEY")
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
-    return AzureOpenAI(azure_endpoint=ENDPOINT, api_key=key, api_version=API_VERSION)
+    # An explicit timeout, because the default is effectively "wait". A 90-case eval run
+    # stalled for 105 minutes at 0% CPU on a single request that never returned — and the
+    # same stall in production is a chat that spins forever with nothing to show the user.
+    # httpx applies the read timeout PER CHUNK, so a long stream is unaffected; only silence
+    # is. Retries stay on: a timeout is exactly the transient this class already handles.
+    return AzureOpenAI(azure_endpoint=ENDPOINT, api_key=key, api_version=API_VERSION,
+                       timeout=float(os.getenv("AZURE_OPENAI_TIMEOUT", "120")), max_retries=2)
 
 
 def _retriable(e: Exception) -> bool:

@@ -22,6 +22,7 @@ import time
 
 from app.ai import warehouse
 from app.ai import scope as _scope, semantics, charts, routing, kpi_registry
+from app.ai.deep import engine as _deep_engine, sanity as _sanity
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
@@ -52,7 +53,9 @@ def _client():
     key = os.getenv("AZURE_OPENAI_API_KEY")
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
-    return AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=key, api_version=AZURE_API_VERSION)
+    # see app/ai/deep/llm.py: without an explicit timeout a stalled request hangs the chat
+    return AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=key, api_version=AZURE_API_VERSION,
+                       timeout=float(os.getenv("AZURE_OPENAI_TIMEOUT", "120")), max_retries=2)
 
 
 # A single transient Azure hiccup (429 rate-limit, or a 500/502/503/504) used to
@@ -209,7 +212,14 @@ def _format_result(res: dict, limit: int = 30) -> dict:
     cols = res["columns"]
     # data-aware typing (not name-based): a string column — e.g. a numeric-looking cost-
     # centre or material code — stays text and is never comma/₹-formatted for the model.
-    kinds = {c: col_kind(c, res["rows"]) for c in cols}
+    # An alias with no unit in its name inherits one from the column it aggregates: the
+    # model's own `SUM(line_value) AS total_procurement` otherwise reached the prose as a
+    # bare 1740233400.36 instead of ₹174.02 Cr.
+    inherited = _deep_engine._alias_units(res.get("sql") or "")
+    kinds = {}
+    for c in cols:
+        k = col_kind(c, res["rows"])
+        kinds[c] = inherited.get(c.lower(), k) if k == "num" else k
     rows = [{c: _fmt(r.get(c), kinds[c]) for c in cols} for r in res["rows"][:limit]]
     return {"columns": cols, "rows": rows, "row_count": res["row_count"],
             "truncated": res.get("truncated", False)}
@@ -1021,6 +1031,18 @@ def answer(query: str, history: list | None = None):
                         any_sql_failed = True
                         yield {"type": "step", "text": "Checking that against the other tables"}
                         continue
+                # A number that cannot be true must not travel on as evidence. Handing the
+                # warning back as a tool ERROR (rather than a note beside the rows) is
+                # deliberate: a note gets read past, an error makes the model rewrite the
+                # query. ₹649.57 Cr of Bangalore procurement — against ₹478.27 Cr that
+                # exists — was a JOIN fan-out that read as a perfectly ordinary figure.
+                _bad = _sanity.part_exceeds_whole(sql, res)
+                if _bad:
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                     "content": json.dumps({"error": _bad})})
+                    any_sql_failed = True
+                    yield {"type": "step", "text": "That total was impossible — re-deriving it"}
+                    continue
                 res["purpose"] = purpose
                 results.append(res)
                 free_sql_result_count += 1
