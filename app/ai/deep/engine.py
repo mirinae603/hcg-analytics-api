@@ -707,6 +707,12 @@ def answer(query: str, history: list | None = None):
         out = tools.get_kpi(kpi_key, question=query)
         if out.get("canonical"):
             res = _kpi_rows(out)
+            # THE SAME HOLE, AGAIN. Canonical findings are built here rather than through
+            # investigate(), so every guard wired into investigate's return skipped them —
+            # first the scope checks, now the placeholder withdrawal. "The largest spend
+            # category is Uncategorized" came back one run after that guard was verified
+            # passing, because the row arrived by this path and was never inspected.
+            sanity.sink_placeholders(res)
             if res.get("row_count"):
                 findings.append({"sub": {"id": "kpi", "question": f"canonical {kpi_key}"},
                                  "sql": f"-- get_kpi('{kpi_key}')", "res": res, "canonical": True,
@@ -864,6 +870,7 @@ def answer(query: str, history: list | None = None):
                 seen_calls[key] = {k: v for k, v in out.items() if not k.startswith("_")}
                 if name == "get_kpi" and out.get("canonical"):
                     last_kpi = _kpi_rows(out)
+                    sanity.sink_placeholders(last_kpi)
                     last_sql = f"-- get_kpi('{args.get('key')}')"
                 if name == "run_query":
                     last_sql = args.get("sql", "")
