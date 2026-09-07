@@ -36,9 +36,13 @@ _RULES: list[tuple[str, str, str, str]] = [
      r"\bCOUNT\s*\(",
      "The question asks HOW MANY, so the query must COUNT. Returning a list, or a SUM of a "
      "value column, answers a different question."),
+    # A column that IS an average satisfies this without calling AVG(). kpi_vendor_lead_time
+    # stores `avg_lead_time_days` pre-computed, and demanding the function blocked five
+    # correct queries in a row until the engine reported "there is no lead time data for
+    # Vardhman" — for a vendor whose figure is 4.77 days over 128,357 rows.
     ("average",
      r"\baverage\b|\bmean\b(?!\s*while)|\bavg\b",
-     r"\bAVG\s*\(|\bMEDIAN\s*\(|\bquantile",
+     r"\bAVG\s*\(|\bMEDIAN\s*\(|\bquantile|avg_|_avg\b|average|median|mean_",
      "The question asks for an AVERAGE. A SUM or a raw list is not one — and if you mean to "
      "average a per-entity figure, say that is what you did."),
     ("percent",

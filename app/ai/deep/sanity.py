@@ -165,7 +165,25 @@ def sink_placeholders(res: dict) -> bool:
     unnamed = [r for r in rows if _PLACEHOLDER.match(str(r.get(label_col) or ""))]
     if not unnamed or not named:
         return False
-    res["rows"] = named + unnamed
+
+    # WITHDRAWN, not merely demoted. Sinking the row to the bottom was not enough: the
+    # engine kept leading with "the largest spend category is Uncategorized, ₹173.31 Cr",
+    # then adding "surpassing the next largest, ANTINEOPLASTIC" — so it had seen the
+    # ordering and reported the unnamed bucket anyway, because by raw value it IS the
+    # largest. It is a true row and a useless answer. The size of the gap is preserved as a
+    # note so nothing is hidden; it just stops being available as the headline.
+    num_col = next((k for k, v in rows[0].items() if isinstance(v, (int, float))), None)
+    res["rows"] = named
+    res["row_count"] = len(named)
+    if num_col:
+        total = sum(r.get(num_col) or 0 for r in unnamed)
+        res["excluded_note"] = (
+            f"{len(unnamed)} unnamed bucket(s) — "
+            + ", ".join(f'"{r.get(label_col)}"' for r in unnamed[:3])
+            + f" — holding {num_col}={total:,.0f} were REMOVED from this ranking. They are an "
+              f"absence of classification, not a category, and cannot be the answer to which "
+              f"category is biggest. Mention the unclassified share once as a data-quality "
+              f"point if it is material.")
     return True
 
 

@@ -78,3 +78,14 @@ def test_canonical_kpi_calls_are_not_sql_and_are_ignored():
     # false alarms on 2 of the first 6 questions tried
     assert check("How many units are expiring?", "-- get_kpi('near-expiry')") is None
     assert check("anything", "") is None
+
+
+def test_a_pre_averaged_column_satisfies_an_average_question():
+    # kpi_vendor_lead_time stores `avg_lead_time_days` already computed. Demanding the AVG()
+    # function blocked five correct queries in a row until the engine gave up and reported
+    # "there is no lead time data for Vardhman" — for a vendor whose figure is 4.77 days.
+    q = "What is Vardhman's average lead time?"
+    assert check(q, "SELECT vendor_name, avg_lead_time_days FROM kpi_vendor_lead_time "
+                    "WHERE upper(vendor_name) LIKE '%VARDHMAN%'") is None
+    assert check(q, "SELECT AVG(vendor_avg_lead_time_days) FROM mart_procurement") is None
+    assert check(q, "SELECT SUM(lead_days) FROM t WHERE x") is not None

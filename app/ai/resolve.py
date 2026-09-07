@@ -500,6 +500,56 @@ def resolve(question: str, limit: int = 8) -> dict:
             "grains": grains, "qualifiers": qualifiers}
 
 
+@lru_cache(maxsize=512)
+def generic_materials(generic: str, limit: int = 8) -> tuple[str, ...]:
+    """The branded materials a molecule name covers.
+
+    "How much pembrolizumab did we consume?" resolved PEMBROLIZUMAB correctly as a GENERIC
+    and was answered "there is no direct match for PEMBROLIZUMAB in the catalog" — because
+    no fact table has a generic_name column, and nothing said the bridge to material_desc
+    exists. It does: dim_material carries both, and PEMBROLIZUMAB is KEYTRUDA 100MG INJ
+    VIAL. This is the synonym problem people reach for embeddings to solve, already
+    answered by the warehouse's own dimension.
+    """
+    from app.ai import warehouse
+    try:
+        rows = warehouse.con().execute(
+            "SELECT DISTINCT material_desc FROM dim_material "
+            "WHERE upper(CAST(generic_name AS VARCHAR)) = upper(?) "
+            "   OR upper(CAST(minor_group_desc AS VARCHAR)) = upper(?) "
+            "ORDER BY 1 LIMIT ?", [generic, generic, limit]).fetchall()
+    except Exception:
+        return ()
+    return tuple(str(r[0]) for r in rows if r[0])
+
+
+def _weight_note(fam: dict) -> str:
+    """Warn when a family's members are wildly unequal, with the actual counts."""
+    # Weight by the TRANSACTION table, not the master list. dim_vendor has 11 rows for
+    # Vardhman Health Specialities and 2 for Medisales — a 69/12 split that says nothing.
+    # mart_procurement has 128,357 against 3,593, which is the split that matters.
+    candidates = [fam["table"]] + [a.split(".", 1)[0] for a in fam.get("also_in") or []]
+    scored = []
+    for table in candidates:
+        w = family_weights(table, fam["column"], fam["token"])
+        if len(w) >= 2:
+            scored.append((sum(n for _, n in w), table, w))
+    if not scored:
+        return ""
+    for total, table, weights in sorted(scored, reverse=True):
+        total = total or 1
+        top_name, top_n = weights[0]
+        if top_n / total < 0.6:
+            continue
+        rest = ", ".join(f"{v} ({n:,})" for v, n in weights[1:4])
+        return (f" THEY ARE NOT EQUAL: {top_name} has {top_n:,} of the {total:,} rows "
+                f"({100 * top_n / total:.0f}%); then {rest}. If the measure is already an "
+                f"average per entity, do NOT take a plain mean across them — that gives a "
+                f"one-row vendor the same weight as a hundred-thousand-row one. Weight by "
+                f"row count, or report the dominant member and say so.")
+    return ""
+
+
 def brief(question: str) -> str:
     """The resolution, as a block to put in front of any model that is about to write SQL."""
     r = resolve(question)
@@ -516,6 +566,17 @@ def brief(question: str) -> str:
         where = ", ".join(e.get("locations") or [f"{e['table']}.{e['column']}"])
         lines.append(f"- \"{e['text']}\" is a {e['kind'].upper()}, held in {where}"
                      + ("" if e["exact"] else f" (confidence {e['confidence']})"))
+        if e["kind"] == "generic":
+            # No fact table has a generic_name column. Without the bridge the engine
+            # searched material_desc for "PEMBROLIZUMAB", found nothing, and asked the user
+            # for a brand name it could have looked up itself.
+            brands = generic_materials(e["text"])
+            if brands:
+                lines.append(
+                    f"  A GENERIC/molecule name appears in NO fact table. \"{e['text']}\" "
+                    f"is sold as: {', '.join(brands)}. Query those material_desc values (or "
+                    f"join dim_material on generic_name) — never report the molecule as "
+                    f"absent from the catalogue.")
     for t in typos:
         lines.append(
             f"- LIKELY MISSPELLING: \"{t['typed']}\" matches nothing, but \"{t['meant']}\" "
@@ -547,7 +608,8 @@ def brief(question: str) -> str:
             f"value(s) in {f['table']}.{f['column']} — {ex}. Cover the whole family with "
             f"upper({f['column']}) LIKE '%{f['token'].upper()}%', and say which ones you "
             f"included. Do not silently answer for just the biggest."
-            + (f" Also in {', '.join(f['also_in'])}." if f["also_in"] else ""))
+            + (f" Also in {', '.join(f['also_in'])}." if f["also_in"] else "")
+            + _weight_note(f))
     for c in r["cities"]:
         sites = r["city_hospitals"].get(c) or []
         codes = [s.split(" ")[0] for s in sites]
@@ -990,6 +1052,27 @@ def spelling_suggestions(question: str, resolved: dict) -> list[dict]:
 # Projections are not history. forecast_sales carries material, month AND a sales value, so
 # a naive search says "a monthly sales trend per drug exists" — from forecast rows.
 _PROJECTION = re.compile(r"forecast|project|budget|plan|target", re.I)
+
+
+@lru_cache(maxsize=512)
+def family_weights(table: str, column: str, token: str) -> tuple[tuple[str, int], ...]:
+    """How many rows each member of a family actually has, biggest first.
+
+    "What is Vardhman's average lead time?" matched five vendors and was answered 2.68 days
+    — the unweighted mean of five per-vendor averages, one of which has 128,357 rows and
+    another has one. The real figure for the business is 4.77. Averaging pre-averaged
+    per-entity values without weights is a category error, and the brief cannot warn about
+    it without knowing the members are unequal.
+    """
+    from app.ai import warehouse
+    try:
+        rows = warehouse.con().execute(
+            f'SELECT "{column}" AS v, COUNT(*) AS n FROM "{table}" '
+            f"WHERE upper(CAST(\"{column}\" AS VARCHAR)) LIKE '%' || upper(?) || '%' "
+            f'GROUP BY 1 ORDER BY n DESC LIMIT 12', [token]).fetchall()
+    except Exception:
+        return ()
+    return tuple((str(r[0]), int(r[1])) for r in rows if r[0] is not None)
 
 
 @lru_cache(maxsize=256)

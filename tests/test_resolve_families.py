@@ -202,3 +202,29 @@ def test_the_subject_grain_is_the_one_named_first():
 def test_an_importance_qualifier_also_gets_a_computed_floor():
     b = brief("Which critical items do we buy from only one vendor?")
     assert "QUALIFIER" in b and "Class-A cut" in b
+
+
+def test_a_family_of_unequal_members_says_so_with_counts():
+    # "What is Vardhman's average lead time?" matched five vendors and was answered 2.68
+    # days — the unweighted mean of five per-vendor averages, one with 128,357 rows and
+    # another with one. The real figure is 4.77.
+    from app.ai.resolve import _weight_note
+    fam = next(f for f in resolve("What is Vardhman's average lead time?")["families"]
+               if f["token"] == "vardhman")
+    note = _weight_note(fam)
+    assert "128,357" in note and "97%" in note
+    assert "do NOT take a plain mean" in note
+
+
+def test_weights_come_from_the_transaction_table_not_the_master_list():
+    # dim_vendor has 11 rows vs 2 — a 69/12 split that says nothing. mart_procurement has
+    # 128,357 vs 3,593, which is the split that decides the answer.
+    from app.ai.resolve import family_weights
+    assert family_weights("mart_procurement", "vendor_name", "vardhman")[0][1] > 100_000
+    assert family_weights("dim_vendor", "vendor_name", "vardhman")[0][1] < 100
+
+
+def test_an_evenly_split_family_gets_no_weight_warning():
+    from app.ai.resolve import _weight_note
+    assert _weight_note({"token": "zzzznomatch", "table": "dim_vendor",
+                         "column": "vendor_name", "also_in": []}) == ""

@@ -905,6 +905,8 @@ def answer(query: str, history: list | None = None):
                 block += f"\n!! {w}"
             if (f.get("res") or {}).get("coverage_note"):
                 block += f"\n!! {f['res']['coverage_note']}"
+            if (f.get("res") or {}).get("excluded_note"):
+                block += f"\n!! {f['res']['excluded_note']}"
             out.append(block)
         return "\n\n".join(out)
 

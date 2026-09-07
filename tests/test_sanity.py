@@ -86,12 +86,25 @@ def test_sales_per_hospital_without_a_city_is_allowed():
         "SELECT hospital, SUM(revenue) FROM sales_by_hospital GROUP BY 1") is None
 
 
-def test_an_unnamed_bucket_is_moved_out_of_first_place():
+def test_an_unnamed_bucket_is_withdrawn_from_a_ranking():
+    # demoting was not enough: the engine kept leading with "the largest spend category is
+    # Uncategorized, ₹173.31 Cr", then adding "surpassing the next largest, ANTINEOPLASTIC"
+    # — so it had seen the ordering and reported the unnamed bucket anyway, because by raw
+    # value it IS the largest. True row, useless answer.
     res = {"rows": [{"category": "Uncategorized", "v": 173.31},
-                    {"category": "ANTINEOPLASTIC", "v": 84.45}]}
+                    {"category": "ANTINEOPLASTIC", "v": 84.45}], "row_count": 2}
     assert sanity.sink_placeholders(res) is True
-    assert res["rows"][0]["category"] == "ANTINEOPLASTIC"
-    assert len(res["rows"]) == 2          # demoted, never dropped
+    assert [r["category"] for r in res["rows"]] == ["ANTINEOPLASTIC"]
+    assert res["row_count"] == 1
+
+
+def test_the_withdrawn_size_is_preserved_as_a_note():
+    # nothing is hidden — the gap stops being available as the HEADLINE, that is all
+    res = {"rows": [{"category": "Uncategorized", "v": 1_733_085_192.5},
+                    {"category": "ANTINEOPLASTIC", "v": 844_500_000.0}], "row_count": 2}
+    sanity.sink_placeholders(res)
+    assert "Uncategorized" in res["excluded_note"]
+    assert "1,733,085,192" in res["excluded_note"]
 
 
 def test_sinking_leaves_a_clean_result_alone():
