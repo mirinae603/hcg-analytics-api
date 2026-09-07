@@ -210,7 +210,8 @@ def _kpi_rows(out: dict) -> dict:
         v = data.get(key)
         if isinstance(v, list) and v and isinstance(v[0], dict):
             cols = list(v[0].keys())
-            return {"columns": cols, "rows": v[:200], "row_count": len(v)}
+            return {"columns": cols, "rows": v[:200], "row_count": len(v),
+                    "totals": data.get("totals") if isinstance(data.get("totals"), dict) else None}
     # Generic fallback: the largest list of records in the payload. The named list above
     # keeps the RIGHT view winning where two exist (near-expiry: buckets, not categories),
     # but a KPI naming its breakdown something unforeseen used to fall through to `totals`
@@ -275,7 +276,27 @@ def _compact(res: dict, limit: int = 25, sql: str = "") -> str:
     inherited = _alias_units(sql)
     kinds = {c: (inherited.get(c.lower()) if _kind(c, rows) == "num" else None) or _kind(c, rows)
              for c in cols}
-    out = [" | ".join(cols)]
+    out = []
+    # Show the KPI's OWN totals beside its breakdown. Given only "Vardhman ₹297.77 Cr,
+    # 45.82%", the model backed the total out by division — 297.77 / 0.4582 — and slipped a
+    # decimal, printing "₹6,499.13 Cr" for ₹649.91 Cr. Every number it has to compute
+    # itself is a chance to do that; handing over the total removes the chance.
+    totals = (res or {}).get("totals")
+    if isinstance(totals, dict) and totals:
+        shown = {k: v for k, v in totals.items() if not str(k).startswith("_")}
+        # A totals key called "total" or "sum" carries no unit of its own, so it printed as
+        # 6,499,128,424 — which is precisely the raw figure the model then mis-scaled. It
+        # inherits the unit of the breakdown's own measure column instead.
+        money_col = next((c for c in cols if kinds.get(c) == "inr"), None)
+        def _tkind(k, v):
+            kk = _kind(k, [{k: v}])
+            if kk == "num" and money_col and str(k).lower() in (
+                    "total", "sum", "grand_total", "overall", "value"):
+                return "inr"
+            return kk
+        out.append("TOTALS (authoritative — do not re-derive these by division): "
+                   + ", ".join(f"{k}={_fmt(v, _tkind(k, v))}" for k, v in shown.items()))
+    out.append(" | ".join(cols))
     for r in rows[:limit]:
         out.append(" | ".join(_fmt(r.get(c), kinds[c]) for c in cols))
     if len(rows) > limit:

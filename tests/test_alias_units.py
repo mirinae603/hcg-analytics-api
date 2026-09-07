@@ -71,3 +71,22 @@ def test_figures_already_in_scale_are_untouched():
     from app.ai.deep.engine import _rupees_in_scale
     for t in ("₹3.03 Cr", "₹39.97 L", "₹1.15 crore", "₹27,012"):
         assert _rupees_in_scale(f"value {t} here") == f"value {t} here", t
+
+
+def test_kpi_totals_are_shown_so_the_model_never_derives_them():
+    # given only "Vardhman ₹297.77 Cr, 45.82%", the model backed the total out by division
+    # — 297.77 / 0.4582 — and slipped a decimal, printing ₹6,499.13 Cr for ₹649.91 Cr
+    from app.ai.deep.engine import _compact
+    res = {"columns": ["name", "value", "share"],
+           "rows": [{"name": "Vardhman", "value": 2_977_700_000.0, "share": 45.82}],
+           "totals": {"vendors": 3416, "total": 6_499_128_424.0, "top1": 45.82}}
+    text = _compact(res)
+    assert "TOTALS" in text and "do not re-derive" in text
+    assert "₹649.91 Cr" in text                  # not 6,499,128,424
+    assert "vendors=3,416" in text               # a count stays a count
+
+
+def test_a_result_without_totals_is_unchanged():
+    from app.ai.deep.engine import _compact
+    text = _compact({"columns": ["a"], "rows": [{"a": 1}]})
+    assert "TOTALS" not in text

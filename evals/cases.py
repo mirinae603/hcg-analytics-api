@@ -455,6 +455,9 @@ L1 += [
      # accepting only the catalogue figure was the same mistake I made on vendors.
      "check": lambda t: any(num_within(v, 3)(t) for v in (1156, 1321, 1079)),
      "why": "1,156 procured from / 1,321 in the catalogue — either, named"},
+    {"id": "l1-expiring-qty", "q": "How many units are expiring in the next 90 days?",
+     "check": all_of(num_within(45223, 2), lacks("101,005", "101005")),
+     "why": "45,223 units, excluding already-expired"},
     {"id": "l1-po-lines-vardhman", "q": "How many purchase order lines do we have with Vardhman?",
      "check": num_within(111582, 5), "why": "111,582 PO lines"},
     {"id": "l1-data-window", "q": "What period does our data cover?",
