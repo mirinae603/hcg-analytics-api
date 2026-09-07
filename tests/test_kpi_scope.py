@@ -71,3 +71,27 @@ def test_the_per_site_payload_renders_as_money():
     text = _compact(_kpi_rows(out))
     assert "₹" in text and "Cr" in text
     assert "HC05" in text and "1,739,047,400" not in text
+
+
+def test_a_kpi_that_ignores_plant_is_caught_rather_than_repeated_per_site():
+    # revenue-margin's source uses a site code system disjoint from dim_plant, so it ignores
+    # `plant` entirely: asking for four hospitals returned the COMPANY total four times,
+    # identically, labelled as four hospitals. That fabricates site-level detail — strictly
+    # worse than the unscoped answer it replaced.
+    from app.ai.deep.tools import get_kpi
+    out = get_kpi("revenue-margin",
+                  question="What is the top-selling drug in our Bangalore hospitals?")
+    assert out.get("error") and "IGNORES the plant argument" in out["error"]
+    assert not out.get("per_site")
+
+
+def test_a_kpi_that_honours_plant_still_returns_every_site():
+    from app.ai.deep.tools import get_kpi
+    out = get_kpi("purchase-value",
+                  question="How much do our Bangalore hospitals spend on procurement?")
+    assert not out.get("error")
+    sites = out.get("per_site") or {}
+    assert set(sites) == {"HC01", "HC05", "HC06", "HC40"}
+    # and the figures must actually differ, or the check above would have fired
+    totals = {str(((p or {}).get("data") or {}).get("totals")) for p in sites.values()}
+    assert len(totals) > 1

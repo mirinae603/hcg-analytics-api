@@ -308,6 +308,22 @@ def get_kpi(key: str, plant: str = "", category: str = "", question: str = "") -
                 per_site[code] = kpi_registry.call_kpi(key, code, category or None)
             except Exception as e:
                 failed.append(f"{code}: {str(e)[:60]}")
+        # PROVE THE FILTER WORKED. Sales metrics ignore `plant` entirely — their tables use
+        # a site code system disjoint from dim_plant — so asking for four hospitals returned
+        # the company total four times, identically, labelled as four hospitals. That is
+        # worse than the unscoped answer it replaced: it manufactures site-level detail that
+        # does not exist. If every site comes back the same, the argument did nothing.
+        _sigs = {json.dumps(((p or {}).get("data") or {}).get("totals"), sort_keys=True,
+                            default=str) for p in per_site.values()}
+        if len(per_site) > 1 and len(_sigs) == 1:
+            return {"error": (
+                f"KPI '{key}' IGNORES the plant argument — every one of {', '.join(codes)} "
+                f"returned an identical figure, which means it is the NETWORK total repeated, "
+                f"not a per-site breakdown. This metric cannot be scoped to a city or a "
+                f"hospital at all (its source uses a site code system disjoint from "
+                f"dim_plant). Do NOT present these numbers as {', '.join(codes)}. Either "
+                f"answer for the whole network and say the city cut is unavailable, or use a "
+                f"table that genuinely carries the site.")}
         if per_site:
             return {"kpi": key, "canonical": True, "scoped_to": codes,
                     "per_site": per_site, "errors": failed or None,
