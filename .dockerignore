@@ -9,3 +9,19 @@ venv/
 *.log
 .DS_Store
 *.md
+
+# The application database. It holds users, chat sessions and chat messages, and it is
+# created and seeded at startup (app/core/seed.py re-seeds admin@hcg.com idempotently),
+# so the image must never carry one.
+#
+# Without these lines `COPY . .` baked the LOCAL app.db into every deployed image: five
+# throwaway test accounts (finalcheck@example.com, regress.tester@example.com, …) and 24
+# debugging chat sessions were shipped to production, and every deploy overwrote whatever
+# real data production had accumulated with a developer's laptop state.
+#
+# .gitignore already excludes these; .dockerignore is a separate list and did not.
+app/data/*.db
+app/data/*.db-journal
+app/data/*.sqlite
+app/data/*.sqlite3
+app/data/users.json

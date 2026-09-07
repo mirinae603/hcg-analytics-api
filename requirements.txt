@@ -15,6 +15,13 @@ duckdb>=1.0.0
 
 # --- Auth / chat persistence (SQLite via SQLAlchemy) ---
 sqlalchemy>=2.0
+# Postgres driver. The code has always claimed DATABASE_URL was swappable ("e.g. to point
+# at Postgres later" — app/core/config.py), but with no driver installed that swap failed
+# with ModuleNotFoundError. It is here so moving off SQLite is genuinely one env var, which
+# matters because a Container App filesystem is EPHEMERAL: chat written in production is
+# lost on every restart, deploy or scale event, and a second replica would get its own
+# separate file. ~4 MB in the image, and it makes the documented escape hatch real.
+psycopg[binary]>=3.1
 passlib[bcrypt]
 # Pinned: passlib 1.7.4's bcrypt backend hard-crashes on bcrypt>=4.1 (removed the
 # `__about__` shim passlib probes, and changed long-password handling). 4.0.1 is the
