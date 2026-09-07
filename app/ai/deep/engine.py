@@ -183,6 +183,22 @@ def _order_rows(res: dict) -> dict:
 def _kpi_rows(out: dict) -> dict:
     """A canonical KPI payload as {columns, rows}, so a KPI-backed finding renders exactly
     like a query-backed one — same table, same chart, same formatting."""
+    # A city-scoped call returns one payload PER SITE. Rendered as one row per site it
+    # formats like any other finding — the first version fell through unrecognised and put
+    # "1,739,047,400.36" in the answer where ₹173.90 Cr belonged.
+    if out.get("per_site"):
+        rows = []
+        for code, payload in (out["per_site"] or {}).items():
+            totals = ((payload or {}).get("data") or {}).get("totals")
+            if isinstance(totals, dict):
+                rows.append({"hospital": code, **{k: v for k, v in totals.items()
+                                                  if not k.startswith("_")}})
+            else:
+                rows.append({"hospital": code, "value": str(payload)[:80]})
+        if rows:
+            cols = list({k: None for r in rows for k in r})
+            return {"columns": cols, "rows": rows, "row_count": len(rows)}
+
     data = ((out.get("payload") or {}).get("data") or {})
     # A KPI payload holds several views of itself and the RIGHT one is the breakdown, not
     # the summary. `near-expiry` keys are totals/buckets/timeline/categories/ladder, and
@@ -667,7 +683,7 @@ def answer(query: str, history: list | None = None):
     kpi_key = capability.kpi_for(query) or (frame.get("kpi_key") or "").strip()
     if kpi_key and kpi_key in tools.kpi_keys():
         yield {"type": "step", "text": f"Taking the canonical figure for {kpi_key}"}
-        out = tools.get_kpi(kpi_key)
+        out = tools.get_kpi(kpi_key, question=query)
         if out.get("canonical"):
             res = _kpi_rows(out)
             if res.get("row_count"):
@@ -1059,6 +1075,42 @@ def answer(query: str, history: list | None = None):
     # a product's answer. Preferring grain-serving findings here closes that door; the plain
     # `sound` list is still the last resort, because refusing to answer is worse.
     at_grain = [f for f in sound if _serves_grain(f["res"], _want)] if _want else sound
+    # LAST RESORT AT THE RIGHT LEVEL. When nothing served the grain the question asked for,
+    # falling through to `sound` let a CATEGORY answer a PRODUCT question — "the product
+    # moving the most units is M070-STATIONARY". One more query at the correct level is
+    # cheaper than a confidently wrong headline, and if it also fails the answer must SAY
+    # it is reporting one level up rather than quietly doing so.
+    if _want and not at_grain and not canonical_findings:
+        yield {"type": "step", "text": f"Nothing answered at {_want} level — asking directly"}
+        # Name the table. Left to choose, the retry called the SAME canonical KPI whose
+        # `name` column holds CATEGORY labels — so "which products move the most units"
+        # came back "M070-STATIONARY" for a third time. resolve knows which tables actually
+        # carry this measure at this grain; hand one over rather than hope.
+        _serving = ""
+        try:
+            _m = (requested_measures or [None])[0]
+            _cands = resolver.grain_measure_tables(_m, _want) if _m else ()
+            _serving = next((c.split(".", 1)[0] for c in _cands
+                             if not c.split(".", 1)[0].startswith("kpi_")), "")
+        except Exception:
+            _serving = ""
+        retry = investigate({
+            "id": f"at_{_want}", "question": query, "table": _serving,
+            "why": (f"answer at {_want.upper()} level specifically, with SQL — do NOT call "
+                    f"get_kpi, whose rows for this metric are CATEGORIES, not {_want}s. "
+                    f"A finding one level up is a different question: a category is not a "
+                    f"product, a vendor is not a manufacturer."
+                    + (f" Query {_serving} and group by the column naming the {_want}."
+                       if _serving else ""))})
+        if retry.get("res") is not None and _serves_grain(retry["res"], _want):
+            findings.append(retry)
+            sound.append(retry)
+            at_grain = [retry]
+            queries.append({"purpose": retry["purpose"], "sql": retry["sql"],
+                            "rows": retry["res"]["row_count"]})
+            yield {"type": "sql", "purpose": retry["purpose"], "sql": retry["sql"],
+                   "rows": retry["res"]["row_count"]}
+            evidence = _evidence(findings)
     derived = shapes.derive_all(shape_name, canonical_findings or at_grain or sound or findings)
     if canonical_totals:
         # A KPI's `totals` ARE the headline. Left only in the lesson board they were read

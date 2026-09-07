@@ -222,7 +222,67 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
             "truncated": r["row_count"] > 12, "_full": r}
 
 
-def get_kpi(key: str, plant: str = "", category: str = "") -> dict:
+def _city_plant_codes(question: str) -> list[str]:
+    """The plant codes a city in the question resolves to, when there is more than one."""
+    try:
+        from app.ai import resolve as _resolve
+        r = _resolve.resolve(question or "")
+    except Exception:
+        return []
+    out: list[str] = []
+    for c in r["cities"]:
+        sites = r["city_hospitals"].get(c) or []
+        if len(sites) > 1:
+            out += [s.split(" ")[0] for s in sites]
+    return list(dict.fromkeys(out))
+
+
+def _kpi_scope_mismatch(key: str, plant: str, question: str) -> str | None:
+    """A company-wide KPI must not be handed back as an entity-scoped answer.
+
+    Every other guard in this system inspects SQL. The canonical path produces none — it is
+    a function call — so `city_on_unreachable_table`, `part_exceeds_whole` and the
+    constraint checker all sat it out. Asked what Bangalore hospitals spend on procurement,
+    the engine called get_kpi with no plant and reported ₹649.91 Cr: the total for all 51
+    sites, labelled as four. Correct by construction, and the wrong question.
+    """
+    try:
+        from app.ai import resolve as _resolve
+        r = _resolve.resolve(question or "")
+    except Exception:
+        return None
+
+    # A city covering four hospitals is not answered by ONE of them either. Told only that
+    # an unscoped call was wrong, the engine called get_kpi with a single plant and reported
+    # ₹16.41 Cr — HC40 alone — against a true citywide ₹173.73 Cr. Under-scoping is as wrong
+    # as not scoping, and it looks more convincing.
+    multi = [c for c in r["cities"] if len(r["city_hospitals"].get(c) or []) > 1]
+    if plant and multi:
+        codes = [s.split(" ")[0] for c in multi for s in (r["city_hospitals"].get(c) or [])]
+        if plant in codes and len(codes) > 1:
+            return (f"UNDER-SCOPED KPI — plant='{plant}' is ONE of the {len(codes)} sites "
+                    f"this question covers ({', '.join(codes)}). Call get_kpi once per code "
+                    f"and SUM them, or write one SQL statement filtered to all of them. "
+                    f"Answering for a single hospital understates the city.")
+        return None
+    if plant:
+        return None
+    sites = [f"{c}: {', '.join((r['city_hospitals'].get(c) or [])[:6])}" for c in r["cities"]]
+    named = [e["text"] for e in r["entities"] if e["kind"] == "hospital"]
+    if not (sites or named):
+        return None
+    which = "; ".join(sites) or ", ".join(named)
+    return (f"UNSCOPED KPI — this question is about a specific site ({which}), and "
+            f"get_kpi('{key}') without a `plant` argument returns the figure for the WHOLE "
+            f"network. Reporting it as that site's number is wrong by a factor of the "
+            f"estate. It covers MORE THAN ONE site: call get_kpi once PER CODE listed "
+            f"above and SUM the results, or write one SQL statement filtered to all of "
+            f"those plant codes at once. Answering for a single site is just as wrong as "
+            f"answering for the network — the first attempt at this returned ₹16.41 Cr, "
+            f"one hospital out of four, against a true total of ₹173.73 Cr.")
+
+
+def get_kpi(key: str, plant: str = "", category: str = "", question: str = "") -> dict:
     """The dashboard's OWN calculation for a named metric — correct by construction.
 
     Deep mode was re-deriving everything with hand-written SQL, including metrics the
@@ -236,6 +296,28 @@ def get_kpi(key: str, plant: str = "", category: str = "") -> dict:
     if key not in kpi_registry.KPI_REGISTRY:
         return {"error": f"unknown kpi '{key}'",
                 "available": sorted(kpi_registry.KPI_REGISTRY)[:40]}
+    # A guard that only refuses leaves the model with nowhere to go: blocking both the
+    # unscoped and the single-plant call produced "I couldn't establish anything" and zero
+    # queries. Where the right scope is KNOWN — a city resolves to an explicit list of plant
+    # codes — fetch every one of them instead of arguing about it.
+    codes = _city_plant_codes(question)
+    if codes and (not plant or plant in codes) and len(codes) > 1:
+        per_site, failed = {}, []
+        for code in codes:
+            try:
+                per_site[code] = kpi_registry.call_kpi(key, code, category or None)
+            except Exception as e:
+                failed.append(f"{code}: {str(e)[:60]}")
+        if per_site:
+            return {"kpi": key, "canonical": True, "scoped_to": codes,
+                    "per_site": per_site, "errors": failed or None,
+                    "note": (f"This question covers {len(codes)} sites ({', '.join(codes)}), "
+                             f"so the metric is returned PER SITE. Sum them for the total "
+                             f"and say which sites are included. Reporting one site, or the "
+                             f"unscoped network figure, is a different answer.")}
+    mismatch = _kpi_scope_mismatch(key, plant, question)
+    if mismatch:
+        return {"error": mismatch}
     try:
         payload = kpi_registry.call_kpi(key, plant or None, category or None)
     except Exception as e:
@@ -294,7 +376,8 @@ DISPATCH = {
     "find_columns": lambda a, ctx: find_columns(a.get("name_like", "")),
     "find_value": lambda a, ctx: find_value(a.get("value", "")),
     "profile_column": lambda a, ctx: profile_column(a.get("table", ""), a.get("column", "")),
-    "get_kpi": lambda a, ctx: get_kpi(a.get("key", ""), a.get("plant", ""), a.get("category", "")),
+    "get_kpi": lambda a, ctx: get_kpi(a.get("key", ""), a.get("plant", ""),
+                                      a.get("category", ""), ctx.get("question", "")),
     "run_query": lambda a, ctx: run_query(a.get("sql", ""), ctx.get("entity_tokens"), ctx.get("question", "")),
 }
 

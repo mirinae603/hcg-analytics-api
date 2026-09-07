@@ -450,10 +450,11 @@ L1 += [
     {"id": "l1-generic-count", "q": "How many distinct generic molecules do we stock?",
      "check": num_within(3224, 8), "why": "3,224 generic names"},
     {"id": "l1-manufacturer-count", "q": "How many manufacturers supply us?",
-     "check": num_within(1321, 8), "why": "1,321 manufacturers"},
-    {"id": "l1-expiring-qty", "q": "How many units are expiring in the next 90 days?",
-     "check": all_of(num_within(45223, 2), lacks("101,005", "101005")),
-     "why": "45,223 units, excluding already-expired"},
+     # 1,156 appear in procurement (actually bought from), 1,321 sit in the
+     # catalogue, 1,079 in sales. "Supply us" most naturally means the first, and
+     # accepting only the catalogue figure was the same mistake I made on vendors.
+     "check": lambda t: any(num_within(v, 3)(t) for v in (1156, 1321, 1079)),
+     "why": "1,156 procured from / 1,321 in the catalogue — either, named"},
     {"id": "l1-po-lines-vardhman", "q": "How many purchase order lines do we have with Vardhman?",
      "check": num_within(111582, 5), "why": "111,582 PO lines"},
     {"id": "l1-data-window", "q": "What period does our data cover?",

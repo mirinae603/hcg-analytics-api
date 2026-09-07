@@ -970,6 +970,16 @@ def answer(query: str, history: list | None = None):
                 kpi_key = (args.get("kpi") or "").strip()
                 plant = (args.get("plant") or "").strip() or None
                 category = (args.get("category") or "").strip() or None
+                # The canonical path produces no SQL, so every scope guard in this file
+                # sat it out: "Bangalore hospitals spend ₹649.91 Cr" was the whole network.
+                from app.ai.deep import tools as _deep_tools
+                _mis = _deep_tools._kpi_scope_mismatch(kpi_key, plant or "", query)
+                if _mis:
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                     "content": json.dumps({"error": _mis})})
+                    any_sql_failed = True
+                    yield {"type": "step", "text": "Scoping that to the named sites"}
+                    continue
                 if kpi_key not in kpi_registry.KPI_REGISTRY:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
                                       "content": json.dumps({"error": f"Unknown kpi '{kpi_key}'. Valid keys: {sorted(kpi_registry.KPI_REGISTRY)}"})})
