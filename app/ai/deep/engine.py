@@ -315,10 +315,16 @@ _FAMILY_TABLES = {
                     "kpi_inventory_aging", "kpi_non_moving"),
 }
 _FAMILY_WORDS = {
-    "sales":       ("sales", "sold", "selling", "revenue", "billed", "turnover"),
-    "purchasing":  ("purchase", "purchasing", "procure", "procurement", "bought", "po ", "vendor spend"),
-    "consumption": ("consumption", "consumed", "usage", "used", "issued"),
-    "stock":       ("stock", "inventory", "on hand", "expiry", "expiring", "aging"),
+    # "spend"/"buying" were missing entirely, so "how much have we SPENT buying items that
+    # are never SOLD" matched only `sold` and a correct procurement answer was prefixed
+    # "There is no sales figure available at this level". A gap in this vocabulary does not
+    # fail loudly — it silently mislabels the answer.
+    "sales":       ("sales", "sold", "sell", "selling", "revenue", "billed", "turnover"),
+    "purchasing":  ("purchase", "purchasing", "procure", "procurement", "bought", "buy",
+                    "buying", "spend", "spent", "spending", "po ", "vendor spend"),
+    "consumption": ("consumption", "consumed", "consume", "consuming", "usage", "used",
+                    "issued", "dispense", "dispensed", "dispensing"),
+    "stock":       ("stock", "inventory", "on hand", "holding", "expiry", "expiring", "aging"),
 }
 
 
@@ -331,11 +337,23 @@ def _family_of_table(sql: str) -> str | None:
 
 
 def _family_asked(question: str) -> str | None:
+    """Which measure family the question is ABOUT — the first one it names.
+
+    Declaration order picked the wrong one whenever a second measure appeared inside a
+    FILTER rather than as the thing being measured. "How much have we SPENT buying items
+    that are never SOLD" was read as a sales question, so a correct procurement answer was
+    prefixed "There is no sales figure available at this level" — a disclosure that made a
+    right answer look like a substitution. The measure a question is about is almost always
+    the first one it mentions; a later one is usually qualifying the population.
+    """
     low = (question or "").lower()
+    best, best_at = None, len(low) + 1
     for fam, words in _FAMILY_WORDS.items():
-        if any(w in low for w in words):
-            return fam
-    return None
+        for w in words:
+            at = low.find(w)
+            if at >= 0 and at < best_at:
+                best, best_at = fam, at
+    return best
 
 
 def _measure_disclosure(question: str, findings: list[dict], primary: dict | None = None) -> str:

@@ -591,6 +591,13 @@ def brief(question: str) -> str:
     for pat, note in _KEYWORD_NOTES:
         if re.search(pat, question or "", re.I):
             lines.append(f"- {note}")
+    # Say it BEFORE the model spends four queries discovering it. "Show me the sales trend
+    # for KEYTRUDA" ruled out both lines of enquiry and reported "I couldn't establish
+    # anything solid enough to report" — which reads as the assistant being weak, when the
+    # truth is the warehouse has no material x month sales grain at all.
+    impossible = impossible_combination(question)
+    if impossible:
+        lines.append(f"- NOT AVAILABLE AT THIS GRAIN: {impossible}")
     # "biggest selling" is revenue to a CFO and units to a storekeeper, and both readings
     # have a real answer: KEYTRUDA at ₹47.48 Cr, EXAMINATION GLOVES at 1,347,643 units.
     if re.search(r"\b(best|biggest|top|highest)[- ]?(selling|seller)\b|\bmoves? the most\b",
@@ -978,3 +985,87 @@ def spelling_suggestions(question: str, resolved: dict) -> list[dict]:
                         "kinds": kinds, "examples": examples,
                         "n": len({c[1] for c in cands})})
     return out[:4]
+
+
+# Projections are not history. forecast_sales carries material, month AND a sales value, so
+# a naive search says "a monthly sales trend per drug exists" — from forecast rows.
+_PROJECTION = re.compile(r"forecast|project|budget|plan|target", re.I)
+
+
+@lru_cache(maxsize=256)
+def grain_measure_tables(measure: str, grain: str, allow_projection: bool = False
+                         ) -> tuple[str, ...]:
+    """Tables that can serve this measure AT this grain — i.e. hold both columns.
+
+    Some combinations simply do not exist. `sales_monthly` has month and revenue but no
+    material; `sales_by_material` has material and revenue but no month. So a monthly sales
+    trend for one drug is not a hard question, it is an impossible one — and "Show me the
+    sales trend for KEYTRUDA" was answered "I couldn't establish anything solid enough to
+    report", which reads as a failure of the assistant rather than a fact about the data.
+    """
+    pat = GRAIN_COLUMNS.get(grain)
+    if not pat:
+        return ()
+    by_table: dict[str, list[str]] = defaultdict(list)
+    for t, c in _schema_columns():
+        by_table[t].append(c)
+    measure_cols = {loc.split(".", 1)[0]: loc.split(".", 1)[1]
+                    for loc in measure_locations(measure, limit=40)}
+    out = []
+    for table, cs in by_table.items():
+        if table.startswith("_pydf") or table not in measure_cols:
+            continue
+        if _PROJECTION.search(table) and not allow_projection:
+            continue
+        if any(pat.match(c) for c in cs):
+            out.append(f"{table}.{measure_cols[table]}")
+    return tuple(sorted(out))
+
+
+@lru_cache(maxsize=256)
+def _tables_serving(measure: str, grains: tuple[str, ...], allow_projection: bool = False
+                    ) -> tuple[str, ...]:
+    """Tables holding the measure AND every one of these grains at once."""
+    sets = [set(grain_measure_tables(measure, g, allow_projection)) for g in grains if g]
+    if not sets:
+        return ()
+    common = set.intersection(*sets) if len(sets) > 1 else sets[0]
+    # intersect on TABLE, not on table.column
+    names = [{loc.split(".", 1)[0] for loc in s_} for s_ in sets]
+    shared = set.intersection(*names) if len(names) > 1 else names[0]
+    return tuple(sorted(loc for loc in common if loc.split(".", 1)[0] in shared))
+
+
+def impossible_combination(question: str) -> str | None:
+    """A named reason the question cannot be answered, or None if it can be.
+
+    Returned INSTEAD of a generic "I couldn't establish anything", which tells the reader
+    their assistant is weak when the truth is that their warehouse has no such grain.
+    """
+    r = resolve(question)
+    if not (r["measures"] and r["grains"]):
+        return None
+    measure = r["measures"][0]
+    # every grain the question needs AT ONCE — naming a drug and asking for a trend means
+    # material AND month, and no sales table has both
+    grains = list(dict.fromkeys(
+        r["grains"] + [e["kind"] for e in r["entities"] if e["kind"] in GRAIN_COLUMNS]
+        + [f["kind"] for f in r["families"] if f["kind"] in GRAIN_COLUMNS]))
+    if not grains:
+        return None
+    wants_projection = bool(re.search(r"forecast|project|predict|expect", question or "", re.I))
+    if _tables_serving(measure, tuple(grains), wants_projection):
+        return None
+    grain = " x ".join(g.upper() for g in grains)
+    # is it the grain or the measure that is missing?
+    alt_grains = [g for g in GRAIN_COLUMNS if grain_measure_tables(measure, g)]
+    alt_measures = [m for m in _MEASURE_COLUMNS if _tables_serving(m, tuple(grains))]
+    parts = [f"No table holds {measure.upper()} at {grain} grain — the combination "
+             f"does not exist in this warehouse, so no query can produce it."]
+    if alt_grains:
+        parts.append(f"{measure.upper()} IS available by: {', '.join(sorted(alt_grains))}.")
+    if alt_measures:
+        parts.append(f"At {grain} grain you CAN have: {', '.join(sorted(alt_measures))}.")
+    parts.append("Say this plainly and offer the closest thing that does exist — do not "
+                 "report it as a failure to find anything.")
+    return " ".join(parts)

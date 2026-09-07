@@ -26,8 +26,13 @@ import re
 # (name, question pattern, SQL pattern, what to say). Ordered by how often each fires on our
 # own golden set, so the cheapest checks come first.
 _RULES: list[tuple[str, str, str, str]] = [
+    # "How many UNITS were sold" is a SUM of a quantity column, not a COUNT of rows — the
+    # first version of this rule blocked every such query and turned two correct answers
+    # into "I couldn't establish anything". "How many" only means COUNT when what follows
+    # is a countable THING (vendors, hospitals, items), not a unit of measure.
     ("count",
-     r"\bhow many\b|\bnumber of\b",
+     r"\bhow many\b(?!\s+(units?|litres?|ml|mg|kg|grams?|rupees?|crores?|lakhs?|days?|"
+     r"hours?|boxes|vials?|tablets?|strips?)\b)|\bnumber of\b(?!\s+units?\b)",
      r"\bCOUNT\s*\(",
      "The question asks HOW MANY, so the query must COUNT. Returning a list, or a SUM of a "
      "value column, answers a different question."),
