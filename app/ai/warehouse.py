@@ -153,6 +153,74 @@ _MART_NAMES = ("mart_material_price_stats", "mart_material_vendor_price_stats", 
 
 
 
+
+def _add_period_columns(con: duckdb.DuckDBPyConnection) -> None:
+    """Give EVERY month-grained table one sortable period key: 'YYYY-MM'.
+
+    `month_num` is the CALENDAR month, 1-12, with the year in a separate column. The data
+    runs December 2025 to May 2026, so ordering a trend by month_num puts December — the
+    FIRST month — LAST:
+
+        January(1) February(2) March(3) April(4) May(5) … December(12)
+
+    Which is what a live answer said: "declining from ₹8.19 Cr in January (the peak) to
+    ₹8.01 Cr in December (the last period)". The chart drew the series correctly and the
+    prose ran time backwards, so it named the wrong peak, the wrong trough and the wrong
+    direction. Every monthly trend crossing a year boundary was affected.
+
+    DISCOVERED, NOT LISTED. The tables are found by asking the schema which ones carry a
+    year alongside a month, so a table added later gets the same key without anyone
+    remembering to add it here — and a hand-maintained list is exactly how the disjoint
+    hospital codes and the billable-consumption gap stayed hidden for so long.
+
+    `sales_monthly.month` already stores '2025-12' and sorts correctly, so it is skipped.
+    """
+    try:
+        rows = con.execute(
+            "SELECT table_name, column_name FROM information_schema.columns").fetchall()
+    except Exception:
+        return
+    cols: dict[str, set[str]] = {}
+    for t, c in rows:
+        cols.setdefault(str(t), set()).add(str(c))
+
+    for table, have in cols.items():
+        if table.startswith(("_period_", "_pydf", "_dim_material_raw")):
+            continue
+        if "period" in have or "year" not in have:
+            continue
+        month_col = next((c for c in ("month_num", "month") if c in have), None)
+        if not month_col:
+            continue
+        # A month is stored either as a NUMBER (1-12) or as a NAME ("February"). Both need
+        # handling: kpi_monthly_purchase_value and kpi_stock_change use names, and sorting
+        # those alphabetically is worse still — April, August, December, February…
+        num_expr = f'CAST("{month_col}" AS INTEGER)'
+        try:
+            con.execute(f'SELECT {num_expr} FROM "{table}" LIMIT 1').fetchone()
+        except Exception:
+            num_expr = (
+                f'CASE lower(substr(CAST("{month_col}" AS VARCHAR), 1, 3)) '
+                "WHEN 'jan' THEN 1 WHEN 'feb' THEN 2 WHEN 'mar' THEN 3 WHEN 'apr' THEN 4 "
+                "WHEN 'may' THEN 5 WHEN 'jun' THEN 6 WHEN 'jul' THEN 7 WHEN 'aug' THEN 8 "
+                "WHEN 'sep' THEN 9 WHEN 'oct' THEN 10 WHEN 'nov' THEN 11 "
+                "WHEN 'dec' THEN 12 END")
+            try:
+                if con.execute(f'SELECT {num_expr} FROM "{table}" LIMIT 1').fetchone()[0] is None:
+                    continue
+            except Exception:
+                continue
+        try:
+            con.execute(
+                f'CREATE OR REPLACE TABLE "_period_{table}" AS SELECT *, '
+                f'CAST("year" AS VARCHAR) || \'-\' || '
+                f'lpad(CAST({num_expr} AS VARCHAR), 2, \'0\') AS period '
+                f'FROM "{table}"')
+            con.execute(f'CREATE OR REPLACE VIEW "{table}" AS SELECT * FROM "_period_{table}"')
+        except Exception:
+            continue
+
+
 def _normalise_formulary(con: duckdb.DuckDBPyConnection) -> None:
     """Collapse 11 spellings of 3 concepts into one column that can be grouped on.
 
@@ -355,6 +423,7 @@ def con() -> duckdb.DuckDBPyConnection:
             _normalise_formulary(_con)
             _build_procurement_mart(_con)
             _fix_billable_nonbillable_scope(_con)
+            _add_period_columns(_con)
     return _con
 
 

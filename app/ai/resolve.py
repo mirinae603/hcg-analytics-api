@@ -838,7 +838,8 @@ GRAIN_COLUMNS: dict[str, re.Pattern] = {
     "vendor":       re.compile(r"^(vendor|vendor_name|vendor_code)$", re.I),
     "manufacturer": re.compile(r"^(manufacturer|manufacturer_desc)$", re.I),
     "category":     re.compile(r"^(category|material_group|major_group_desc|minor_group_desc|group|name)$", re.I),
-    "month":        re.compile(r"^(month|month_name|period|posting_date|year)$", re.I),
+    # `period` first: it is the only key that sorts correctly across a year boundary
+    "month":        re.compile(r"^(period|month|month_num|month_name|posting_date|year)$", re.I),
     "department":   re.compile(r"^(department|department_name|cost_ctr|costcenter)$", re.I),
 }
 

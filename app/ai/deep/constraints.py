@@ -137,6 +137,40 @@ def violations(question: str, sql: str) -> list[str]:
             if name not in skip and qp.search(question) and not sp.search(sql)]
 
 
+# A month key that is not monotonic across years. ORDER BY month_num runs
+# January(1) … December(12), so on data spanning Dec 2025 -> May 2026 December lands LAST
+# and the narrative names the wrong peak, trough and direction. Every such table now carries
+# a `period` column ('2025-12') that sorts correctly.
+_BAD_TIME_SORT = re.compile(
+    r"\bORDER\s+BY\b[^;]*?\b(month_num|month)\b", re.I)
+_HAS_PERIOD = re.compile(r"\bperiod\b", re.I)
+_HAS_YEAR_FIRST = re.compile(r"\bORDER\s+BY\s+[^;]{0,40}?\byear\b", re.I)
+
+
+# A month DERIVED from a real date sorts correctly, whatever it is aliased as:
+# `DATE_TRUNC('month', CAST(posting_date AS DATE)) AS month ... ORDER BY month` is right,
+# and the first version of this rule blocked it on sight of the word "month" — leaving the
+# engine with no usable query at all and the answer "no conclusions can be drawn".
+_DERIVED_MONTH = re.compile(
+    r"date_trunc|strftime|date_part|extract\s*\(|::\s*date|AS\s+DATE\s*\)", re.I)
+
+
+def wrong_time_ordering(sql: str) -> str | None:
+    """A trend ordered by a key that puts December before January."""
+    if not sql or not _BAD_TIME_SORT.search(sql):
+        return None
+    if _HAS_PERIOD.search(sql) or _HAS_YEAR_FIRST.search(sql):
+        return None                      # already sorted by something monotonic
+    if _DERIVED_MONTH.search(sql):
+        return None                      # month came from a real date; it sorts fine
+    return ("WRONG TIME ORDER — `month_num` is the calendar month 1-12 with the year in a "
+            "separate column, and `month` may be a NAME. This data spans December 2025 to "
+            "May 2026, so ordering by either puts December LAST when it is the FIRST "
+            "period, and the peak, trough and direction all come out wrong. Order by the "
+            "`period` column instead ('2025-12', '2026-01', …), which every month-grained "
+            "table now carries.")
+
+
 _NOT_SQL = re.compile(r"^\s*(--|#)|^\s*$")
 
 
@@ -151,7 +185,51 @@ def check(question: str, sql: str) -> str | None:
     if not sql or _NOT_SQL.match(sql) or not re.search(r"\bSELECT\b", sql, re.I):
         return None
     bad = violations(question, sql)
+    for extra in (wrong_time_ordering(sql), misleading_alias(sql)):
+        if extra:
+            bad = bad + [extra]
     if not bad:
         return None
     return ("QUERY DOES NOT MATCH THE QUESTION — re-write it before using the result.\n"
             + "\n".join(f"- {b}" for b in bad))
+
+
+# ── AN ALIAS MAY NOT RENAME THE MEASURE ──────────────────────────────────────────────────
+# `SELECT SUM(monthly_purchase_value) AS total_sales_value` — a PURCHASING column relabelled
+# as SALES. The engine had already disclosed, deterministically, "what follows is
+# PURCHASING", and then the prose followed the alias and called the same numbers "total
+# sales value" in the very next sentence. Two stacked, contradictory claims about one figure.
+#
+# Disclosure cannot survive a query that lies in its own column names, and no amount of
+# prompt text fixes it: the model reads its own alias back and believes it.
+_FAMILY_OF_COLUMN: tuple[tuple[str, str], ...] = (
+    ("purchasing",  r"purchase|procure|po_value|line_value|grn|spend"),
+    ("sales",       r"revenue|sales|billed_revenue|turnover"),
+    ("consumption", r"consum|issued|dispens"),
+    ("stock",       r"stock|inventory|on_hand|closing"),
+)
+
+
+def _family_of(name: str) -> str | None:
+    for fam, pat in _FAMILY_OF_COLUMN:
+        if re.search(pat, name or "", re.I):
+            return fam
+    return None
+
+
+def misleading_alias(sql: str) -> str | None:
+    """An aggregate aliased into a different measure family than its source column."""
+    if not sql:
+        return None
+    for raw_col, alias in re.findall(
+            r"\b(?:SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)[^()]*\)"
+            r"\s*(?:AS\s+)?([A-Za-z_]\w*)", sql, re.I):
+        src = _family_of(raw_col.split(".")[-1])
+        dst = _family_of(alias)
+        if src and dst and src != dst:
+            return (f"MISLEADING ALIAS — `{raw_col}` is a {src.upper()} column and you have "
+                    f"named it `{alias}`, which reads as {dst.upper()}. Those are different "
+                    f"business events measured from different tables, and the answer will "
+                    f"call the figure by the alias you chose. Name it after what it is "
+                    f"(e.g. total_{src}_value) and describe it as {src.upper()}.")
+    return None

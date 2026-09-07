@@ -393,6 +393,22 @@ def _family_asked(question: str) -> str | None:
     return best
 
 
+
+# A restatement of the measure substitution, which the engine has ALREADY emitted in code
+# before the model's first token. Asked twice not to repeat it — once in the prompt, once
+# more emphatically — the model wrote it anyway both times, because an instruction is a
+# preference. Two stacked apologies before any number is a worse answer than one.
+_SENTENCE_END = re.compile(r"(?<!\d)\.(?:\s|$)")
+
+_REDUNDANT_OPENER = re.compile(
+    r"^\s*there (?:is|are) no [^.]*?\b(figure|data|breakdown|series|trend)s?\b[^.]*\."
+    r"(?:\s*what follows is[^.]*\.)?\s*", re.I)
+
+
+def _drop_redundant_opener(text: str) -> str:
+    """Remove a leading 'there is no X figure ...' sentence from the model's prose."""
+    return _REDUNDANT_OPENER.sub("", text or "", count=1)
+
 def _measure_disclosure(question: str, findings: list[dict], primary: dict | None = None) -> str:
     """Say so, in code, when the answer is about a DIFFERENT measure than was asked for.
 
@@ -552,6 +568,13 @@ def answer(query: str, history: list | None = None):
             # actually reference it
             entity_tokens.extend(e["text"] for e in _r["entities"] if e.get("exact"))
             entity_tokens.extend(_r["cities"])
+            # NOT bound: one-member families. Binding them looked right — the brief calls
+            # "keytruda" an identification — and it made missing_entity_scope reject every
+            # query that did not name the item, including the ones that legitimately search
+            # with LIKE. Two questions that had been answering correctly started returning
+            # "I couldn't establish anything". Measured, reverted, and left here as a note:
+            # the entity IS under-enforced for families, but total failure is worse than an
+            # unscoped figure, and the fix has to come from the query side, not this list.
     except Exception:
         pass
 
@@ -1176,6 +1199,9 @@ def answer(query: str, history: list | None = None):
         yield {"type": "answer_delta", "text": disclosure}
     prose = disclosure
     pending = ""      # hold back a partial word so "plant" is never half-emitted
+    # When the substitution has already been disclosed in code, hold the model's opening
+    # sentence back until it can be inspected, and drop it if it merely says the same thing.
+    opener_buf, opener_done = "", not bool(disclosure)
     for tok in llm.stream_text(
         cl, role="synthesise",
         system=("You are a hospital supply-chain analyst writing a short brief for an executive.\n"
@@ -1185,6 +1211,18 @@ def answer(query: str, history: list | None = None):
                    f"manufacturer; answering one level up is a different question.\n"
                    if requested_grains else "")
                 + (_source_words(findings) + "\n" if _source_words(findings) else "")
+                # The substitution has ALREADY been disclosed, in code, above your first
+                # word. Saying it again produced two stacked and CONTRADICTORY prefixes:
+                # "what follows is PURCHASING" immediately followed by "what follows is
+                # monthly revenue", for the same numbers.
+                + (f"ALREADY STATED — the reader has been told, before your first word: "
+                   f"\"{disclosure.strip()}\" Do NOT repeat it, rephrase it, or contradict "
+                   f"it. Those figures ARE that measure: name them accordingly and never "
+                   f"call them something else. START WITH THE ANSWER — your first sentence "
+                   f"must be the finding itself, never another \"there is no X figure\" "
+                   f"line. The substitution has been disclosed; saying it twice buries the "
+                   f"answer under two paragraphs of apology before a number appears.\n"
+                   if disclosure else "")
                 + "STRUCTURE: lead with the answer and its number; then WHAT DRIVES IT, ranked; then "
                 "WHAT YOU RULED OUT; then the limits.\n"
                 "NEVER state a percentage or a share unless that exact percentage appears in "
@@ -1218,6 +1256,19 @@ def answer(query: str, history: list | None = None):
                  f"recompute them):\n{derived_block}\n\n" if derived_block else "")
               + f"EVIDENCE (results only):\n{evidence[:8000]}\n\n"
               f"CORROBORATION: {corr_note}\nREVIEW: {crit_note}")):
+        if not opener_done:
+            opener_buf += tok
+            # Wait for a REAL sentence boundary. "." alone is not one: "₹47.48 Cr" cut the
+            # buffer at "47." and the stripper then ate the front of a genuine sentence,
+            # emitting "48 Cr) and billed quantity (2,193)". A boundary is a period that is
+            # not between two digits, followed by a space or the end of the text.
+            if not _SENTENCE_END.search(opener_buf) and len(opener_buf) < 400:
+                continue
+            kept = _drop_redundant_opener(opener_buf)
+            opener_done, opener_buf = True, ""
+            if not kept.strip():
+                continue
+            tok, pending = kept, ""
         pending += tok
         cut = max(pending.rfind(" "), pending.rfind("\n"))
         if cut >= 0:
@@ -1225,6 +1276,8 @@ def answer(query: str, history: list | None = None):
             ready, pending = _rupees_in_scale(_hospitalise(pending[:cut + 1])), pending[cut + 1:]
             prose += ready
             yield {"type": "answer_delta", "text": ready}
+    if opener_buf:                       # stream ended inside the opening sentence
+        pending += _drop_redundant_opener(opener_buf)
     if pending:
         ready = _rupees_in_scale(_hospitalise(pending))
         prose += ready
