@@ -22,6 +22,7 @@ import time
 
 from app.ai import warehouse
 from app.ai import scope as _scope, semantics, charts, routing, kpi_registry
+from app.ai import resolve as _resolver
 from app.ai.deep import engine as _deep_engine, sanity as _sanity
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
@@ -942,6 +943,21 @@ def answer(query: str, history: list | None = None):
             except Exception:
                 args = {}
             if tc.function.name == "ask_clarification":
+                # A confident spelling correction is not an ambiguity. The brief already
+                # says "proceed on that reading and say you read it that way; do not stop
+                # and ask" — and the model asked anyway: "keytuda doesn't match any item.
+                # Did you mean Keytruda?" That is a wasted turn for a 93% match with one
+                # candidate. An instruction is a preference; refusing the tool is a rule.
+                _typos = _resolver.spelling_suggestions(query, _resolver.resolve(query))
+                if _typos:
+                    _t = _typos[0]
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(
+                        {"error": f"Do not ask. \"{_t['typed']}\" is a misspelling of "
+                                  f"\"{_t['meant']}\" ({_t['similarity']:.0%} match, "
+                                  f"e.g. {', '.join(_t['examples'][:2])}). Proceed on that "
+                                  f"reading, state that you read it that way, and answer."})})
+                    yield {"type": "step", "text": f"Reading that as \u201c{_t['meant']}\u201d"}
+                    continue
                 yield {"type": "clarify", "text": args.get("question", "Could you clarify what you'd like?"),
                        "options": args.get("options", [])}
                 yield {"type": "done"}

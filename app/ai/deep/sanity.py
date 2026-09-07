@@ -29,6 +29,9 @@ from app.ai import warehouse
 # SUM(x) is additive over rows, so a filter can only ever remove from it. AVG/MIN/MAX/COUNT
 # DISTINCT are not, and comparing them part-to-whole proves nothing.
 _SUM = re.compile(r"\bSUM\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)\s*\)", re.I)
+# SUM(col) together with the alias it was given, so each aggregate is judged on its own
+_SUM_ALIAS = re.compile(
+    r"\bSUM\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)\s*\)\s*(?:AS\s+)?([A-Za-z_]\w*)?", re.I)
 _FROM = re.compile(r"\bFROM\s+([A-Za-z_]\w*)", re.I)
 _HAS_WHERE = re.compile(r"\bWHERE\b", re.I)
 _HAS_JOIN = re.compile(r"\bJOIN\b", re.I)
@@ -61,25 +64,36 @@ def part_exceeds_whole(sql: str, res: dict) -> str | None:
     if re.search(r"\bUNION\b", sql, re.I):
         return None
 
-    m, f = _SUM.search(sql), _FROM.search(sql)
-    if not (m and f):
+    f = _FROM.search(sql)
+    if not f:
         return None
-    col, table = m.group(1).split(".")[-1].lower(), f.group(1)
-    if col not in _columns(table):
-        return None                       # the measure is not this table's own column
+    table, cols = f.group(1), _columns(table_name := f.group(1))
 
-    try:
-        whole = warehouse.con().execute(
-            f'SELECT SUM("{col}") FROM "{table}"').fetchone()[0]
-    except Exception:
-        return None
-    if whole is None or whole <= 0:
-        return None
-
-    # the largest single number the query returned, and their sum for a breakdown
-    numbers = [v for r in rows for v in r.values() if isinstance(v, (int, float))]
-    part = max((abs(v) for v in numbers), default=0.0)
-    if part <= whole * _TOLERANCE:
+    # Judge each aggregate against ITS OWN total. Taking the first SUM() and comparing it
+    # to the largest number ANYWHERE in the result was wrong the moment a query returned
+    # two measures: `SUM(qty) AS total_qty, SUM(cost) AS total_cost` came back 2,193 and
+    # 412,980,621, and the COST was checked against the QUANTITY total — so a correct
+    # answer was rejected as impossible, three times in a row, and the chat gave up.
+    col = whole = part = None
+    for raw_col, alias in _SUM_ALIAS.findall(sql):
+        c = raw_col.split(".")[-1].lower()
+        if c not in cols:
+            continue                      # not this table's own column
+        try:
+            total = warehouse.con().execute(
+                f'SELECT SUM("{c}") FROM "{table_name}"').fetchone()[0]
+        except Exception:
+            continue
+        if total is None or total <= 0:
+            continue
+        key = (alias or "").lower()
+        vals = [abs(v) for r in rows for k, v in r.items()
+                if isinstance(v, (int, float)) and (not key or k.lower() == key)]
+        biggest = max(vals, default=0.0)
+        if biggest > total * _TOLERANCE:
+            col, whole, part = c, total, biggest
+            break
+    if col is None:
         return None
     return (f"IMPOSSIBLE RESULT — do not report this number. This query returned "
             f"{part:,.0f} for {col}, but {table} contains only {whole:,.0f} in total. A "

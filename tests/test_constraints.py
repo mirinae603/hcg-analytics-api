@@ -50,10 +50,22 @@ def test_an_extreme_needs_an_ordering():
                  "SELECT category, SUM(v) s FROM t GROUP BY 1 ORDER BY s DESC") is None
 
 
-def test_a_trend_needs_a_time_column():
-    assert check("How has monthly revenue moved?", "SELECT SUM(revenue) FROM t") is not None
+def test_a_trend_needs_a_time_column_WHEN_ONE_EXISTS():
+    # sales_monthly HAS a month column, so demanding it is fair
     assert check("How has monthly revenue moved?",
-                 "SELECT month, SUM(revenue) FROM t GROUP BY 1") is None
+                 "SELECT SUM(revenue) FROM sales_monthly") is not None
+    assert check("How has monthly revenue moved?",
+                 "SELECT month, SUM(revenue) FROM sales_monthly GROUP BY 1") is None
+
+
+def test_a_trend_is_not_demanded_from_a_table_that_has_no_time_column():
+    # consumption_all has no time axis. A query WITH `month` failed to bind and one WITHOUT
+    # it was blocked by this rule — a deadlock that retried three times and gave up with
+    # "I ran into a repeated error building the query". A rule may insist the SQL match the
+    # question; it may not insist on a column that does not exist.
+    assert check("how does the consumption trend of keytruda look?",
+                 "SELECT scope, SUM(qty) FROM consumption_all "
+                 "WHERE material = '101313' GROUP BY scope") is None
 
 
 def test_an_average_is_not_a_sum():

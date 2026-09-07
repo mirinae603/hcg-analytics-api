@@ -77,15 +77,60 @@ def required(question: str) -> list[str]:
     return [n for n, qp, _, _ in _COMPILED if qp.search(question or "")]
 
 
+_TABLES_IN = re.compile(r"\b(?:FROM|JOIN)\s+\"?([A-Za-z_]\w*)\"?", re.I)
+_TIME_COL = re.compile(r"^(month|month_num|month_name|posting_date|date|period|year|"
+                       r"snapshot_date|doc_date|week)$", re.I)
+
+
+def _no_time_column_available(sql: str) -> bool:
+    """True when NONE of the tables in this query carry a time column.
+
+    Demanding a construct the data cannot supply is a deadlock, and it was one: asked for
+    Keytruda's consumption trend, a query WITH `month` failed (consumption_all has no such
+    column) and a query WITHOUT it was blocked by the TEMPORAL rule. Three retries, then
+    "I ran into a repeated error building the query". A rule may insist the SQL match the
+    question; it may not insist on a column that does not exist.
+    """
+    try:
+        from app.ai import warehouse
+        tables = set(_TABLES_IN.findall(sql or ""))
+        if not tables:
+            return False
+        rows = warehouse.con().execute(
+            "SELECT table_name, column_name FROM information_schema.columns").fetchall()
+    except Exception:
+        return False
+    return not any(t in tables and _TIME_COL.match(c) for t, c in rows)
+
+
+def _grain_is_impossible(question: str) -> bool:
+    """True when the warehouse simply cannot serve this question's time grain.
+
+    Demanding a construct the data cannot provide creates a deadlock, and it did: asked for
+    Keytruda's consumption trend, a query WITH `month` failed (consumption_all has no such
+    column) and a query WITHOUT it was blocked by the TEMPORAL rule. The chat retried three
+    times and gave up. A constraint may insist the SQL match the question; it may not insist
+    on a column that does not exist.
+    """
+    try:
+        from app.ai import resolve
+        return resolve.impossible_combination(question) is not None
+    except Exception:
+        return False
+
+
 def violations(question: str, sql: str) -> list[str]:
     """Constraints the question imposes that the SQL does not satisfy."""
     if not question or not sql:
         return []
+    skip = set()
+    if _grain_is_impossible(question) or _no_time_column_available(sql):
+        skip.add("temporal")
     # a CTE or subquery may satisfy the construct anywhere in the statement, so the whole
     # text is searched rather than just the outer SELECT
     return [f"{name.upper()} — {msg}"
             for name, qp, sp, msg in _COMPILED
-            if qp.search(question) and not sp.search(sql)]
+            if name not in skip and qp.search(question) and not sp.search(sql)]
 
 
 _NOT_SQL = re.compile(r"^\s*(--|#)|^\s*$")

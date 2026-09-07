@@ -143,3 +143,21 @@ def test_a_real_name_containing_those_letters_is_untouched():
     for name in ("GENERAL MEDICAL", "GENERIC HEALTH LTD", "MISCO PHARMA"):
         assert sanity.placeholder_leader(
             {"rows": [{"m": name, "v": 2}, {"m": "X", "v": 1}]}) is None, name
+
+
+def test_two_measures_are_judged_against_their_own_totals():
+    # `SUM(qty) AS total_qty, SUM(cost) AS total_cost` returned 2,193 and 412,980,621; the
+    # first SUM found was qty, and the COST was then compared to the QUANTITY total. A
+    # correct answer was rejected as impossible three times and the chat gave up.
+    sql = ("SELECT scope, SUM(qty) AS total_qty, SUM(cost) AS total_cost "
+           "FROM consumption_all WHERE material = '101313' GROUP BY scope")
+    res = {"rows": [{"scope": "billed", "total_qty": 2193.0, "total_cost": 412_980_620.96}]}
+    assert sanity.part_exceeds_whole(sql, res) is None
+
+
+def test_an_over_counted_measure_is_still_caught_when_another_is_fine():
+    sql = ("SELECT SUM(qty) AS total_qty, SUM(cost) AS total_cost "
+           "FROM consumption_all WHERE material = '101313'")
+    res = {"rows": [{"total_qty": 9e12, "total_cost": 1.0}]}    # qty impossible, cost fine
+    w = sanity.part_exceeds_whole(sql, res)
+    assert w and "qty" in w
