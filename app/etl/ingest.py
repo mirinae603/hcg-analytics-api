@@ -7,6 +7,7 @@ present in the raw exports (e.g. ' Aging', '   Total Cost').
 from __future__ import annotations
 
 import glob
+import re
 import os
 from pathlib import Path
 
@@ -193,11 +194,25 @@ def load_po() -> pd.DataFrame:
         raise FileNotFoundError(f"No PO files under {RAW / DIR_PO}")
     frames = []
     for f in files:
-        d = _norm_headers(pd.read_excel(f, engine="openpyxl"))
-        frames.append(d)
+        # EVERY sheet, not just the first. pd.read_excel() with no sheet_name reads sheet 0,
+        # and three of these workbooks carry a SECOND sheet — "Capex", "Capex PO",
+        # "Dom Capital PO" — with the identical 43-column schema. 645 purchase-order lines
+        # worth Rs 76.76 Cr were dropped on the floor, silently, because nobody looked past
+        # the first tab. The sheet name is kept as `po_type` so capital purchases can be
+        # excluded deliberately rather than by accident.
+        for sheet_name, d in pd.read_excel(f, engine="openpyxl", sheet_name=None).items():
+            if d.empty:
+                continue
+            d = _norm_headers(d)
+            if "Material" not in d.columns:      # a summary tab, not PO lines
+                continue
+            d["po_type"] = ("capex" if re.search(r"capex|capital", str(sheet_name), re.I)
+                            else "operational")
+            frames.append(d)
     df = pd.concat(frames, ignore_index=True)
 
     out = pd.DataFrame({
+        "po_type": df["po_type"].astype(str),
         "plant": df["Plant"].astype(str).str.strip(),
         "plant_name": df["Plant Name"].astype(str).str.strip(),
         "sloc": df["Storage Location"].astype(str).str.strip(),
@@ -222,3 +237,4 @@ def load_po() -> pd.DataFrame:
     out = out[out["material"].str.lower() != "nan"].copy()
     print(f"[ingest] po: {len(out):,} rows from {len(files)} files")
     return out
+

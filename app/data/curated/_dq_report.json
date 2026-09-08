@@ -2,7 +2,7 @@
   "consumption_rows": 128369,
   "inventory_rows": 97590,
   "grn_rows": 255803,
-  "po_rows": 249884,
+  "po_rows": 250529,
   "plants": 53,
   "materials": 24931,
   "vendors": 3576,
@@ -15,5 +15,5 @@
     5,
     12
   ],
-  "elapsed_sec": 114.1
+  "elapsed_sec": 146.5
 }
