@@ -207,20 +207,25 @@ _MEASURE_NOTES: dict[str, str] = {
                "revenue is a rounding error wearing the clothes of a finding."),
     "price":  ("Price compared across items must be per-unit. Summing price across rows is "
                "meaningless — it adds rates, not amounts."),
-    "consumption": ("USE `consumption_all` — it is the only table that holds both scopes. "
-                    "Consumption here is TWO events: `fact_consumption` is materials ISSUED "
-                    "FROM STORES (11,225 materials), and materials dispensed against a "
-                    "patient's bill are not in it at all (13,706 more). consumption_all "
-                    "unions them at material grain with a `scope` column ('internal' or "
-                    "'billed'), covering 25,153 materials. Always report which scope a "
-                    "figure is, and never read an empty fact_consumption result as proof an "
-                    "item is unused. NOTE: the billed side has no plant and no date, so "
-                    "consumption_all cannot give a monthly or per-hospital trend — say that "
-                    "plainly rather than implying one."),
+    # A CALLABLE, not a string. The counts here are facts about the data, and writing them
+    # into the prompt as literals means the model is told stale numbers the moment the
+    # parquet is refreshed — the same "hand-maintained list" failure that hid the disjoint
+    # hospital codes. Everything countable is counted at call time.
+    "consumption": lambda: (
+        "USE `consumption_all` — it is the only table that holds both scopes. Consumption "
+        "here is TWO events: `fact_consumption` is materials ISSUED FROM STORES "
+        f"({_count_distinct('fact_consumption', 'material')} materials), and materials "
+        "dispensed against a patient's bill are not in it at all. consumption_all unions "
+        "them at material grain with a `scope` column ('internal' or 'billed'), covering "
+        f"{_count_distinct('consumption_all', 'material')} materials. Always report which "
+        "scope a figure is, and never read an empty fact_consumption result as proof an "
+        "item is unused. NOTE: the billed side has no plant and no date, so consumption_all "
+        "cannot give a monthly or per-hospital trend — say that plainly rather than "
+        "implying one."),
     "expiry": ("This warehouse buckets expiry as Expired / 0-30d / 31-90d / 91-180d. Stock "
                "that has ALREADY expired is not \"expiring in the next N days\" — it has "
                "expired. A 90-day question is 0-30d + 31-90d only; adding the expired "
-               "bucket turns 45,223 units into 101,005. State whether expired stock is "
+               "bucket roughly doubles the figure. State whether expired stock is "
                "included either way, because both totals are quoted on the dashboard and "
                "the reader cannot tell which one they are looking at."),
     "lead_time": ("Lead time is an average already computed per vendor. Average it with a "
@@ -463,14 +468,28 @@ def resolve(question: str, limit: int = 8) -> dict:
     # was typed as a PRICE question because "generates" contains "rate" — and the brief then
     # told the model, in its most authoritative voice, to think about per-unit pricing. Same
     # for "corporate", "operating", "separate".
+    def _pattern(w: str) -> str:
+        """Match a vocabulary word and its ordinary inflections.
+
+        The list holds "consumption" and "consumed"; a user writes "consume". Matching only
+        the literals meant "how much keytruda did we consume?" resolved NO measure at all,
+        so the consumption guidance — which table holds both scopes — was never shown. A
+        word list that has to enumerate every tense is a list that will always be one tense
+        behind, so words of six letters or more also match on their stem.
+        """
+        esc = re.escape(w)
+        if len(w) >= 6 and w.isalpha():
+            return rf"(?<![a-z]){re.escape(w[:5])}[a-z]{{0,6}}(?![a-z])"
+        return rf"(?<![a-z]){esc}s?(?![a-z])"
+
     def _asks(words) -> bool:
         # a trailing "s" is allowed so "items" still matches "item" — dropping it cost the
         # material grain on every question that used the plural, which is most of them
-        return any(re.search(rf"(?<![a-z]){re.escape(w)}s?(?![a-z])", low) for w in words)
+        return any(re.search(_pattern(w), low) for w in words)
 
     def _where(words) -> int:
         hits = [m.start() for w in words
-                for m in [re.search(rf"(?<![a-z]){re.escape(w)}s?(?![a-z])", low)] if m]
+                for m in [re.search(_pattern(w), low)] if m]
         return min(hits) if hits else 10 ** 6
 
     measures = [name for name, words in _MEASURES if _asks(words)]
@@ -521,6 +540,33 @@ def generic_materials(generic: str, limit: int = 8) -> tuple[str, ...]:
     except Exception:
         return ()
     return tuple(str(r[0]) for r in rows if r[0])
+
+
+@lru_cache(maxsize=128)
+def _count_distinct(table: str, column: str) -> str:
+    """A live COUNT(DISTINCT), formatted — so a note never quotes a stale number."""
+    from app.ai import warehouse
+    try:
+        n = warehouse.con().execute(
+            f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"').fetchone()[0] or 0
+    except Exception:
+        return "many"
+    return f"{n:,}"
+
+
+def _note_text(note) -> str:
+    """A note is a string, or a callable that computes one from the current data.
+
+    Returns "" for a missing note. Without that guard str(None) produced the literal string
+    "None", which is truthy — so every measure WITHOUT a note (revenue, purchasing, stock,
+    quantity: most of them) appended a bare "None" line to the brief the model reads.
+    """
+    if note is None:
+        return ""
+    try:
+        return (note() if callable(note) else str(note)) or ""
+    except Exception:
+        return ""
 
 
 def _weight_note(fam: dict) -> str:
@@ -643,13 +689,15 @@ def brief(question: str) -> str:
         lines.append(f"- MEASURE asked for: {m}"
                      + (f" — stored in {', '.join(where)}" if where
                         else " — no column in this warehouse stores it"))
-        if _MEASURE_NOTES.get(m):
-            lines.append(f"  {_MEASURE_NOTES[m]}")
+        note = _note_text(_MEASURE_NOTES.get(m))
+        if note:
+            lines.append(f"  {note}")
     if r["grains"]:
         lines.append(f"- BROKEN DOWN BY: {', '.join(r['grains'])}")
         for g in r["grains"]:
-            if _GRAIN_NOTES.get(g):
-                lines.append(f"  {_GRAIN_NOTES[g]}")
+            gnote = _note_text(_GRAIN_NOTES.get(g))
+            if gnote:
+                lines.append(f"  {gnote}")
     for pat, note in _KEYWORD_NOTES:
         if re.search(pat, question or "", re.I):
             lines.append(f"- {note}")
