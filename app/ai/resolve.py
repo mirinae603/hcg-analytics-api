@@ -764,12 +764,18 @@ def brief(question: str) -> str:
 # actually holds both consumption scopes.
 _MEASURE_PREFERRED: dict[str, tuple[str, ...]] = {
     "consumption": ("consumption_all.qty", "consumption_all.cost"),
+    # for a TREND question the month-grained table is the one that can answer it
+    "revenue": ("sales_by_material_month.revenue", "sales_by_material.revenue"),
 }
 
 _MEASURE_COLUMNS: dict[str, tuple[str, ...]] = {
     "margin":      (r"margin", r"profit"),
     "revenue":     (r"revenue", r"sales_value", r"net_sales", r"^sales$", r"turnover",
                     r"billed_value", r"^value$"),
+    # sales_by_material_month is the only table with revenue at material x month. It exists
+    # because every raw billing row carries SALESDATE and MATERIALCODE, and the ETL had
+    # simply never written that cross — so "show me the sales trend of KEYTRUDA" was
+    # answerable as a six-month total and nothing else.
     "purchasing":  (r"line_value", r"po_value", r"purchase_value", r"spend", r"net_value",
                     r"grn_value"),
     "consumption": (r"consum", r"issued", r"usage", r"billed_qty", r"internal_units"),

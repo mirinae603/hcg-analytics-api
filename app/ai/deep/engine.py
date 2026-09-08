@@ -406,8 +406,23 @@ _REDUNDANT_OPENER = re.compile(
 
 
 def _drop_redundant_opener(text: str) -> str:
-    """Remove a leading 'there is no X figure ...' sentence from the model's prose."""
-    return _REDUNDANT_OPENER.sub("", text or "", count=1)
+    """Remove a leading 'there is no X figure ...' sentence when the answer then gives one.
+
+    Only when SOMETHING SUBSTANTIVE FOLLOWS. The sentence is a real answer when it is the
+    whole answer — some questions genuinely have no data — so stripping it unconditionally
+    would delete the finding. It is false when the very next line reports the figure it just
+    denied, which is what happened the moment sales_by_material_month existed: "There is no
+    monthly sales figure for Keytruda; what follows is monthly revenue. Revenue fell from
+    ₹9.68 Cr in December 2025 to ₹7.92 Cr in May 2026."
+    """
+    stripped = _REDUNDANT_OPENER.sub("", text or "", count=1)
+    if stripped == (text or ""):
+        return text or ""
+    rest = stripped.strip()
+    # a figure, or a real paragraph, means the denial was wrong — drop it
+    if re.search(r"\d", rest) or len(rest) > 80:
+        return stripped
+    return text or ""
 
 def _measure_disclosure(question: str, findings: list[dict], primary: dict | None = None) -> str:
     """Say so, in code, when the answer is about a DIFFERENT measure than was asked for.
@@ -1201,7 +1216,10 @@ def answer(query: str, history: list | None = None):
     pending = ""      # hold back a partial word so "plant" is never half-emitted
     # When the substitution has already been disclosed in code, hold the model's opening
     # sentence back until it can be inspected, and drop it if it merely says the same thing.
-    opener_buf, opener_done = "", not bool(disclosure)
+    # Always inspect the opening sentence. Gating this on `disclosure` meant that once the
+    # data existed, the model could still open with "there is no monthly sales figure" and
+    # then print the monthly figures underneath it, unchecked.
+    opener_buf, opener_done = "", False
     for tok in llm.stream_text(
         cl, role="synthesise",
         system=("You are a hospital supply-chain analyst writing a short brief for an executive.\n"
@@ -1262,7 +1280,14 @@ def answer(query: str, history: list | None = None):
             # buffer at "47." and the stripper then ate the front of a genuine sentence,
             # emitting "48 Cr) and billed quantity (2,193)". A boundary is a period that is
             # not between two digits, followed by a space or the end of the text.
-            if not _SENTENCE_END.search(opener_buf) and len(opener_buf) < 400:
+            #
+            # Then wait for what FOLLOWS it. Judging on the opening sentence alone meant the
+            # buffer was exactly "There is no monthly sales figure for Keytruda; what
+            # follows is monthly revenue." with nothing after it — so the check that
+            # protects a genuine no-data answer saw an empty remainder and kept the
+            # sentence, immediately above the monthly figures it denied.
+            _end = _SENTENCE_END.search(opener_buf)
+            if (not _end or len(opener_buf) - _end.end() < 60) and len(opener_buf) < 400:
                 continue
             kept = _drop_redundant_opener(opener_buf)
             opener_done, opener_buf = True, ""

@@ -10,16 +10,26 @@ from __future__ import annotations
 from app.ai.resolve import brief, grain_measure_tables, impossible_combination
 
 
-def test_a_monthly_trend_for_one_drug_is_named_impossible():
-    r = impossible_combination('Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"')
-    assert r and "MONTH x MATERIAL" in r
+# The original example here was a monthly sales trend for one drug. That combination WAS
+# impossible and is not any more: the raw billing files always carried SALESDATE and
+# MATERIALCODE, and once the ETL wrote sales_by_material_month the question became a plain
+# query. The machinery is unchanged; the example had to move to something still absent.
+def test_a_missing_combination_is_named_impossible():
+    r = impossible_combination("what is our margin by vendor?")
+    assert r and "VENDOR" in r
     assert "does not exist in this warehouse" in r
 
 
 def test_it_offers_what_does_exist_instead():
-    r = impossible_combination('Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"')
+    r = impossible_combination("what is our margin by vendor?")
     assert "IS available by" in r
-    assert "do not report it as a failure" in r.lower() or "not report it as a failure" in r
+    assert "not report it as a failure" in r
+
+
+def test_a_combination_the_data_gained_is_no_longer_refused():
+    # regression guard: if sales_by_material_month is ever dropped, this fails loudly
+    assert impossible_combination(
+        'Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"') is None
 
 
 def test_an_answerable_question_is_left_alone():
@@ -40,8 +50,7 @@ def test_but_a_forecast_question_may_use_them():
 
 
 def test_the_brief_says_it_before_any_query_runs():
-    b = brief('Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"')
-    assert "NOT AVAILABLE AT THIS GRAIN" in b
+    assert "NOT AVAILABLE AT THIS GRAIN" in brief("what is our margin by vendor?")
 
 
 def test_a_question_with_no_measure_or_grain_is_not_judged():

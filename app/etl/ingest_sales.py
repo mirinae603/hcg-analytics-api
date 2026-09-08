@@ -10,6 +10,7 @@ accumulate aggregates the dashboards need:
   sales_by_hospital.parquet    hospital(code) → revenue, cost, qty
   sales_by_manufacturer.parquet manufacturer → revenue, cost, qty
   sales_by_material.parquet    material → desc, group, revenue, cost, qty
+  sales_by_material_month.parquet  material × period → revenue, cost, qty, lines
   sales_totals.parquet         patient → revenue, cost, qty, lines
 
 Revenue = TOTALMRP (billed), Cost = TOTALCOSTPRICE, Margin = revenue − cost (real).
@@ -159,6 +160,14 @@ def run():
     mat = defaultdict(lambda: defaultdict(float))
     mfr_mat = defaultdict(lambda: defaultdict(float))   # (manufacturer, material) → for mfr drill
     hosp_mat = defaultdict(lambda: defaultdict(float))  # (hospital, material) → for hospital drill
+    # (material, month) — the one cut nobody produced, though every raw billing row carries
+    # both SALESDATE and MATERIALCODE. Its absence is why "show me the sales trend of
+    # KEYTRUDA" was answerable only as a six-month total: sales_monthly has the month and no
+    # material, sales_by_material has the material and no month, and the cross was never
+    # written. The assistant then told users, correctly about the WAREHOUSE and wrongly
+    # about the DATA, that no month-by-month figure existed for an item.
+    mat_month = defaultdict(lambda: defaultdict(float))
+    read_counts: dict = {}          # path -> rows SEEN, so a silent reader failure is loud
     matdesc = {}
 
     def files(sub):
@@ -188,6 +197,8 @@ def run():
                 bucket[key]["qty"] += qty; bucket[key]["lines"] += 1
             hm = hosp_mat[(hk, code)]
             hm["revenue"] += rev; hm["cost"] += cost; hm["qty"] += qty; hm["lines"] += 1
+            mmo = mat_month[(code, ymk)]
+            mmo["revenue"] += rev; mmo["cost"] += cost; mmo["qty"] += qty; mmo["lines"] += 1
             m = g("mfr")
             if m and str(m).strip().lower() not in ("none", "nan", ""):
                 mt = str(m).strip().title()
@@ -197,6 +208,7 @@ def run():
                 mmx["revenue"] += rev; mmx["cost"] += cost; mmx["qty"] += qty; mmx["lines"] += 1
             matdesc.setdefault(code, str(g("desc")) if g("desc") else code)
             kept += 1
+        read_counts[path] = seen
         print(f"[sales] {patient:2s} {os.path.basename(path)[:38]:38s} seen={seen:>8,} kept={kept:>8,}", flush=True)
 
     # category from material master
@@ -213,6 +225,25 @@ def run():
     if dm is not None and "material" in dm and "material_group" in dm:
         grp = dict(zip(dm["material"].astype(str), dm["material_group"].astype(str)))
 
+    # REFUSE TO WRITE A PARTIAL DATASET.
+    #
+    # pyxlsb is an optional import guarded by try/except. With it missing, all four .xlsb
+    # OP-sales months read ZERO rows, the run "succeeded", and it overwrote seven parquets
+    # with ₹492.40 Cr in place of ₹521.67 Cr — 4 months of outpatient billing gone, and
+    # nothing in the log said anything louder than "seen=0 kept=0". Every dashboard and
+    # every AI answer would have quietly moved by ₹29 Cr.
+    #
+    # A file that yields no rows at all is a reader failure, not an empty month. Say so and
+    # stop, rather than half-writing the warehouse.
+    empty = [os.path.basename(p_) for p_, n_ in read_counts.items() if n_ == 0]
+    if empty:
+        raise SystemExit(
+            "[sales] ABORT — these files produced ZERO rows, so the aggregate would be "
+            "incomplete:\n  " + "\n  ".join(empty) +
+            "\n\nNothing was written. A .xlsb file reading empty usually means pyxlsb is "
+            "not installed (pip install pyxlsb). Fix the reader and re-run; do NOT ship "
+            "these aggregates, because they silently drop whole months.")
+
     os.makedirs(KPI, exist_ok=True)
     pd.DataFrame([{"patient": k, **v} for k, v in tot.items()]).to_parquet(os.path.join(KPI, "sales_totals.parquet"), index=False)
     pd.DataFrame([{"patient": k[0], "month": k[1], **v} for k, v in month.items()]).to_parquet(os.path.join(KPI, "sales_monthly.parquet"), index=False)
@@ -221,6 +252,11 @@ def run():
     pd.DataFrame([{"material": k, "desc": matdesc.get(k, k), "group": grp.get(k, ""), **v} for k, v in mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material.parquet"), index=False)
     pd.DataFrame([{"manufacturer": k[0], "material": k[1], "desc": matdesc.get(k[1], k[1]), "group": grp.get(k[1], ""), **v} for k, v in mfr_mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material_mfr.parquet"), index=False)
     pd.DataFrame([{"hospital": k[0], "material": k[1], "desc": matdesc.get(k[1], k[1]), "group": grp.get(k[1], ""), **v} for k, v in hosp_mat.items()]).to_parquet(os.path.join(KPI, "sales_by_material_hospital.parquet"), index=False)
+    # material x month. `period` is named to match every other month-grained table so it
+    # sorts chronologically ('2025-12' < '2026-01') rather than by calendar month number.
+    pd.DataFrame([{"material": k[0], "period": k[1], "desc": matdesc.get(k[0], k[0]),
+                   "group": grp.get(k[0], ""), **v} for k, v in mat_month.items()]
+                 ).to_parquet(os.path.join(KPI, "sales_by_material_month.parquet"), index=False)
     print(f"[sales] wrote mfr_mat={len(mfr_mat):,} hosp_mat={len(hosp_mat):,} pairs", flush=True)
 
     grand = sum(v["revenue"] for v in tot.values())

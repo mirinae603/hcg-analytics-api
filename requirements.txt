@@ -22,6 +22,10 @@ sqlalchemy>=2.0
 # lost on every restart, deploy or scale event, and a second replica would get its own
 # separate file. ~4 MB in the image, and it makes the documented escape hatch real.
 psycopg[binary]>=3.1
+# Reader for .xlsb sales extracts. It was an OPTIONAL import, and with it missing the ETL
+# silently skipped four months of OP billing and overwrote the aggregates with ₹492.40 Cr
+# where ₹521.67 Cr belonged. Not optional.
+pyxlsb>=1.0.10
 passlib[bcrypt]
 # Pinned: passlib 1.7.4's bcrypt backend hard-crashes on bcrypt>=4.1 (removed the
 # `__about__` shim passlib probes, and changed long-password handling). 4.0.1 is the
