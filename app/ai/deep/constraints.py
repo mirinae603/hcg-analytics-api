@@ -185,7 +185,8 @@ def check(question: str, sql: str) -> str | None:
     if not sql or _NOT_SQL.match(sql) or not re.search(r"\bSELECT\b", sql, re.I):
         return None
     bad = violations(question, sql)
-    for extra in (wrong_time_ordering(sql), misleading_alias(sql)):
+    for extra in (wrong_time_ordering(sql), misleading_alias(sql),
+                  under_aggregated_trend(question, sql)):
         if extra:
             bad = bad + [extra]
     if not bad:
@@ -215,6 +216,30 @@ def _family_of(name: str) -> str | None:
         if re.search(pat, name or "", re.I):
             return fam
     return None
+
+
+_TREND_COL = re.compile(r"\b(period|month|month_num|posting_date)\b", re.I)
+_AGGREGATED = re.compile(r"\b(SUM|AVG|COUNT|MIN|MAX)\s*\(|\bGROUP\s+BY\b", re.I)
+
+
+def under_aggregated_trend(question: str, sql: str) -> str | None:
+    """A per-period series that never groups, so a period can appear more than once.
+
+    `SELECT period, revenue FROM sales_by_material_month WHERE material_desc = '…'` returns
+    TWO rows for December when two material codes share that description, and the answer
+    read "December 2025: ₹9.29 Cr + ₹38.97 L" — a sum the reader is left to do, in mixed
+    units. A trend has exactly one value per period or it is not a trend.
+    """
+    if not sql or not question:
+        return None
+    if not re.search(r"\btrend\b|\bover time\b|\bmonth(ly|-on-month)?\b", question, re.I):
+        return None
+    if not _TREND_COL.search(sql) or _AGGREGATED.search(sql):
+        return None
+    return ("UNDER-AGGREGATED TREND — this selects a measure per period without SUM and "
+            "without GROUP BY, so any period with more than one matching row appears twice "
+            "and the reader is handed two numbers to add. Group by the period column and "
+            "SUM the measure, so each period has exactly one value.")
 
 
 def misleading_alias(sql: str) -> str | None:

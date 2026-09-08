@@ -80,3 +80,21 @@ def test_a_month_derived_from_a_real_date_is_allowed(sql):
     # the first version of this rule blocked these on sight of the word "month", leaving the
     # engine with no usable query at all and an answer of "no conclusions can be drawn"
     assert wrong_time_ordering(sql) is None
+
+
+def test_a_trend_must_have_one_value_per_period():
+    # "SELECT period, revenue FROM sales_by_material_month WHERE material_desc = '…'"
+    # returns TWO rows for December when two material codes share that description, and the
+    # answer read "December 2025: ₹9.29 Cr + ₹38.97 L" — a sum left to the reader, in mixed
+    # units. A trend has exactly one value per period or it is not a trend.
+    from app.ai.deep.constraints import under_aggregated_trend as u
+    q = "get me the sales trend of keytruda"
+    assert u(q, "SELECT period, revenue FROM sales_by_material_month "
+                "WHERE material_desc='X' ORDER BY period")
+    assert u(q, "SELECT period, SUM(revenue) FROM sales_by_material_month "
+                "WHERE material_desc='X' GROUP BY 1 ORDER BY 1") is None
+
+
+def test_a_non_trend_question_is_not_forced_to_group():
+    from app.ai.deep.constraints import under_aggregated_trend as u
+    assert u("what is total revenue", "SELECT period, revenue FROM t") is None
