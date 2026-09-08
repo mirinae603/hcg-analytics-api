@@ -175,15 +175,6 @@ def build_stock_change(grn: pd.DataFrame, cons: pd.DataFrame, dim_material: pd.D
 # PROCUREMENT
 # --------------------------------------------------------------------------- #
 def build_procurement_kpis(po: pd.DataFrame, dim_material: pd.DataFrame):
-    # OPERATIONAL POs only. The Capex / "Dom Capital PO" sheets were never ingested at all
-    # until now — 645 lines, ₹76.76 Cr — and pulling them in unfiltered would move the
-    # headline procurement figure from ₹649.91 Cr to ₹726.67 Cr, changing every dashboard
-    # number the client has already reviewed. Capital equipment is a different kind of
-    # purchase from consumables, so the KPIs keep their existing scope; the rows are in
-    # fact_po, tagged, so "including capex" is now a question that can be ASKED rather than
-    # a decision made silently by a missing sheet read.
-    if "po_type" in po.columns:
-        po = po[po["po_type"] == "operational"].copy()
     po = po.copy()
     po["category"] = po["major_group"].replace({"nan": np.nan}).fillna("Uncategorized")
 
@@ -262,12 +253,6 @@ def build_consumption_kpis(cons: pd.DataFrame, dim_material: pd.DataFrame, dim_c
 # ADDITIONAL: cycle time, lead time, fill rate
 # --------------------------------------------------------------------------- #
 def build_additional_kpis(grn: pd.DataFrame, po: pd.DataFrame):
-    # Same operational-only scope as build_procurement_kpis and drill_sources. Fill rate is
-    # ordered-vs-open quantity on CONSUMABLE purchase orders; a capital equipment PO sitting
-    # open for a quarter is not a stores fulfilment problem, and mixing it in moved the
-    # per-plant rate without anything saying why.
-    if "po_type" in po.columns:
-        po = po[po["po_type"] == "operational"].copy()
     # Clip invalid lead-time anomalies: negative (GR before PO = data error) and
     # implausible outliers (> 365 days). Keeps cycle/lead-time KPIs trustworthy.
     grn = grn.copy()

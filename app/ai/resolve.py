@@ -269,10 +269,11 @@ _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
      "values are FORMULARY (4,024), NON FORMULARY (7,090), OUT OF FORMULARY (3,504), "
      "UNSPECIFIED (10,313)."),
     (r"\bcapex\b|\bcapital\b|\bequipment purchase",
-     "Capital purchases live in fact_po with po_type = 'capex' (645 lines, ₹76.76 Cr). "
-     "They are DELIBERATELY excluded from every procurement KPI, which covers po_type = "
-     "'operational' only (₹649.91 Cr) — so the dashboard figure and a capex figure are "
-     "different scopes, not a discrepancy. Say which scope you are reporting."),
+     "Capital purchases are identified by doc_type — 'Dom Capital PO', 'Imp capital PO', "
+     "'Service PO', 'CMC', 'AMC' — NOT by a separate table. They are already inside the "
+     "₹649.91 Cr procurement total (Dom Capital PO alone is 1,086 lines, ₹121.75 Cr), so a "
+     "capex figure is a SUBSET of procurement, never an addition to it. Say which doc_types "
+     "you counted."),
     (r"\bgeneric\b|\bmolecule\b|\bsalt\b",
      "The molecule is dim_material.minor_group_desc (3,237 values) or generic_name; "
      "major_group_desc is the therapeutic CLASS, not the molecule."),

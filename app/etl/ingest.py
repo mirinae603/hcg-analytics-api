@@ -194,25 +194,26 @@ def load_po() -> pd.DataFrame:
         raise FileNotFoundError(f"No PO files under {RAW / DIR_PO}")
     frames = []
     for f in files:
-        # EVERY sheet, not just the first. pd.read_excel() with no sheet_name reads sheet 0,
-        # and three of these workbooks carry a SECOND sheet — "Capex", "Capex PO",
-        # "Dom Capital PO" — with the identical 43-column schema. 645 purchase-order lines
-        # worth Rs 76.76 Cr were dropped on the floor, silently, because nobody looked past
-        # the first tab. The sheet name is kept as `po_type` so capital purchases can be
-        # excluded deliberately rather than by accident.
-        for sheet_name, d in pd.read_excel(f, engine="openpyxl", sheet_name=None).items():
-            if d.empty:
-                continue
-            d = _norm_headers(d)
-            if "Material" not in d.columns:      # a summary tab, not PO lines
-                continue
-            d["po_type"] = ("capex" if re.search(r"capex|capital", str(sheet_name), re.I)
-                            else "operational")
-            frames.append(d)
+        # SHEET 0 ONLY — and that is correct, however wrong it looks.
+        #
+        # Three of these workbooks carry a second sheet ("Capex", "Capex PO", "Dom Capital
+        # PO") holding 645 lines worth ₹76.76 Cr in the identical 43-column schema, which
+        # reads exactly like data being dropped on the floor. It is not. Every one of those
+        # 645 rows has an EXACT twin in the main sheet — same po_no, material, quantity and
+        # value — and all 486 distinct PO numbers already appear there. The tabs are a
+        # convenience view the analyst made of capital POs that are already in the extract.
+        #
+        # Ingesting them inflates procurement from ₹649.91 Cr to ₹726.67 Cr, an 11.8%
+        # double-count, and `Dom Capital PO` would then be counted once on the main sheet
+        # (1,086 lines, ₹121.75 Cr) and twice on the tab. Verified by set difference:
+        # capex EXCEPT operational on (po_no, material, po_qty, value) returns ZERO rows.
+        # tests/test_source_completeness.py pins this so the next person who notices the
+        # unread tab does not "fix" it either.
+        d = _norm_headers(pd.read_excel(f, engine="openpyxl"))
+        frames.append(d)
     df = pd.concat(frames, ignore_index=True)
 
     out = pd.DataFrame({
-        "po_type": df["po_type"].astype(str),
         "plant": df["Plant"].astype(str).str.strip(),
         "plant_name": df["Plant Name"].astype(str).str.strip(),
         "sloc": df["Storage Location"].astype(str).str.strip(),
@@ -237,4 +238,5 @@ def load_po() -> pd.DataFrame:
     out = out[out["material"].str.lower() != "nan"].copy()
     print(f"[ingest] po: {len(out):,} rows from {len(files)} files")
     return out
+
 

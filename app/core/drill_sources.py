@@ -107,12 +107,6 @@ def po_grain() -> pd.DataFrame:
     grouping this frame the same way reproduces any of them exactly.
     """
     po = da.load("fact_po")               # `category` = derived material category
-    # OPERATIONAL only, matching build_procurement_kpis. fact_po gained 645 capital-purchase
-    # lines (₹76.76 Cr) that had never been ingested — three PO workbooks keep them on a
-    # second sheet nobody read. Every procurement aggregate rebuilt here must use the same
-    # scope as the KPI it reproduces, or the drill-downs stop summing back to the card.
-    if "po_type" in po.columns:
-        po = po[po["po_type"] == "operational"]
     po = po.assign(
         po_category=po["major_group"].replace({"nan": np.nan}).fillna("Uncategorized"),
         material_group=_group_of(po["material"]),
