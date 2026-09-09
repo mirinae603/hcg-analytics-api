@@ -171,6 +171,17 @@ def load_grn() -> pd.DataFrame:
         "net_price": _to_num(df["     Net Price"]) if "     Net Price" in df.columns else _to_num(df.get("Net Price")),
         "unit_mrp": _to_num(df["      Unit MRP"]) if "      Unit MRP" in df.columns else _to_num(df.get("Unit MRP")),
         "total_amount_wo_tax": _to_num(df.get("Total Amount without tax")),
+        # TAX, DISCOUNT and MRP — dense (96-99% non-zero) and unanswerable until now.
+        # "What did we pay in GST", "which items carry a discount", "what is our margin at
+        # receipt" all failed because these columns were never read off the sheet.
+        # Deliberately NOT added: Selling Price and Free Qty (100% filled, 100% ZERO),
+        # Formulary (all zero here; the real one is on dim_material), and PR No / PR Date /
+        # PO TAT (4-6% filled — a requisition-cycle answer from 6% of rows would mislead).
+        "tax_pct": _to_num(df.get("Tax %")),
+        "tax_amount": _to_num(df.get("Tax Amount")),
+        "total_amount_with_tax": _to_num(df.get("Total Amount with Tax")),
+        "discount_value": _to_num(df.get("Discount Value")),
+        "total_mrp_value": _to_num(df.get("Total MRP Value w/o free")),
         "po_to_gr_tat": _to_num(df["PO to GR TAT"]),
         "pr_to_gr_tat": _to_num(df["PR to GR TAT"]),
         "major_group": df.get("Major Group", pd.Series([np.nan] * len(df))).astype(str).str.strip(),
@@ -228,6 +239,11 @@ def load_po() -> pd.DataFrame:
         "net_price": _to_num(df["Net Price"]),
         "total_value_wo_tax": _to_num(df["Total value without Tax"]),
         "total_value_tax": _to_num(df.get("Total value with Tax")),
+        # The GST split. `total_value_wo_tax` (the procurement KPI's basis) is EX-tax by
+        # definition; without these there was no way to answer a tax question at all.
+        "cgst_value": _to_num(df.get("CGST Value")),
+        "sgst_value": _to_num(df.get("SGST Value")),
+        "igst_value": _to_num(df.get("IGST Value")),
         "major_group": df.get("Major Group", pd.Series([np.nan] * len(df))).astype(str).str.strip(),
         "minor_group": df.get("Minor Group", pd.Series([np.nan] * len(df))).astype(str).str.strip(),
     })

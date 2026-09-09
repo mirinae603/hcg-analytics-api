@@ -205,6 +205,12 @@ _MEASURE_NOTES: dict[str, str] = {
                "because a percentage on a tiny base is noise, rank margins only above an "
                "explicit revenue floor and SAY what floor you used: -40.1% on \u20b92,927 of "
                "revenue is a rounding error wearing the clothes of a finding."),
+    "purchasing": ("Procurement spend is EX-TAX. The ₹649.91 Cr figure every dashboard "
+                   "shows is fact_po.total_value_wo_tax; GST sits beside it in cgst_value / "
+                   "sgst_value / igst_value (₹48.79 Cr) and fact_grn carries "
+                   "total_amount_with_tax on the receipt side. Do NOT report a with-tax "
+                   "column as procurement spend, and never add tax to the ex-tax total "
+                   "unless the question asks for the inclusive figure."),
     "price":  ("Price compared across items must be per-unit. Summing price across rows is "
                "meaningless — it adds rates, not amounts."),
     # A CALLABLE, not a string. The counts here are facts about the data, and writing them
@@ -268,6 +274,19 @@ _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
      "drops 123 items and a GROUP BY returns eleven buckets for three things. The clean "
      "values are FORMULARY (4,024), NON FORMULARY (7,090), OUT OF FORMULARY (3,504), "
      "UNSPECIFIED (10,313)."),
+    (r"\btax\b|\bgst\b|\bcgst\b|\bsgst\b|\bigst\b|\bduty\b",
+     "Tax is SEPARATE from spend. Procurement spend is EX-TAX by definition — the ₹649.91 Cr "
+     "figure is fact_po.total_value_wo_tax — and GST sits beside it in cgst_value / "
+     "sgst_value / igst_value (₹48.79 Cr, 7.5%). fact_grn carries tax_amount, tax_pct and "
+     "total_amount_with_tax on the receipt side. NEVER add tax to the spend figure or report "
+     "total_amount_with_tax as procurement spend; say which basis you used."),
+    (r"\bdiscounts?\b|\brebates?\b",
+     "Discounts are fact_grn.discount_value — ₹0.15 Cr in total, non-zero on under 4% of "
+     "receipt lines. Report the covered share, not an average across all lines."),
+    (r"\bmrp\b|\bretail price\b|\bmargin at receipt\b",
+     "fact_grn.total_mrp_value (₹1,777.65 Cr) is the RETAIL value of goods received, not "
+     "revenue and not spend — it is roughly 3.5x the ₹506.68 Cr received at cost. Never "
+     "quote it as sales."),
     (r"\bcapex\b|\bcapital\b|\bequipment purchase",
      "Capital purchases are identified by doc_type — 'Dom Capital PO', 'Imp capital PO', "
      "'Service PO', 'CMC', 'AMC' — NOT by a separate table. They are already inside the "
@@ -609,8 +628,12 @@ def brief(question: str) -> str:
         r"\b(period|window|range|cover|covers|coverage|timeframe|time frame|history)\b",
         question or "", re.I))
     typos = spelling_suggestions(question, r)
+    # A keyword note may be the ONLY thing a question needs. "How much GST did we pay?"
+    # resolves no entity, no measure and no grain, so the brief returned empty and the tax
+    # guidance — the note that stops tax being added to spend — never reached the model.
+    kw_hits = [n for pat, n in _KEYWORD_NOTES if re.search(pat, question or "", re.I)]
     if not (r["entities"] or r["families"] or r["cities"] or r["measures"] or r["grains"]
-            or asks_about_time or typos):
+            or asks_about_time or typos or kw_hits):
         return ""
     lines = ["WHAT THIS QUESTION IS ABOUT (resolved against the actual dimension values — "
              "use these exact columns, do not guess where a name lives):"]

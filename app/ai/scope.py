@@ -113,6 +113,22 @@ def sql_literals(sql: str) -> list[str]:
     return out
 
 
+
+@lru_cache(maxsize=64)
+def _codes_for_city(name: str) -> tuple[str, ...]:
+    """Plant codes a city resolves to, so a code-filtered query counts as scoped."""
+    try:
+        from app.ai import resolve as _resolve
+        r = _resolve.resolve(str(name or ""))
+    except Exception:
+        return ()
+    out = []
+    for c in r.get("cities", []):
+        for site in r.get("city_hospitals", {}).get(c, []) or []:
+            out.append(site.split(" ")[0])
+    return tuple(out)
+
+
 def missing_entity_scope(sql: str, entities: list[str]) -> str | None:
     """A query run after an entity was resolved must actually mention that entity.
 
@@ -123,13 +139,24 @@ def missing_entity_scope(sql: str, entities: list[str]) -> str | None:
     """
     if not entities:
         return None
-    hay = _norm(sql)
+    # STRIP ALIASES FIRST. The check was satisfiable by NAMING the entity rather than
+    # filtering on it: `SELECT SUM(total_value_wo_tax) AS bangalore_hospital_procurement
+    # FROM fact_po` contains "bangalore", passes, and returns the whole network's ₹649.91 Cr
+    # as one city's spend. An alias is a label the model chose, not evidence of a filter.
+    body = re.sub(r"\bAS\s+[\"'`\[]?[A-Za-z_][\w]*[\"'`\]]?", " ", sql or "", flags=re.I)
+    hay = _norm(body)
     if not hay:
         return None
+    # A CITY is satisfied by its plant CODES, which is how it must actually be filtered —
+    # city names live only in dim_plant. Requiring the literal word inverted the guard:
+    # the correctly-coded query was blocked and the alias-only one waved through.
     for e in entities:
         token = _norm(e)
         if token and len(token) >= 3 and token in hay:
             return None
+        for code in _codes_for_city(e):
+            if _norm(code) in hay:
+                return None
     shown = ", ".join(sorted({e for e in entities if e})[:4])
     return (
         f"This query is not scoped to the item the question is about ({shown}) — none of its "
