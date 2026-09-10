@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from app.ai import charts, resolve as resolver, scope, warehouse
-from app.ai.deep import answer_gate, capability, llm, sanity, schemas, shapes, tools
+from app.ai.deep import answer_gate, verifier, capability, llm, sanity, schemas, shapes, tools
 
 MAX_SUBQUESTIONS = 6
 MAX_ROUNDS = 2          # investigate → critique → (one more investigate) → stop
@@ -1118,7 +1118,12 @@ def _answer_once(query: str, history: list | None = None):
             if alt.get("row_count"):
                 a, b = _num_tokens(_compact(primary["res"], 8)), _num_tokens(_compact(alt, 8))
                 agreed = bool(a & b)
-                corroborations.append({"agreed": agreed, "sql": alt_sql, "rows": _compact(alt, 8)})
+                # Keep the raw figures, not just the boolean. `agreed` is any-shared-token,
+                # which a year or a rank satisfies by accident; verifier.compare() reads the
+                # magnitudes off these and can tell a real second derivation from a
+                # coincidence. Recorded on every run so the signal can be scored offline.
+                corroborations.append({"agreed": agreed, "sql": alt_sql, "rows": _compact(alt, 8),
+                                       "nums": [sorted(a), sorted(b)]})
                 queries.append({"purpose": "independent re-derivation", "sql": alt_sql,
                                 "rows": alt["row_count"]})
                 yield {"type": "sql", "purpose": "independent re-derivation", "sql": alt_sql,
@@ -1439,6 +1444,10 @@ def _answer_once(query: str, history: list | None = None):
 
     verified = "flagged" if crit.get("refuted") else (
         "ok" if any(c["agreed"] for c in corroborations) else None)
+    # The content verdict, computed on every run and reported, but NOT yet allowed to change
+    # an answer. It earns that only once its precision is measured on the full bank — the
+    # last signal that skipped this step cost three points.
+    agreement = verifier.verdict([c["nums"] for c in corroborations if c.get("nums")])
     # THE EXIT GATE. Every other guard inspects SQL and therefore only covers the routes
     # that produce SQL — the canonical KPI path produces none, the give-up path runs no
     # query at all, and each fix covered one more route while the next new route bypassed
@@ -1471,7 +1480,7 @@ def _answer_once(query: str, history: list | None = None):
     if gate:
         verified = "flagged"
     final = {"type": "answer", "text": prose, "verified": verified, "options": [],
-             "gate": gate or None,
+             "gate": gate or None, "agreement": agreement,
              "scope": f"deep · {len(findings)} lines of enquiry, {len(queries)} queries"}
     # NO RETRY HERE, AND THAT IS A MEASURED DECISION.
     #
