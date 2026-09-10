@@ -86,6 +86,46 @@ def profile(entity_family: str | None = None) -> dict:
     return {"tables": by_entity, "tables_with_time": with_time}
 
 
+def ontology_context(limit: int = 8) -> str:
+    """What the ontology knows that a column list cannot say.
+
+    The schema brief lists tables and columns. It cannot say that two of those columns are
+    the same business thing in different code systems, or that a measure must never be
+    summed — and those are the misunderstandings that produce confident wrong answers. On
+    the OMG P&C benchmark, supplying exactly this kind of context moved GPT-4 from 16% to
+    54% before any query checking was added.
+    """
+    from app.ai import ontology
+    ont = ontology.load()
+    if not ont.get("columns"):
+        return ""
+    lines = []
+    disjoint = ont.get("disjoint") or []
+    if disjoint:
+        lines.append("COLUMNS THAT LOOK JOINABLE AND ARE NOT (measured value overlap):")
+        # ONE REPRESENTATIVE PER DISTINCT TRAP. Nine near-identical `category` pairs crowded
+        # out the hospital one, which is the trap that actually produces wrong answers —
+        # dim_plant.plant and sales_by_hospital.hospital. A context block is only useful if
+        # the important line is in it.
+        seen: set = set()
+        for d in sorted(disjoint, key=lambda x: (not x.get("entity"), x.get("column", ""))):
+            other = d.get("other", d["column"])
+            kind = (d.get("entity") or d["column"], d["column"], other)
+            if kind in seen:
+                continue
+            seen.add(kind)
+            lines.append(f"  {d['a']}.{d['column']} and {d['b']}.{other} share "
+                         f"{d['overlap']:.0%} of their values — different code systems, "
+                         f"never join them.")
+            if len(seen) >= limit:
+                break
+    na = ontology.non_additive()
+    if na:
+        lines.append("NEVER SUM these — rates, prices and pre-computed averages:")
+        lines.append("  " + ", ".join(na[:14]))
+    return "\n".join(lines)
+
+
 def brief(entity_family: str | None = None, max_tables: int = 200) -> str:
     """The plan-ready description of the answerable surface — ALL of it.
 

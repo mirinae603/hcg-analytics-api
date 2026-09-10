@@ -825,7 +825,8 @@ def answer(query: str, history: list | None = None):
             "Call finish() with the SQL that produced your answer, or give_up() once you have "
             "actually checked and the data cannot answer it.\n\n"
             "SCHEMA (a starting map — verify with describe_table, never trust it over what the "
-            "tools return):\n" + cap_brief)
+            "tools return):\n" + cap_brief
+            + ("\n\n" + capability.ontology_context() if capability.ontology_context() else ""))
 
         with lesson_lock:
             known = list(lessons)

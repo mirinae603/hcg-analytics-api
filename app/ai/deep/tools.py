@@ -203,6 +203,14 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
     unmet = _constraints.check(question, sql)
     if unmet:
         return {"error": unmet}
+    # Checks DERIVED from the ontology rather than typed: non-additive measures, joins
+    # between columns measured as sharing no values, and columns whose name means different
+    # things in different tables. Rename a column and these follow, because the ontology is
+    # rebuilt from the warehouse.
+    from app.ai.deep import ontology_checks as _onto
+    violation = _onto.check(sql)
+    if violation:
+        return {"error": violation}
     # SUM() over zero matching rows returns ONE row containing NULL, which looks like a
     # result and is not: "SELECT SUM(revenue) FROM sales_by_manufacturer WHERE manufacturer
     # = 'MSD'" matched nothing (the value is stored 'Msd') and the answer became "there is

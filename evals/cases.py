@@ -145,15 +145,18 @@ L1: list[dict] = [
                      any_of("rose", "fell", "flat", "stable", "declin", "increas", "grew", "%")),
      "why": "Dec 89.52 → May 87.93 Cr; must state a direction, not 'varies'", "must_answer": True},
 
+    # This case USED to require a refusal, because no table held sales at material x month.
+    # That was true of the warehouse and never of the data: every raw billing row carries
+    # SALESDATE and MATERIALCODE, and sales_by_material_month now exists. The question is a
+    # plain query, so the check asks for the real series — and still bans the company-wide
+    # monthly totals, which is the wrong answer it used to give.
     {"id": "keytruda-trend", "q": 'Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"',
      "check": all_of(
-         any_of("purchas", "consumption", "no monthly sales", "no sales figure",
-                "not available", "no real trend", "does not hold", "doesn't hold",
-                "no time-series", "not contain time-series", "no time series",
-                "isn't answerable", "not answerable", "no monthly"),
-         lacks("89.52", "90.90")),   # the ALL-material monthly totals
-     "why": "no material-by-month sales grain: substitute and SAY SO, or refuse — never "
-            "report company-wide monthly revenue as this item's"},
+         any_of("9.68", "9.29", "7.92"),          # its own monthly figures
+         any_of("december", "dec 2025", "2025-12"),
+         lacks("89.52", "90.90")),                # the ALL-material monthly totals
+     "why": "Dec 2025 ₹9.68 Cr → May 2026 ₹7.92 Cr from sales_by_material_month — its own "
+            "series, never the company-wide monthly total"},
 
     # ── traps: wrong entity type, false absence ──────────────────────────────
     {"id": "msd-procurement", "q": "Show me the procurement history for MSD products",

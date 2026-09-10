@@ -1066,9 +1066,11 @@ def answer(query: str, history: list | None = None):
                 # query. ₹649.57 Cr of Bangalore procurement — against ₹478.27 Cr that
                 # exists — was a JOIN fan-out that read as a perfectly ordinary figure.
                 from app.ai.deep import constraints as _constraints
+                from app.ai.deep import ontology_checks as _onto
                 _bad = (_sanity.part_exceeds_whole(sql, res)
                         or _sanity.placeholder_won_a_ranking(sql, res, query)
-                        or _constraints.check(query, sql))
+                        or _constraints.check(query, sql)
+                        or _onto.check(sql))
                 if _bad:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
                                      "content": json.dumps({"error": _bad})})

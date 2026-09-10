@@ -90,3 +90,36 @@ def test_a_column_named_like_a_rate_cannot_claim_to_be_additive():
     clean, _ = o.verify(
         {"columns": {"t.margin_pct": {"role": "measure", "additive": True}}, "tables": {}}, prof)
     assert clean["columns"]["t.margin_pct"]["additive"] is False
+
+
+def test_every_column_is_classified():
+    """Coverage is a property of the build, not a hope.
+
+    The model silently omits columns from its JSON. On one run it dropped
+    `sales_by_hospital.hospital` — one half of the worst trap in this warehouse — so the
+    ontology found nothing and looked clean while being blind. The build now chases the gaps
+    until they close.
+    """
+    assert not ONT.get("unclassified"), ONT.get("unclassified", [])[:8]
+
+
+def test_the_hospital_trap_survives_a_rebuild():
+    # it disappeared twice: once to an over-strict shape filter, once to a dropped column
+    pairs = [(d["a"], d["b"]) for d in ONT["disjoint"]]
+    assert any({"dim_plant", "sales_by_hospital"} <= {a, b} for a, b in pairs)
+
+
+def test_a_code_and_a_name_are_not_reported_as_rival_code_systems():
+    # vendor_code and vendor_name identify the same vendor and share no values because one
+    # is a number and the other is words. Calling that a code-system mismatch tells the
+    # model never to join two columns it should.
+    for d in ONT["disjoint"]:
+        cols = {d.get("column"), d.get("other")}
+        assert cols != {"vendor_code", "vendor_name"}, d
+
+
+def test_a_plain_money_column_is_never_marked_unsummable():
+    # the classifier called consumption_all.cost non-additive, which would have blocked
+    # SUM(cost) — a correct query. A false "never sum this" refuses work that was right.
+    assert "consumption_all.cost" not in __import__(
+        "app.ai.ontology", fromlist=["x"]).non_additive()

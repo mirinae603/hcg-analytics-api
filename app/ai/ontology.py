@@ -139,6 +139,33 @@ def joinability(column: str, a: str, b: str) -> float:
     return overlap(column, a, column, b)
 
 
+
+def _is_code_like(values: list[str]) -> bool:
+    """Is this a CODE rather than a name or a description?
+
+    The distinction that matters is code-vs-name, not the exact character mix. 'HC05' and
+    'GJHCA' are both site codes — one has digits, one does not — and they share zero values,
+    which is the single worst trap in this warehouse. A first attempt compared digit ratios
+    and threw that pair away as "different shapes". Meanwhile 'Vardhman Health Specialities'
+    is a NAME: long, spaced, and not a rival code system for vendor_code at all.
+    """
+    vals = [v for v in values if v][:8]
+    if not vals:
+        return False
+    lens = sorted(len(v) for v in vals)
+    median = lens[len(lens) // 2]
+    spaced = sum(1 for v in vals if " " in v) / len(vals)
+    return median <= 12 and spaced < 0.4
+
+
+def _same_shape(ta: str, ca: str, tb: str, cb: str) -> bool:
+    """Two identifier columns of the same KIND — both codes, or both names."""
+    pa, pb = profile_column(ta, ca), profile_column(tb, cb)
+    if not pa or not pb:
+        return False
+    return _is_code_like(pa.get("samples") or []) == _is_code_like(pb.get("samples") or [])
+
+
 def profile() -> dict:
     """The deterministic skeleton: every table, every column, plus real join evidence."""
     c = _con()
@@ -230,10 +257,20 @@ def verify(ont: dict, prof: dict) -> tuple[dict, list[str]]:
             rejected.append(f"{key}: called an identifier but has {p.get('distinct')} values")
             continue
         # additivity is checkable: a rate or pre-averaged column must not claim it
-        if spec.get("additive") and re.search(r"(_pct|percent|_rate|avg_|_avg|median|price|share)",
-                                              p["column"], re.I):
+        _rate_like = re.search(r"(_pct|percent|_rate|avg_|_avg|median|price|share|score|"
+                               r"days|months|ratio|tat)", p["column"], re.I)
+        if spec.get("additive") and _rate_like:
             spec = {**spec, "additive": False}
             rejected.append(f"{key}: additive=false forced (name says it is a rate/average)")
+        # …and the reverse. The classifier called consumption_all.cost non-additive, which
+        # would have blocked SUM(cost) — a correct query on a plain currency amount. A false
+        # "never sum this" is worse than the hand-written list it replaces, because it
+        # refuses work that was right. Money and quantity ARE additive unless the name says
+        # otherwise, and the model does not get a vote on that.
+        if (role == "measure" and not spec.get("additive", True) and not _rate_like
+                and str(spec.get("unit", "")).lower() in ("currency", "quantity", "count")):
+            spec = {**spec, "additive": True}
+            rejected.append(f"{key}: additive=true restored (a plain {spec.get('unit')} amount)")
         clean_cols[key] = {**spec, "profile": {k: p.get(k) for k in
                                                ("type", "distinct", "null_pct", "samples",
                                                 "all_zero", "uniqueness")}}
@@ -268,6 +305,13 @@ def verify(ont: dict, prof: dict) -> tuple[dict, list[str]]:
             for tb, cb in sorted(members)[i + 1:]:
                 if ta == tb or (ca == cb):
                     continue                      # same table, or already name-matched
+                # Only compare LIKE WITH LIKE. `vendor_code` and `vendor_name` identify the
+                # same vendor and share no values because one is a number and the other is
+                # words — that is not a code-system mismatch, and calling it one tells the
+                # model never to join two columns it should. The real trap is two columns of
+                # the SAME SHAPE that still share nothing: 'HC05' and 'GJHCA'.
+                if not _same_shape(ta, ca, tb, cb):
+                    continue
                 ov = overlap(ca, ta, cb, tb)
                 cross.append({"column": ca, "other": cb, "a": ta, "b": tb,
                               "entity": ent, "overlap": ov,
@@ -304,7 +348,35 @@ def build(save: bool = True) -> dict:
         merged["tables"].update(got.get("tables") or {})
         print(f"  classified {min(i + 6, len(names))}/{len(names)} tables", flush=True)
 
+    # COVERAGE IS NOT OPTIONAL. The model silently omits columns from its JSON — on one run
+    # it dropped `sales_by_hospital.hospital`, which is one half of the single worst trap in
+    # this warehouse, so the ontology "found" nothing and looked clean while being blind.
+    # Chase the gaps until they close; a partial ontology that does not say it is partial is
+    # the same failure mode as every other silent omission in this codebase.
+    all_cols = {f"{p_['table']}.{p_['column']}"
+                for cols in prof["tables"].values() for p_ in cols}
+    for attempt in range(4):
+        missing = sorted(all_cols - set(merged["columns"]))
+        if not missing:
+            break
+        print(f"  filling {len(missing)} unclassified columns (pass {attempt + 1})", flush=True)
+        by_table: dict = {}
+        for key in missing:
+            t = key.split(".", 1)[0]
+            by_table.setdefault(t, []).append(
+                next(x for x in prof["tables"][t] if f"{t}.{x['column']}" == key))
+        names_m = sorted(by_table)
+        for i in range(0, len(names_m), 6):
+            chunk = {t: by_table[t] for t in names_m[i:i + 6]}
+            got = _classify({"tables": chunk}, cl)
+            merged["columns"].update(got.get("columns") or {})
+            merged["tables"].update(got.get("tables") or {})
+    still = sorted(all_cols - set(merged["columns"]))
+
     ont, rejected = verify(merged, prof)
+    if still:
+        rejected.append(f"{len(still)} columns could not be classified after 4 passes")
+    ont["unclassified"] = still
     ont["rejected"] = rejected
     if save:
         os.makedirs(os.path.dirname(_CACHE), exist_ok=True)
