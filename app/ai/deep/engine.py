@@ -514,8 +514,24 @@ def _num_tokens(text: str) -> set[str]:
 
 # ── the loop ─────────────────────────────────────────────────────────────────
 def answer(query: str, history: list | None = None):
-    """Same generator contract as orchestrator.answer, so chat_service can swap paths
-    with a single branch and the frontend needs no new event vocabulary."""
+    """One question, answered — retried once if the engine says it had a bad run.
+
+    A three-run measurement of the whole bank found that NOT ONE case fails all three times.
+    Every question is answered correctly sometimes, so the residual error is variance
+    between runs, not missing knowledge. That is only fixable if a bad run can be RECOGNISED,
+    and it can: the failing run in a six-case probe came back `flagged`, from the critic, the
+    corroborator or the answer gate.
+
+    Flagged also fires on runs that were fine — but for a retry that asymmetry is the right
+    way round. A false alarm costs a second attempt; a missed one costs a wrong answer. So a
+    flagged answer is re-run once and the UNFLAGGED result preferred, with no judgement about
+    content: if the second attempt is clean it wins, if both are flagged the first stands.
+    """
+    yield from _answer_once(query, history, retry_allowed=True)
+
+
+def _answer_once(query: str, history: list | None = None, retry_allowed: bool = False):
+    """The pipeline itself. Same generator contract as orchestrator.answer."""
     if not llm.has_key():
         yield {"type": "answer", "text": "Deep analysis needs AZURE_OPENAI_API_KEY to be set.",
                "verified": None, "options": []}
@@ -1447,7 +1463,24 @@ def answer(query: str, history: list | None = None):
             pass
     if gate:
         verified = "flagged"
-    yield {"type": "answer", "text": prose, "verified": verified, "options": [],
-           "gate": gate or None,
-           "scope": f"deep · {len(findings)} lines of enquiry, {len(queries)} queries"}
+    final = {"type": "answer", "text": prose, "verified": verified, "options": [],
+             "gate": gate or None,
+             "scope": f"deep · {len(findings)} lines of enquiry, {len(queries)} queries"}
+    if retry_allowed and verified == "flagged":
+        yield {"type": "step", "text": "That run flagged itself — answering it again"}
+        second, saw_answer = [], None
+        try:
+            for ev in _answer_once(query, history, retry_allowed=False):
+                if ev.get("type") == "answer":
+                    saw_answer = ev
+                elif ev.get("type") != "done":
+                    second.append(ev)
+        except Exception:
+            saw_answer = None
+        if saw_answer and saw_answer.get("verified") != "flagged":
+            for ev in second:                      # let the second attempt's work show
+                yield ev
+            yield {"type": "answer_revision", "text": saw_answer.get("text", "")}
+            final = saw_answer
+    yield final
     yield {"type": "done"}

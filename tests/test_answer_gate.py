@@ -70,3 +70,28 @@ def test_give_up_requires_evidence_of_looking():
     # that read a schema and concluded from it still gave up having run ZERO queries
     assert "You have not RUN anything" in blk
     assert "run_query" in blk and "seen_calls" in blk
+
+
+def test_the_engine_retries_a_run_that_flagged_itself():
+    """The mechanism that attacks route variance directly.
+
+    Three runs of the whole bank found NOT ONE case failing all three times — every question
+    is answered correctly sometimes, so the residual error is variance between runs. That is
+    only fixable if a bad run can be RECOGNISED, and it can: the failing run in a six-case
+    probe came back `flagged`.
+
+    Flagged fires on good runs too, and for a retry that asymmetry is the right way round —
+    a false alarm costs a second attempt, a missed one costs a wrong answer.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "ai" / "deep" / "engine.py").read_text()
+    assert "def _answer_once(" in src
+    assert "retry_allowed" in src
+    blk = src[src.index("if retry_allowed and verified"):][:600]
+    assert 'saw_answer.get("verified") != "flagged"' in blk, "must prefer the UNflagged run"
+
+
+def test_the_retry_cannot_recurse():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "app" / "ai" / "deep" / "engine.py").read_text()
+    assert "_answer_once(query, history, retry_allowed=False)" in src
