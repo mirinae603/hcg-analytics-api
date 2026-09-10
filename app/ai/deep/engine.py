@@ -514,7 +514,14 @@ def _num_tokens(text: str) -> set[str]:
 
 # ── the loop ─────────────────────────────────────────────────────────────────
 def answer(query: str, history: list | None = None):
-    """One question, answered — retried once if the engine says it had a bad run.
+    """One question, answered.
+
+    This wrapper is where a retry would go, and the docstring below is kept because the
+    measurement is worth more than the idea. See the note at the final yield in
+    _answer_once: re-running a flagged answer and preferring the unflagged one cost three
+    points across the full bank.
+
+    ORIGINAL REASONING, WHICH WAS WRONG:
 
     A three-run measurement of the whole bank found that NOT ONE case fails all three times.
     Every question is answered correctly sometimes, so the residual error is variance
@@ -527,10 +534,10 @@ def answer(query: str, history: list | None = None):
     flagged answer is re-run once and the UNFLAGGED result preferred, with no judgement about
     content: if the second attempt is clean it wins, if both are flagged the first stands.
     """
-    yield from _answer_once(query, history, retry_allowed=True)
+    yield from _answer_once(query, history)
 
 
-def _answer_once(query: str, history: list | None = None, retry_allowed: bool = False):
+def _answer_once(query: str, history: list | None = None):
     """The pipeline itself. Same generator contract as orchestrator.answer."""
     if not llm.has_key():
         yield {"type": "answer", "text": "Deep analysis needs AZURE_OPENAI_API_KEY to be set.",

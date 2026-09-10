@@ -16,7 +16,9 @@ from app.ai.deep import engine
 
 
 def _answer_src() -> str:
-    return inspect.getsource(engine.answer)
+    # `answer` is now a thin wrapper; the pipeline lives in `_answer_once`, so reading the
+    # wrapper found none of the canonical-path construction sites these tests exist to guard
+    return inspect.getsource(engine._answer_once)
 
 
 def test_every_canonical_kpi_result_is_placeholder_checked():
