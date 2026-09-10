@@ -123,3 +123,40 @@ def test_a_plain_money_column_is_never_marked_unsummable():
     # SUM(cost) — a correct query. A false "never sum this" refuses work that was right.
     assert "consumption_all.cost" not in __import__(
         "app.ai.ontology", fromlist=["x"]).non_additive()
+
+
+# ── staleness ────────────────────────────────────────────────────────────────
+def test_the_ontology_matches_the_warehouse_it_claims_to_describe():
+    """A stale ontology fails SILENTLY, which is the worst way for a guard to fail.
+
+    ontology.json is a build artefact that is checked in, and everything derived from it —
+    the non-additive list, the disjoint joins, the ambiguous columns, and now the guards on
+    the corroborating query — is keyed by "table.column". Rename or drop a column and those
+    checks do not error: they simply stop matching anything and never fire again, while the
+    test suite stays green and the answers get quietly worse.
+
+    So drift is a test failure. If this fails, run `python -m app.ai.ontology` to rebuild.
+    """
+    from app.ai import ontology, warehouse
+
+    ont = ontology.load()
+    if not ont.get("columns"):
+        import pytest
+        pytest.skip("no ontology built yet")
+
+    # profile()["tables"][t] is a LIST of column specs, not a name -> spec map. Iterating it
+    # as a map builds keys out of stringified dicts, which match nothing and make every
+    # column look like it vanished — which is exactly what the first draft of this reported.
+    live = {f'{t}.{c["column"]}' for t, cols in ontology.profile()["tables"].items()
+            for c in cols if c.get("column")}
+    known = set(ont["columns"])
+
+    vanished = sorted(known - live)
+    assert not vanished, (
+        f"{len(vanished)} ontology columns no longer exist in the warehouse — every check "
+        f"keyed to them is now dead and silent: {vanished[:8]}")
+
+    unclassified = sorted(live - known)
+    assert not unclassified, (
+        f"{len(unclassified)} warehouse columns the ontology has never seen, so nothing "
+        f"knows whether they are additive, ambiguous or safe to join: {unclassified[:8]}")
