@@ -226,6 +226,17 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
         hint = scope.explain_zero_rows(sql)
         return {"row_count": 0, "columns": r["columns"],
                 "note": hint or "0 rows — check the filter values with find_value or profile_column"}
+    # A part cannot be larger than the whole. A join that multiplies rows before a SUM
+    # produces a well-formed, correctly-scoped, ontology-clean query whose answer is off by a
+    # factor — "procurement is dominated by Consumables, Rs 19,825 Cr" against a warehouse
+    # holding Rs 478 Cr in total. Every other check reads the QUERY; this one reads the
+    # ARITHMETIC, which is why it catches a class the others cannot see.
+    from app.ai.deep import magnitude as _magnitude
+    inflated = _magnitude.exceeds_the_whole(
+        sql, {"rows": r.get("rows") or [],
+              "truncated": len(r.get("rows") or []) < (r.get("row_count") or 0)})
+    if inflated:
+        return {"error": inflated}
     return {"row_count": r["row_count"], "columns": r["columns"], "rows": r["rows"][:12],
             "truncated": r["row_count"] > 12, "_full": r}
 
