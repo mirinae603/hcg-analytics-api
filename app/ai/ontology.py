@@ -208,6 +208,11 @@ For each column return:
             a price, a rate or a pre-computed average is NOT)
   event     for measures only: what business event it records — sales | procurement |
             consumption | stock | forecast | none
+  primary   for measures only: TRUE for the ONE column in this table that an executive
+            would mean by the table's headline figure, FALSE for its components and for
+            secondary amounts. In a procurement table `total_value_wo_tax` is primary while
+            `cgst_value`, `unit_mrp` and `open_qty` are not. At most ONE primary per table
+            per unit — if two columns could both be it, neither is.
   synonyms  words a hospital analyst would use for it, lowercase, 0-6 of them
   note      one short sentence ONLY if something is genuinely surprising or a trap
 
@@ -320,6 +325,22 @@ def verify(ont: dict, prof: dict) -> tuple[dict, list[str]]:
     dropped = len(prof["links"]) - len(keyed)
     if dropped:
         rejected.append(f"{dropped} column pairs ignored for linking: not identifiers")
+
+    # AT MOST ONE PRIMARY PER TABLE AND UNIT. The compiler picks the headline measure by
+    # this flag, so two claimants is not a tie to be broken — it is an ambiguity, and the
+    # honest response is to compile nothing and let the engine look. A heuristic here
+    # ("take the largest") compiled `total_mrp_value` as procurement spend: ₹1,777 Cr of
+    # retail value reported as ₹649.91 Cr of purchasing, deterministically and wrongly.
+    from collections import defaultdict as _dd
+    claims = _dd(list)
+    for key, spec in clean_cols.items():
+        if spec.get("role") == "measure" and spec.get("primary"):
+            claims[(key.split(".", 1)[0], str(spec.get("unit", "")).lower())].append(key)
+    for (tbl, unit), keys in claims.items():
+        if len(keys) > 1:
+            for k in keys:
+                clean_cols[k] = {**clean_cols[k], "primary": False}
+            rejected.append(f"{tbl}/{unit}: {len(keys)} columns claimed primary — none kept")
 
     return ({"columns": clean_cols,
              "tables": ont.get("tables") or {},
@@ -436,3 +457,17 @@ def non_additive() -> list[str]:
     """Measures that must never be SUMmed — rates, prices, pre-computed averages."""
     return sorted(k for k, c in load()["columns"].items()
                   if c.get("role") == "measure" and not c.get("additive", True))
+
+
+def primary_measure(table: str, unit: str = "") -> str:
+    """The one column an executive means by this table's headline figure, or ""."""
+    for key, spec in load()["columns"].items():
+        if not spec.get("primary") or spec.get("role") != "measure":
+            continue
+        t = key.split(".", 1)[0]
+        if t != table:
+            continue
+        if unit and str(spec.get("unit", "")).lower() != unit.lower():
+            continue
+        return key
+    return ""
