@@ -1420,6 +1420,29 @@ def answer(query: str, history: list | None = None):
     # different path to the same sentence.
     gate = answer_gate.check(prose, len(queries))
     if gate:
+        # SELF-CORRECT, don't just mark. A flag on a bad answer still ships the bad answer;
+        # the reader gets a warning badge and the wrong headline underneath it. One
+        # re-synthesis, only when a check fired, with the specific defect named — the same
+        # execute-then-repair loop that took the OMG benchmark from 54% to 72%.
+        yield {"type": "step", "text": "Re-checking how that answer is framed"}
+        try:
+            fixed = "".join(llm.stream_text(
+                cl, role="synthesise",
+                system=("You are correcting ONE specific defect in an analytics brief. Keep "
+                        "every number, citation and finding exactly as they are — the data "
+                        "is not in question, only how it was presented. Change nothing "
+                        "else, and do not mention that a correction was made.\n\n"
+                        "THE DEFECT:\n" + "\n".join(f"- {g}" for g in gate)),
+                user="Rewrite this brief with that defect fixed:\n\n" + prose,
+                temperature=0.0))
+            fixed = _rupees_in_scale(_hospitalise(fixed)).strip()
+            # only accept a repair that actually repaired something and kept the substance
+            if fixed and len(fixed) > 80 and not answer_gate.check(fixed, len(queries)):
+                yield {"type": "answer_revision", "text": fixed}
+                prose, gate = fixed, []
+        except Exception:
+            pass
+    if gate:
         verified = "flagged"
     yield {"type": "answer", "text": prose, "verified": verified, "options": [],
            "gate": gate or None,

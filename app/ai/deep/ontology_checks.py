@@ -105,8 +105,50 @@ def groups_by_an_ambiguous_column(sql: str) -> str | None:
 def check(sql: str) -> str | None:
     """The first ontology violation in this query, or None."""
     for fn in (sums_a_non_additive_measure, joins_disjoint_columns,
-               groups_by_an_ambiguous_column):
+               groups_by_an_ambiguous_column, averages_a_skewed_measure):
         hit = fn(sql)
         if hit:
             return hit
+    return None
+
+
+_AVG = re.compile(r"\bAVG\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)", re.I)
+_SKEW_FACTOR = 3.0
+
+
+def averages_a_skewed_measure(sql: str) -> str | None:
+    """AVG() over a measure whose mean is far from its median.
+
+    "Our overall days-on-hand is 203.34 days" — with the median at 16.57. The mean is
+    twelve times the median because a few thousand near-dead SKUs carry enormous day counts,
+    and quoting it as "overall" describes a warehouse nobody works in. The ontology already
+    marks doh_days non-additive; this asks the data whether the mean is safe to report, and
+    the answer is a measurement, not a rule of thumb.
+    """
+    if not sql:
+        return None
+    non_add = {k.split(".", 1)[1]: k for k in ontology.non_additive()}
+    used = _tables(sql)
+    for col in _AVG.findall(sql):
+        name = col.split(".")[-1]
+        key = non_add.get(name)
+        if not key:
+            continue
+        table = key.split(".", 1)[0]
+        if used and table not in used:
+            continue
+        try:
+            from app.ai import warehouse
+            mean, med = warehouse.con().execute(
+                f'SELECT AVG("{name}"), MEDIAN("{name}") FROM "{table}"').fetchone()
+        except Exception:
+            return None
+        if not mean or not med or med == 0:
+            return None
+        if abs(mean) < abs(med) * _SKEW_FACTOR:
+            return None
+        return (f"AVG({col}) IS MISLEADING HERE — across {table} its mean is {mean:,.1f} "
+                f"and its median {med:,.1f}, a {abs(mean / med):.0f}x gap, so a few extreme "
+                f"rows are carrying the average. Report the MEDIAN as the headline figure "
+                f"and mention the mean only alongside what skews it.")
     return None
