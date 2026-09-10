@@ -1104,17 +1104,30 @@ def _answer_once(query: str, history: list | None = None):
     yield {"type": "step", "text": "Re-deriving the key figures independently"}
     corroborations = []
     primary = findings[0]
+    _onto_ctx = capability.ontology_context()
     got = llm.ask_json(
         cl, role="corroborate",
         system=("You independently CHECK a figure another analyst produced. Compute the same "
                 "quantity a DIFFERENT way — a different table, or a sum of parts instead of a "
-                "stored total. Do not copy their query.\n\nSCHEMA:\n" + cap_brief),
+                "stored total. Do not copy their query.\n\nSCHEMA:\n" + cap_brief
+                + ("\n\n" + _onto_ctx if _onto_ctx else "")),
         user=f"Their query:\n{primary['sql']}\n\nTheir result:\n{_compact(primary['res'], 8)}",
         schema_hint=schemas.CORROBORATE)
     alt_sql = (got.get("sql") or "").strip()
-    if alt_sql and not scope.missing_entity_scope(alt_sql, entity_tokens):
+    if alt_sql:
         try:
-            alt = warehouse.run_sql(alt_sql, row_cap=50)
+            # THROUGH THE SAME GUARDS AS THE PRIMARY. This used to call warehouse.run_sql
+            # directly with only a scope check, so the query that sits in judgement over the
+            # answer was the one query in the system subject to none of the rules — free to
+            # join the disjoint hospital codes, sum a non-additive measure, or return the
+            # single all-NULL row that reads as a figure and is not. A corroboration that
+            # breaks a data-integrity rule is not a second opinion, and letting one contradict
+            # a correct answer is worse than having no corroboration at all.
+            alt = tools.run_query(alt_sql, entity_tokens, query)
+            if alt.get("error"):
+                # Discarded, and deliberately NOT recorded as disagreement. "I could not
+                # check this" and "I checked and it conflicts" are different facts.
+                alt = {}
             if alt.get("row_count"):
                 a, b = _num_tokens(_compact(primary["res"], 8)), _num_tokens(_compact(alt, 8))
                 agreed = bool(a & b)

@@ -55,3 +55,38 @@ def test_malformed_tokens_do_not_raise():
     # Result rows carry nulls and text; the verifier runs on every answer and must never be
     # the thing that breaks one.
     assert V.compare(["n/a", None, "8420000000"], ["8420000000", ""]) == V.AGREE
+
+
+# ── the corroborator's own query ─────────────────────────────────────────────
+import inspect
+
+from app.ai.deep import engine
+
+
+def _corroborate_src() -> str:
+    src = inspect.getsource(engine._answer_once)
+    start = src.index("PHASE 4 · CORROBORATE")
+    return src[start:src.index("PHASE 5", start)]
+
+
+def test_the_corroborating_query_runs_through_the_guards():
+    # It used to call warehouse.run_sql directly, which made the query that sits in
+    # judgement over the answer the only one in the system subject to no rules. It could
+    # join the disjoint hospital codes or sum a non-additive measure and then contradict a
+    # correct answer with the result.
+    src = _corroborate_src()
+    assert "tools.run_query(" in src, "corroboration must use the guarded path"
+    assert "warehouse.run_sql(" not in src, "corroboration must not bypass the guards"
+
+
+def test_a_rejected_corroboration_is_not_counted_as_disagreement():
+    # "I could not check this" and "I checked and it conflicts" are different facts, and
+    # collapsing them would let a guard rejection discredit a correct answer.
+    src = _corroborate_src()
+    assert 'if alt.get("error")' in src and "alt = {}" in src
+
+
+def test_the_corroborator_is_given_the_ontology():
+    # It writes SQL, so it needs the same domain knowledge as the analyst that wrote the
+    # query it is checking — otherwise it writes a plausible query over a trap.
+    assert "_onto_ctx" in _corroborate_src()
