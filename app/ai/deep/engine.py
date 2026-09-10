@@ -1466,21 +1466,20 @@ def _answer_once(query: str, history: list | None = None, retry_allowed: bool = 
     final = {"type": "answer", "text": prose, "verified": verified, "options": [],
              "gate": gate or None,
              "scope": f"deep · {len(findings)} lines of enquiry, {len(queries)} queries"}
-    if retry_allowed and verified == "flagged":
-        yield {"type": "step", "text": "That run flagged itself — answering it again"}
-        second, saw_answer = [], None
-        try:
-            for ev in _answer_once(query, history, retry_allowed=False):
-                if ev.get("type") == "answer":
-                    saw_answer = ev
-                elif ev.get("type") != "done":
-                    second.append(ev)
-        except Exception:
-            saw_answer = None
-        if saw_answer and saw_answer.get("verified") != "flagged":
-            for ev in second:                      # let the second attempt's work show
-                yield ev
-            yield {"type": "answer_revision", "text": saw_answer.get("text", "")}
-            final = saw_answer
+    # NO RETRY HERE, AND THAT IS A MEASURED DECISION.
+    #
+    # Re-running a flagged answer and preferring the UNFLAGGED result looked obviously
+    # right: the residual error is run-to-run variance, and the failing run in a probe came
+    # back flagged. On the seven cases that were failing it worked — six went to 3/3.
+    #
+    # On the full bank, three runs each, it cost three points: 280/288 -> 272/288. And
+    # worst-margin-drugs went to 0/3, the first deterministically broken case in any
+    # measurement all day.
+    #
+    # The flaw is that `flagged` has poor PRECISION. It fires on good answers too, so
+    # "prefer the unflagged one" trades a flagged-but-CORRECT answer for an
+    # unflagged-but-WRONG one. Preferring the answer that looks cleanest is not the same as
+    # preferring the answer that is right, and nothing here can tell those apart. A retry
+    # needs a verifier that judges CONTENT; until there is one, the first answer stands.
     yield final
     yield {"type": "done"}

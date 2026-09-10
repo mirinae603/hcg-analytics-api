@@ -72,26 +72,19 @@ def test_give_up_requires_evidence_of_looking():
     assert "run_query" in blk and "seen_calls" in blk
 
 
-def test_the_engine_retries_a_run_that_flagged_itself():
-    """The mechanism that attacks route variance directly.
+def test_there_is_no_retry_and_that_was_measured():
+    """Re-running a flagged answer and preferring the unflagged one made things WORSE.
 
-    Three runs of the whole bank found NOT ONE case failing all three times — every question
-    is answered correctly sometimes, so the residual error is variance between runs. That is
-    only fixable if a bad run can be RECOGNISED, and it can: the failing run in a six-case
-    probe came back `flagged`.
+    It looked obviously right — the residual error is run-to-run variance, and the failing
+    run in a probe came back flagged. On the seven failing cases it worked: six went to 3/3.
+    On the full bank at three runs each it cost three points, 280/288 -> 272/288, and
+    worst-margin-drugs went to 0/3 — the first deterministically broken case in any
+    measurement that day.
 
-    Flagged fires on good runs too, and for a retry that asymmetry is the right way round —
-    a false alarm costs a second attempt, a missed one costs a wrong answer.
+    `flagged` has poor precision. Preferring the unflagged answer trades a flagged-but-
+    CORRECT one for an unflagged-but-WRONG one. Looking cleanest is not being right.
     """
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "app" / "ai" / "deep" / "engine.py").read_text()
-    assert "def _answer_once(" in src
-    assert "retry_allowed" in src
-    blk = src[src.index("if retry_allowed and verified"):][:600]
-    assert 'saw_answer.get("verified") != "flagged"' in blk, "must prefer the UNflagged run"
-
-
-def test_the_retry_cannot_recurse():
-    from pathlib import Path
-    src = (Path(__file__).resolve().parents[1] / "app" / "ai" / "deep" / "engine.py").read_text()
-    assert "_answer_once(query, history, retry_allowed=False)" in src
+    assert "NO RETRY HERE" in src
+    assert "_answer_once(query, history, retry_allowed=False)" not in src
