@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from app.ai import charts, resolve as resolver, scope, warehouse
-from app.ai.deep import capability, llm, sanity, schemas, shapes, tools
+from app.ai.deep import answer_gate, capability, llm, sanity, schemas, shapes, tools
 
 MAX_SUBQUESTIONS = 6
 MAX_ROUNDS = 2          # investigate → critique → (one more investigate) → stop
@@ -893,6 +893,30 @@ def answer(query: str, history: list | None = None):
                     continue
 
                 if name == "give_up":
+                    # YOU MAY NOT GIVE UP BEFORE LOOKING.
+                    #
+                    # The tool's own description says "call this only after LOOKING", and
+                    # that is advice — the same kind of advice that has lost every time in
+                    # this system. Asked "is Reliance a supplier or a manufacturer", the
+                    # worker gave up having run ZERO queries, and the answer was "I couldn't
+                    # establish anything" for a fact one lookup away: Reliance is in
+                    # dim_material.manufacturer_desc and not in dim_vendor.
+                    #
+                    # An unanswerable question and an unattempted one produce the same
+                    # sentence, and only one of them is honest. So looking is now a
+                    # precondition, checked, not requested.
+                    if not any(k.startswith(("run_query", "find_value", "profile_column",
+                                             "describe_table", "sample_rows", "get_kpi",
+                                             "lookup_item"))
+                               for k in seen_calls):
+                        msgs.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(
+                            {"error": "You have not looked yet — no query, no describe_table, "
+                                      "no find_value. give_up() reports a limit of the DATA, "
+                                      "and you have no evidence of one. find_value() the "
+                                      "entity to see which table and column actually holds "
+                                      "it, or describe_table() the one you think should. "
+                                      "Give up only after that comes back empty."})})
+                        continue
                     _note_lesson(args.get("reason", "")[:180])
                     stop = {"sub": sub, "skipped": args.get("reason") or "gave up"}
                     break
@@ -1030,6 +1054,12 @@ def answer(query: str, history: list | None = None):
                  "I couldn't establish anything solid enough to report — every line of enquiry "
                  "either hit a table that can't answer it or returned nothing.")
                 + " Try narrowing the question to a specific item, site or period.")
+        # A limit of the DATA claimed after zero queries is a limit of the ATTEMPT, and the
+        # two produce the same sentence. Say which this was, rather than letting the reader
+        # assume their warehouse is the problem.
+        if not queries:
+            text += (" I did not manage to run a single query on this, so treat it as a gap "
+                     "in the attempt rather than proof the data cannot answer it.")
         for ch in text:
             yield {"type": "answer_delta", "text": ch}
         yield {"type": "answer", "text": text, "verified": "flagged", "options": []}
@@ -1382,6 +1412,15 @@ def answer(query: str, history: list | None = None):
 
     verified = "flagged" if crit.get("refuted") else (
         "ok" if any(c["agreed"] for c in corroborations) else None)
+    # THE EXIT GATE. Every other guard inspects SQL and therefore only covers the routes
+    # that produce SQL — the canonical KPI path produces none, the give-up path runs no
+    # query at all, and each fix covered one more route while the next new route bypassed
+    # it again. These checks read the FINISHED ANSWER, so they cannot be dodged by taking a
+    # different path to the same sentence.
+    gate = answer_gate.check(prose, len(queries))
+    if gate:
+        verified = "flagged"
     yield {"type": "answer", "text": prose, "verified": verified, "options": [],
+           "gate": gate or None,
            "scope": f"deep · {len(findings)} lines of enquiry, {len(queries)} queries"}
     yield {"type": "done"}
