@@ -105,7 +105,8 @@ def groups_by_an_ambiguous_column(sql: str) -> str | None:
 def check(sql: str) -> str | None:
     """The first ontology violation in this query, or None."""
     for fn in (sums_a_non_additive_measure, joins_disjoint_columns,
-               groups_by_an_ambiguous_column, averages_a_skewed_measure):
+               groups_by_an_ambiguous_column, averages_a_skewed_measure,
+               alias_contradicts_the_ontology):
         hit = fn(sql)
         if hit:
             return hit
@@ -151,4 +152,55 @@ def averages_a_skewed_measure(sql: str) -> str | None:
                 f"and its median {med:,.1f}, a {abs(mean / med):.0f}x gap, so a few extreme "
                 f"rows are carrying the average. Report the MEDIAN as the headline figure "
                 f"and mention the mean only alongside what skews it.")
+    return None
+
+
+def alias_contradicts_the_ontology(sql: str) -> str | None:
+    """An aggregate aliased into a measure family the ontology says it is not.
+
+    `SELECT SUM(amount_lc) AS total_revenue FROM fact_consumption` — a CONSUMPTION cost
+    relabelled as revenue, and the prose then faithfully reported "monthly revenue fell
+    from ₹10.91 Cr". constraints.misleading_alias missed it because its hand-written pattern
+    list has no entry for `amount_lc`; the ontology classified that column's event as
+    consumption from its own samples, without anyone typing the column name anywhere.
+
+    This is the argument for the ontology in one function: a hand list only knows the names
+    somebody thought of.
+    """
+    if not sql:
+        return None
+    ont = ontology.load().get("columns") or {}
+    if not ont:
+        return None
+    used = _tables(sql)
+
+    def event_of(col: str) -> str:
+        name = col.split(".")[-1]
+        for key, spec in ont.items():
+            t, c = key.split(".", 1)
+            if c == name and (not used or t in used) and spec.get("role") == "measure":
+                return str(spec.get("event", "")).lower()
+        return ""
+
+    def alias_claims(alias: str) -> str:
+        a = alias.lower()
+        for ev, words in (("sales", ("revenue", "sales", "turnover", "billed")),
+                          ("procurement", ("purchase", "procure", "spend", "bought")),
+                          ("consumption", ("consum", "issued", "dispens", "used")),
+                          ("stock", ("stock", "inventory", "on_hand", "holding"))):
+            if any(w in a for w in words):
+                return ev
+        return ""
+
+    for src_col, alias in re.findall(
+            r"\b(?:SUM|AVG|MIN|MAX)\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w.]*)[^()]*\)"
+            r"\s*(?:AS\s+)?([A-Za-z_]\w*)", sql, re.I):
+        src_ev, claim = event_of(src_col), alias_claims(alias)
+        if src_ev and claim and src_ev != claim:
+            return (f"ALIAS CONTRADICTS THE DATA — `{src_col}` records {src_ev.upper()} "
+                    f"according to the ontology, and you have named it `{alias}`, which "
+                    f"reads as {claim.upper()}. Those are different business events from "
+                    f"different tables, and the answer will use the name you chose. Either "
+                    f"query the table that actually records {claim.upper()}, or name the "
+                    f"column for what it is.")
     return None

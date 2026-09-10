@@ -155,6 +155,43 @@ _DERIVED_MONTH = re.compile(
     r"date_trunc|strftime|date_part|extract\s*\(|::\s*date|AS\s+DATE\s*\)", re.I)
 
 
+
+_YYYY_MM = re.compile(r"^\d{4}[-/]\d{1,2}")
+
+
+def _sorts_chronologically(sql: str) -> bool:
+    """True when every month-ish column this query orders by holds sortable values."""
+    m = re.search(r"\bORDER\s+BY\b(.*)$", sql or "", re.I | re.S)
+    if not m:
+        return False
+    ordered = {t.strip().strip('"').split(".")[-1].split()[0].lower()
+               for t in m.group(1).split(",") if t.strip()}
+    ordered = {o for o in ordered if o in ("month", "month_num", "period")}
+    if not ordered:
+        return False
+    tables = re.findall(r"\b(?:FROM|JOIN)\s+\"?([A-Za-z_]\w*)\"?", sql or "", re.I)
+    try:
+        from app.ai import warehouse
+        con = warehouse.con()
+    except Exception:
+        return False
+    for col in ordered:
+        ok = False
+        for t in tables:
+            try:
+                vals = con.execute(
+                    f'SELECT DISTINCT CAST("{col}" AS VARCHAR) FROM "{t}" '
+                    f'WHERE "{col}" IS NOT NULL LIMIT 5').fetchall()
+            except Exception:
+                continue
+            if vals and all(_YYYY_MM.match(str(v[0])) for v in vals):
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
 def wrong_time_ordering(sql: str) -> str | None:
     """A trend ordered by a key that puts December before January."""
     if not sql or not _BAD_TIME_SORT.search(sql):
@@ -163,6 +200,13 @@ def wrong_time_ordering(sql: str) -> str | None:
         return None                      # already sorted by something monotonic
     if _DERIVED_MONTH.search(sql):
         return None                      # month came from a real date; it sorts fine
+    # ASK THE DATA WHETHER IT SORTS. `sales_monthly.month` holds '2025-12' and orders
+    # perfectly; this rule banned ORDER BY month by NAME and refused the only correct query
+    # for "how has monthly revenue trended", leaving the engine with nothing and an answer
+    # of "I couldn't establish anything". The rule exists because month_num is 1-12 with the
+    # year elsewhere — that is a fact about the VALUES, so check the values.
+    if _sorts_chronologically(sql):
+        return None
     return ("WRONG TIME ORDER — `month_num` is the calendar month 1-12 with the year in a "
             "separate column, and `month` may be a NAME. This data spans December 2025 to "
             "May 2026, so ordering by either puts December LAST when it is the FIRST "

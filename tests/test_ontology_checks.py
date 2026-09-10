@@ -89,3 +89,30 @@ def test_no_table_or_column_name_is_hardcoded_in_the_checks():
     code = ast.unparse(ast.fix_missing_locations(tree))
     for name in ("kpi_doh", "sales_by_hospital", "dim_plant", "fill_rate_pct", "doh_days"):
         assert name not in code, f"{name} is hardcoded in the check logic"
+
+
+def test_an_alias_that_contradicts_the_ontology_is_refused():
+    """The argument for the ontology, in one test.
+
+    `SELECT SUM(amount_lc) AS total_revenue FROM fact_consumption` — a consumption cost
+    relabelled as revenue, and the prose then reported "monthly revenue fell from ₹10.91
+    Cr". constraints.misleading_alias missed it because its hand-written pattern list has no
+    entry for `amount_lc`. The ontology classified that column as CONSUMPTION from its own
+    samples, with nobody typing the column name anywhere. A hand list only knows the names
+    somebody thought of.
+    """
+    w = oc.alias_contradicts_the_ontology(
+        "SELECT period, SUM(amount_lc) AS total_revenue FROM fact_consumption GROUP BY 1")
+    assert w and "CONSUMPTION" in w and "SALES" in w
+
+
+def test_an_honest_alias_on_the_same_column_passes():
+    assert oc.alias_contradicts_the_ontology(
+        "SELECT period, SUM(amount_lc) AS total_consumption_cost "
+        "FROM fact_consumption GROUP BY 1") is None
+
+
+def test_a_real_revenue_column_named_revenue_passes():
+    assert oc.alias_contradicts_the_ontology(
+        "SELECT period, SUM(revenue) AS total_revenue "
+        "FROM sales_by_material_month GROUP BY 1") is None

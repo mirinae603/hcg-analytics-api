@@ -65,6 +65,8 @@ def test_give_up_requires_evidence_of_looking():
     # queries, for a fact one lookup away.
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "app" / "ai" / "deep" / "engine.py").read_text()
-    blk = src[src.index('if name == "give_up":'):][:1600]
-    assert "You have not looked yet" in blk
-    assert "seen_calls" in blk
+    blk = src[src.index('if name == "give_up":'):][:2000]
+    # the message tightened once: describing a table used to count as looking, and a worker
+    # that read a schema and concluded from it still gave up having run ZERO queries
+    assert "You have not RUN anything" in blk
+    assert "run_query" in blk and "seen_calls" in blk

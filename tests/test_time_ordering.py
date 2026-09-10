@@ -98,3 +98,26 @@ def test_a_trend_must_have_one_value_per_period():
 def test_a_non_trend_question_is_not_forced_to_group():
     from app.ai.deep.constraints import under_aggregated_trend as u
     assert u("what is total revenue", "SELECT period, revenue FROM t") is None
+
+
+def test_a_month_column_that_actually_sorts_is_allowed():
+    """The guard must ask the DATA, not the column name.
+
+    `sales_monthly.month` holds '2025-12' and orders perfectly. This rule banned ORDER BY
+    month by name, refused the only correct query for "how has monthly revenue trended",
+    and left the engine with zero queries and "I couldn't establish anything". The rule
+    exists because month_num is 1-12 with the year elsewhere — a fact about the VALUES.
+    """
+    assert wrong_time_ordering(
+        "SELECT month, SUM(revenue) FROM sales_monthly GROUP BY 1 ORDER BY month") is None
+    assert wrong_time_ordering(
+        "SELECT period, SUM(revenue) FROM sales_by_material_month "
+        "GROUP BY 1 ORDER BY period") is None
+
+
+def test_a_month_column_that_does_not_sort_is_still_refused():
+    # month_num is the calendar month 1-12; month here is a NAME, ordered alphabetically
+    assert wrong_time_ordering(
+        "SELECT month, SUM(line_value) FROM mart_procurement GROUP BY 1 ORDER BY month_num")
+    assert wrong_time_ordering(
+        "SELECT month, SUM(inflow) FROM kpi_stock_change GROUP BY 1 ORDER BY month")

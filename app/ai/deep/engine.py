@@ -906,17 +906,20 @@ def answer(query: str, history: list | None = None):
                     # An unanswerable question and an unattempted one produce the same
                     # sentence, and only one of them is honest. So looking is now a
                     # precondition, checked, not requested.
-                    if not any(k.startswith(("run_query", "find_value", "profile_column",
-                                             "describe_table", "sample_rows", "get_kpi",
-                                             "lookup_item"))
+                    # LOOKING MEANS TRYING. The first version accepted describe_table as
+                    # evidence, and a worker that reads a schema and concludes from it still
+                    # produced "I couldn't establish anything" with ZERO queries run — the
+                    # same sentence an unanswerable question gets. Reading the menu is not
+                    # eating. A query that comes back empty IS evidence; a query never
+                    # written is not.
+                    if not any(k.startswith(("run_query", "get_kpi", "lookup_item"))
                                for k in seen_calls):
                         msgs.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(
-                            {"error": "You have not looked yet — no query, no describe_table, "
-                                      "no find_value. give_up() reports a limit of the DATA, "
-                                      "and you have no evidence of one. find_value() the "
-                                      "entity to see which table and column actually holds "
-                                      "it, or describe_table() the one you think should. "
-                                      "Give up only after that comes back empty."})})
+                            {"error": "You have not RUN anything — describing a table is not "
+                                      "trying it. give_up() reports a limit of the DATA and "
+                                      "you have no evidence of one. Write the most obvious "
+                                      "query you can and run it; if it returns nothing, THAT "
+                                      "is evidence and you may give up citing it."})})
                         continue
                     _note_lesson(args.get("reason", "")[:180])
                     stop = {"sub": sub, "skipped": args.get("reason") or "gave up"}
