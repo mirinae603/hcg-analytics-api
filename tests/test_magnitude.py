@@ -56,10 +56,18 @@ def test_it_never_raises_on_odd_rows():
     assert m.exceeds_the_whole(FANOUT, _res([{"spend": None}, {"spend": "n/a"}, {}])) is None
 
 
-def test_the_guarded_path_applies_it():
+def test_it_is_deliberately_not_wired_into_the_query_path():
+    """Wired in as a rejection this cost eight points; the reasoning must stay next to it.
+
+    13/27 on the nine degraded cases with it, 21/27 with it ablated. It consumes the tool
+    budget instead of correcting the query, so turns end in "I did not manage to run a single
+    query" — including turns that were previously right.
+    """
     import inspect
     from app.ai.deep import tools
-    assert "exceeds_the_whole" in inspect.getsource(tools.run_query)
+    src = inspect.getsource(tools.run_query)
+    assert "exceeds_the_whole" not in src or "NOT APPLIED" in src
+    assert "MEASURED DECISION" in src, "the measurement must not be deleted with the wiring"
 
 
 def test_integrity_checks_still_apply_without_conformance():
@@ -69,7 +77,8 @@ def test_integrity_checks_still_apply_without_conformance():
     from app.ai.deep import tools
     src = inspect.getsource(tools.run_query)
     body = src[src.index("conformance: bool"):]
-    for integrity in ("exceeds_the_whole", "_onto.check", "city_on_unreachable_table"):
+    # exceeds_the_whole is deliberately absent from this path — see the test below.
+    for integrity in ("_onto.check", "city_on_unreachable_table"):
         i = body.find(integrity)
         assert i > 0, f"{integrity} missing from run_query"
         line = body[body.rfind("\n", 0, i):body.find("\n", i)]

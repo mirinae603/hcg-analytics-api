@@ -241,17 +241,25 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
         hint = scope.explain_zero_rows(sql)
         return {"row_count": 0, "columns": r["columns"],
                 "note": hint or "0 rows — check the filter values with find_value or profile_column"}
-    # A part cannot be larger than the whole. A join that multiplies rows before a SUM
-    # produces a well-formed, correctly-scoped, ontology-clean query whose answer is off by a
-    # factor — "procurement is dominated by Consumables, Rs 19,825 Cr" against a warehouse
-    # holding Rs 478 Cr in total. Every other check reads the QUERY; this one reads the
-    # ARITHMETIC, which is why it catches a class the others cannot see.
-    from app.ai.deep import magnitude as _magnitude
-    inflated = _magnitude.exceeds_the_whole(
-        sql, {"rows": r.get("rows") or [],
-              "truncated": len(r.get("rows") or []) < (r.get("row_count") or 0)})
-    if inflated:
-        return {"error": inflated}
+    # THE MAGNITUDE CHECK IS NOT APPLIED HERE, AND THAT IS A MEASURED DECISION.
+    #
+    # app/ai/deep/magnitude.py catches a real error: a join that multiplies rows before a SUM
+    # shipped "procurement is dominated by Consumables, Rs 19,825 Cr" against a warehouse
+    # holding Rs 478 Cr in total. It fires on that exact shape, it has no false positives on
+    # 60 single-table sums, and it reads the ARITHMETIC rather than the query, which is a
+    # class no other check here can see.
+    #
+    # Wired in as a rejection it cost eight points. On the nine cases that got worse:
+    # 13/27 with it, 21/27 with it ablated, same build otherwise. And
+    # l2-procurement-by-category — the case it was BUILT for — is 0/3 either way, so it never
+    # fixed its own target. What it does instead is consume the tool budget: the model retries
+    # against a bound it cannot satisfy, and the turn ends in "I did not manage to run a
+    # single query" where it used to end in a wrong number.
+    #
+    # A guard that turns a wrong answer into no answer is not obviously an improvement, and
+    # this one turns CORRECT answers into no answer too. The module and its tests stay because
+    # the invariant is right and a cheaper application of it may not be; the rejection does
+    # not, because the measurement says so.
     return {"row_count": r["row_count"], "columns": r["columns"], "rows": r["rows"][:12],
             "truncated": r["row_count"] > 12, "_full": r}
 
