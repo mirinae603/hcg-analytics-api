@@ -77,6 +77,10 @@ def test_the_corroborating_query_runs_through_the_guards():
     src = _corroborate_src()
     assert "tools.run_query(" in src, "corroboration must use the guarded path"
     assert "warehouse.run_sql(" not in src, "corroboration must not bypass the guards"
+    # ...but INTEGRITY checks only. A corroboration recomputes one figure a different way, so
+    # the question-conformance checks reject it by design; applying them dropped usable
+    # corroborations from 39% of runs to 14% and took away the engine's second opinion.
+    assert "conformance=False" in src, "corroboration must skip question-conformance checks"
 
 
 def test_a_rejected_corroboration_is_not_counted_as_disagreement():

@@ -161,10 +161,25 @@ def _miscounts_items(sql: str, question: str) -> str | None:
     return None
 
 
-def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = "") -> dict:
-    """Run it and SEE the result — including the error, which is information, not a dead end."""
+def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = "",
+              conformance: bool = True) -> dict:
+    """Run it and SEE the result — including the error, which is information, not a dead end.
+
+    Two KINDS of check live here and they are not interchangeable:
+
+      INTEGRITY   — is this a valid computation over this warehouse? Disjoint joins,
+                    non-additive sums, all-NULL results, a part larger than the whole.
+                    True of any query, whatever it was written for.
+      CONFORMANCE — does this SQL answer the USER'S question? Item miscounts, the shape the
+                    question demands, a placeholder winning the ranking that was asked for.
+
+    A corroborating query is deliberately NOT the user's query — it recomputes one figure a
+    different way, so it fails conformance by design while being perfectly valid. Applying
+    both sets to it rejected most corroborations (39% of runs down to 14%) and took the
+    engine's second opinion away. `conformance=False` runs integrity only.
+    """
     from app.ai import scope
-    miscount = _miscounts_items(sql, question)
+    miscount = _miscounts_items(sql, question) if conformance else None
     if miscount:
         return {"error": miscount}
     off = scope.missing_entity_scope(sql, entity_tokens or [])
@@ -182,7 +197,7 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
         return {"error": str(e)[:300]}
     # `ORDER BY spend DESC LIMIT 1` returning "Uncategorized" cannot be repaired by
     # reordering — there is nothing left to promote. Send it back to be re-queried.
-    unnamed = _sanity.placeholder_won_a_ranking(sql, r, question)
+    unnamed = _sanity.placeholder_won_a_ranking(sql, r, question) if conformance else None
     if unnamed:
         return {"error": unnamed}
     # An empty fact_consumption result is the expected result for a patient-billed item,
@@ -200,7 +215,7 @@ def run_query(sql: str, entity_tokens: list[str] | None = None, question: str = 
     # What the QUESTION demands of the SQL. "What share of revenue is non-formulary" was
     # answered "₹29.06 Cr" — the right numerator, never divided, so no share was given.
     from app.ai.deep import constraints as _constraints
-    unmet = _constraints.check(question, sql)
+    unmet = _constraints.check(question, sql) if conformance else None
     if unmet:
         return {"error": unmet}
     # Checks DERIVED from the ontology rather than typed: non-additive measures, joins

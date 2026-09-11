@@ -60,3 +60,17 @@ def test_the_guarded_path_applies_it():
     import inspect
     from app.ai.deep import tools
     assert "exceeds_the_whole" in inspect.getsource(tools.run_query)
+
+
+def test_integrity_checks_still_apply_without_conformance():
+    # The split must not become a way to run unchecked SQL. A corroboration is exempt from
+    # "does this answer the user's question", never from "is this a valid computation".
+    import inspect
+    from app.ai.deep import tools
+    src = inspect.getsource(tools.run_query)
+    body = src[src.index("conformance: bool"):]
+    for integrity in ("exceeds_the_whole", "_onto.check", "city_on_unreachable_table"):
+        i = body.find(integrity)
+        assert i > 0, f"{integrity} missing from run_query"
+        line = body[body.rfind("\n", 0, i):body.find("\n", i)]
+        assert "conformance" not in line, f"{integrity} must not be gated on conformance"

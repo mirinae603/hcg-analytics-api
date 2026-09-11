@@ -1123,7 +1123,11 @@ def _answer_once(query: str, history: list | None = None):
             # single all-NULL row that reads as a figure and is not. A corroboration that
             # breaks a data-integrity rule is not a second opinion, and letting one contradict
             # a correct answer is worse than having no corroboration at all.
-            alt = tools.run_query(alt_sql, entity_tokens, query)
+            # INTEGRITY ONLY. A corroboration recomputes one figure a different way, so the
+            # question-conformance checks — which ask whether the SQL answers the USER'S
+            # question — reject it by design. Applying them cost three quarters of all
+            # corroborations and left the engine with no second opinion on most answers.
+            alt = tools.run_query(alt_sql, entity_tokens, query, conformance=False)
             if alt.get("error"):
                 # Discarded, and deliberately NOT recorded as disagreement. "I could not
                 # check this" and "I checked and it conflicts" are different facts.
