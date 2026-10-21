@@ -15,15 +15,31 @@ timed-out). Numbers fed back to the model are pre-formatted (₹Cr/L/%) so it ne
 mis-converts units. The key is read from env — never hardcoded.
 """
 from __future__ import annotations
+import functools
 import json
+import logging
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from app.ai import warehouse
-from app.ai import scope as _scope, semantics, charts, routing, kpi_registry
+from app.ai import scope as _scope, semantics, charts, routing, kpi_registry, windows
 from app.ai import resolve as _resolver
+from app.ai import page_context
 from app.ai.deep import engine as _deep_engine, sanity as _sanity
+
+_log = logging.getLogger(__name__)
+# The app configures no logging (uvicorn sets up only its own loggers), so an INFO line from
+# here would go nowhere and the per-turn usage line below would never be seen. Give this
+# logger a plain stderr handler only when nobody has configured one; a real logging setup,
+# when there is one, takes over untouched.
+if not _log.handlers and not logging.getLogger().handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _log.addHandler(_h)
+    _log.setLevel(logging.INFO)
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://ed-gpt.openai.azure.com")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
@@ -32,9 +48,22 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 # reasoning — gpt-4o is overkill for it. A cheaper, dedicated model call handles this so
 # every answer reliably gets 2-3 GENUINELY relevant suggestions (grounded in the actual
 # entities/numbers just discussed) instead of depending on the main model remembering to.
-MINI_DEPLOYMENT = os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT", "gpt-4o-mini")
+# Deep mode used to read AZURE_OPENAI_DEPLOYMENT_MINI while this read the other spelling, so
+# setting one silently left the other on a default that may not exist on the Azure resource.
+# Both modes now accept either name.
+MINI_DEPLOYMENT = (os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_MINI")
+                   or "gpt-4o-mini")
 MAX_SQL_STEPS = 9
 MAX_AUDIT_RETRIES = 3   # times the auditor can bounce a wrong/mis-scoped answer back for re-query
+# A turn has a time budget, not just a round budget. Nine rounds of a slow model, each
+# allowed its own retries, could keep a user watching "Thinking it through" for minutes.
+# Past this many seconds no new tool round starts: if anything has been gathered, one
+# no-tools round writes the answer from it (the frontend's own watchdog sits at 180 s, so
+# the backend's deadline speaks first).
+TURN_DEADLINE_S = 120.0
+# How long the end of a turn waits for the follow-up chips that were started in parallel
+# with the audit. They usually arrive first; if not, the answer still ships without them.
+FOLLOWUP_WAIT_S = 10.0
 # Rotating filler shown before each tool-calling round after the first — that round is a
 # full, non-streamed model completion (several real seconds) with no other visible progress.
 _THINKING_STEPS = ["Thinking it through", "Working out the next step", "Putting the analysis together", "Digging a little deeper"]
@@ -42,6 +71,8 @@ _THINKING_STEPS = ["Thinking it through", "Working out the next step", "Putting 
 # — too short: a callback to anything ~4+ turns back fell outside the window and the model
 # confidently hallucinated a substitute. gpt-4o has a 128K context and answers are short, so a
 # generous window is cheap and covers realistic working sessions. Kept in sync with the frontend.
+# The auditor sees only the last 6 of them (see _audit_payload): its job is the current answer,
+# and a long history in its payload used to crowd the evidence out.
 HISTORY_MESSAGES = 24
 
 
@@ -49,14 +80,29 @@ def has_key() -> bool:
     return bool(os.getenv("AZURE_OPENAI_API_KEY"))
 
 
-def _client():
+@functools.lru_cache(maxsize=4)
+def _client_for(endpoint: str, key: str, version: str, timeout: float):
+    """One AzureOpenAI client (and its connection pool) per configuration, reused across
+    questions. Building a new one per question paid a fresh TCP + TLS handshake to Azure
+    every time; the client is thread-safe, so the follow-up thread can share it.
+
+    max_retries=0: _chat below is the ONE retry layer. With the SDK retrying twice inside a
+    wrapper that retried four times, a stuck call could make 12 attempts of up to two minutes
+    each before the user saw anything."""
     from openai import AzureOpenAI
+    return AzureOpenAI(azure_endpoint=endpoint, api_key=key, api_version=version,
+                       timeout=timeout, max_retries=0)
+
+
+def _client():
     key = os.getenv("AZURE_OPENAI_API_KEY")
     if not key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
-    # see app/ai/deep/llm.py: without an explicit timeout a stalled request hangs the chat
-    return AzureOpenAI(azure_endpoint=AZURE_ENDPOINT, api_key=key, api_version=AZURE_API_VERSION,
-                       timeout=float(os.getenv("AZURE_OPENAI_TIMEOUT", "120")), max_retries=2)
+    # see app/ai/deep/llm.py: without an explicit timeout a stalled request hangs the chat.
+    # 60 s, not 120: on a streamed answer the timeout applies per chunk, so a long answer is
+    # unaffected, and a call that has sent nothing for a minute is not going to.
+    return _client_for(AZURE_ENDPOINT, key, AZURE_API_VERSION,
+                       float(os.getenv("AZURE_OPENAI_TIMEOUT", "60")))
 
 
 # A single transient Azure hiccup (429 rate-limit, or a 500/502/503/504) used to
@@ -77,20 +123,122 @@ def _is_retriable(e: Exception) -> bool:
     return any(k in name for k in ("ratelimit", "timeout", "connection", "apiconnection", "internalserver"))
 
 
-def _chat(client, **kwargs):
-    """client.chat.completions.create with retry+backoff on transient Azure errors."""
+def _llm_error_text(e: Exception) -> str:
+    """What to tell the user when the model cannot be reached at all. Every failure used to
+    read "briefly overloaded (rate-limited)", which sent people to wait out a wrong key or a
+    missing deployment. The status decides the wording; the key itself is never included."""
+    root = e.__cause__ if isinstance(e, _StreamOpenFailed) and e.__cause__ else e
+    status = getattr(root, "status_code", None) or getattr(getattr(root, "response", None), "status_code", None)
+    body = getattr(root, "body", None)
+    detail = str((body.get("message") if isinstance(body, dict) else None) or root)[:160]
+    _log.warning("ai.llm_error type=%s status=%s detail=%s", type(root).__name__, status, detail)
+    if status in (401, 403):
+        return ("The AI service rejected the key or the endpoint (error %s). Check AZURE_OPENAI_API_KEY "
+                "and AZURE_OPENAI_ENDPOINT on the server; `python -m app.ai.check_connection` tests them."
+                % status)
+    if status == 404:
+        return ("The AI model was not found on this Azure resource (error 404). Check that the deployment "
+                f"named in AZURE_OPENAI_DEPLOYMENT ('{AZURE_DEPLOYMENT}') exists there.")
+    if status == 400:
+        return f"The AI service refused the request (error 400): {detail}"
+    if status == 429 or "ratelimit" in type(root).__name__.lower():
+        return "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."
+    if _is_retriable(root):
+        return "The AI service did not respond in time. Please try that again in a moment."
+    return f"The AI service returned an error ({type(root).__name__}). Please try that again."
+
+
+def _retry_after(e: Exception) -> float:
+    """Seconds Azure asked us to wait (Retry-After on a 429), or 0. The SDK used to honour
+    this header; now that the SDK does not retry, the wrapper has to."""
+    try:
+        v = getattr(getattr(e, "response", None), "headers", None) or {}
+        return float(v.get("retry-after") or v.get("Retry-After") or 0)
+    except Exception:
+        return 0.0
+
+
+# ── token and latency accounting ─────────────────────────────────────────────
+# Nothing used to read `usage`, so nobody could say what a question cost, how many rounds
+# or audit bounces it really took, or whether Azure's prompt cache was hitting the ~20k-token
+# prefix that is resent every round. One log line per call and one per turn answers that.
+class _Usage:
+    """Totals for ONE turn. Shared with the follow-up thread, hence the lock."""
+
+    def __init__(self):
+        self.t0 = time.monotonic()
+        self.rounds = 0
+        self.audits = 0
+        self.calls = 0
+        self.prompt = 0
+        self.cached = 0
+        self.completion = 0
+        self._lock = threading.Lock()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.t0
+
+    def add(self, prompt: int, cached: int, completion: int):
+        with self._lock:
+            self.calls += 1
+            self.prompt += prompt
+            self.cached += cached
+            self.completion += completion
+
+
+def _usage(kind: str, model: str, u, dt: float, acc: _Usage | None = None):
+    """Log one call's tokens and latency (DEBUG: six-odd lines a question), and add them to the
+    turn's totals, which answer() logs once at INFO. `u` is the SDK's usage object, or None
+    when the endpoint sent none."""
+    prompt = int(getattr(u, "prompt_tokens", 0) or 0)
+    completion = int(getattr(u, "completion_tokens", 0) or 0)
+    cached = int(getattr(getattr(u, "prompt_tokens_details", None), "cached_tokens", 0) or 0)
+    if acc is not None:
+        acc.add(prompt, cached, completion)
+    _log.debug("ai.llm kind=%s model=%s prompt_tokens=%d cached_tokens=%d completion_tokens=%d secs=%.2f",
+               kind, model, prompt, cached, completion, dt)
+
+
+def _chat(client, _acc: _Usage | None = None, _kind: str = "round", **kwargs):
+    """client.chat.completions.create with retry+backoff on transient Azure errors.
+
+    The only retry layer: the client itself is built with max_retries=0, so this makes at
+    most _MAX_LLM_RETRIES calls. Also opens streams (stream=True), where a failure to OPEN is
+    as safe to retry as any other call — no text has reached the user yet."""
     delay = 2.0
     last = None
     for attempt in range(_MAX_LLM_RETRIES):
         try:
-            return client.chat.completions.create(**kwargs)
+            t = time.monotonic()
+            resp = client.chat.completions.create(**windows.fill_request(kwargs))
+            if not kwargs.get("stream"):
+                _usage(_kind, kwargs.get("model", ""), getattr(resp, "usage", None), time.monotonic() - t, _acc)
+            return resp
         except Exception as e:  # noqa: BLE001 — we re-raise below if not retriable / out of attempts
             last = e
             if not _is_retriable(e) or attempt == _MAX_LLM_RETRIES - 1:
                 raise
-            time.sleep(delay)
+            time.sleep(max(delay, min(_retry_after(e), 20.0)))
             delay = min(delay * 2.2, 20.0)
     raise last  # unreachable, but keeps type-checkers happy
+
+
+# Usage arrives on a stream only when asked for (stream_options.include_usage), in a final
+# chunk with no choices. An older API version that rejects the option would turn every
+# streamed round into an error, so the first rejection switches it off for the process.
+_stream_usage_ok = True
+
+
+class _StreamOpenFailed(Exception):
+    """The stream could not be OPENED. Distinct from a stream that died mid-answer. When the
+    cause was transient (`retriable`), _chat has already retried it four times, and asking
+    the same endpoint again without streaming would only repeat the same failures — so the
+    caller does not fall back for that one. A non-transient failure may be specific to
+    streaming, so the one non-streaming attempt is still worth making."""
+
+    def __init__(self, msg: str, retriable: bool):
+        super().__init__(msg)
+        self.retriable = retriable
 
 
 class _Streamed:
@@ -112,19 +260,43 @@ class _TC:
         self.function = type("F", (), {"name": name, "arguments": args})()
 
 
-def _chat_stream(client, **kwargs):
+def _open_stream(client, _acc, _kind, kwargs):
+    """Open a streamed completion through _chat's retries, asking for usage when the API
+    version allows it. Raises _StreamOpenFailed when it cannot be opened at all."""
+    global _stream_usage_ok
+    kwargs["stream"] = True
+    try:
+        if _stream_usage_ok:
+            try:
+                return _chat(client, _acc=_acc, _kind=_kind, stream_options={"include_usage": True}, **kwargs)
+            except Exception as e:
+                if "stream_options" not in str(e):
+                    raise
+                _stream_usage_ok = False   # this API version rejects it; stream without usage from now on
+        return _chat(client, _acc=_acc, _kind=_kind, **kwargs)
+    except Exception as e:
+        raise _StreamOpenFailed(str(e), _is_retriable(e)) from e
+
+
+def _chat_stream(client, _acc: _Usage | None = None, _kind: str = "round", **kwargs):
     """Generator yielding ("delta", text) as prose arrives, then ("done", _Streamed).
 
     Tool-call arguments arrive fragmented across chunks and have to be concatenated per
     index before they parse as JSON — that reassembly is the whole reason this exists
-    rather than passing stream=True to _chat. Retries are NOT attempted here: a stream that
-    dies mid-answer cannot be silently restarted without either duplicating or losing text
-    the user has already seen, so the caller falls back to the non-streaming path instead.
+    rather than passing stream=True to _chat. Opening the stream is retried (inside _chat);
+    a stream that dies mid-answer is NOT: it cannot be silently restarted without either
+    duplicating or losing text the user has already seen, so the caller falls back to the
+    non-streaming path instead.
     """
-    kwargs["stream"] = True
+    t = time.monotonic()
+    stream = _open_stream(client, _acc, _kind, kwargs)
     parts: list[str] = []
     slots: dict = {}
-    for chunk in client.chat.completions.create(**kwargs):
+    usage = None
+    for chunk in stream:
+        # the usage chunk has no choices, so it has to be read before they are skipped
+        if getattr(chunk, "usage", None) is not None:
+            usage = chunk.usage
         if not chunk.choices:
             continue
         d = chunk.choices[0].delta
@@ -142,22 +314,69 @@ def _chat_stream(client, **kwargs):
                 if getattr(fn, "arguments", None):
                     slot["args"] += fn.arguments
     calls = [_TC(slots[i]["id"], slots[i]["name"], slots[i]["args"]) for i in sorted(slots)]
+    _usage(_kind, kwargs.get("model", ""), usage, time.monotonic() - t, _acc)
     yield "done", _Streamed("".join(parts), calls or None)
 
 
 # ── number pre-formatting so the model can't mis-convert units ───────────────
-_INR = re.compile(r"(revenue|margin|value|cost|spend|price|amount|opportunity|overpay|mrp|purchase|sales|cr\b)", re.I)
-_PCT = re.compile(r"(pct|percent|share|rate|margin_pct|%)", re.I)
+_INR = re.compile(r"(revenue|margin|value|cost|spend|price|amount|opportunity|overpay|mrp|purchase|sales)", re.I)
+# A percentage when the name says so. A "rate" is one too (see _PRICE_RATE_WORDS), unless it
+# is a price: unit_rate and avg_rate are rupee prices, and typing them pct printed a price
+# as "2783870.0%".
+_PCT = re.compile(r"(pct|percent|share|%)", re.I)
+_PCT_RATES = ("fill_rate", "fulfillment_rate", "stock_out_rate", "wastage_rate")
 _DAYS = re.compile(r"(doh|days|aging|lead|cover|tat)", re.I)
 _YEAR = re.compile(r"^(year|yr|fiscal_year|fy)$", re.I)   # a calendar year is a label, not a quantity
+# The LAST word of a name says it is a count: purchase_qty and sales_lines contain
+# "purchase" / "sales", so the money test typed them ₹ and a quantity of 2,783,870 reached
+# the model as "₹27.84 L". The last word only, so a name like units_cost stays money.
+_COUNT_TAIL = ("qty", "quantity", "units", "count", "cnt", "lines", "nos", "skus")
+# A column the SQL already scaled (SUM(revenue)/1e7 AS revenue_cr) holds 9.68, not
+# 96,800,000; formatting it as rupees printed "₹10". It stays a plain number and its name,
+# which is the table label, carries the unit. Value: the unit _canon_num reads.
+_PRESCALED_TAIL = {"cr": "cr", "crore": "cr", "crores": "cr", "lakh": "l", "lakhs": "l"}
+# A name ending in "rate" is a percentage (the stock-out KPI's `rate` and `value_rate` are
+# percentages), unless the word before it makes it a price: unit_rate, avg_rate, purchase_rate
+# are rupees per unit.
+_PRICE_RATE_WORDS = {"unit", "avg", "average", "purchase", "net", "mrp", "price", "per",
+                     "landed", "selling", "sale", "sales", "buy", "cost", "base", "contract",
+                     "po", "item"}
+_NAME_WORDS = re.compile(r"[a-z0-9]+")
+
+
+def _name_words(col: str) -> list[str]:
+    # "purchase_qty", "Total Qty" and "revenue (Cr)" all end in the word that matters
+    return _NAME_WORDS.findall(col.lower())
+
+
+def prescaled_unit(col: str) -> str:
+    """'cr' or 'l' when the column's name says its values are already in crore / lakh."""
+    words = _name_words(col)
+    return _PRESCALED_TAIL.get(words[-1], "") if words else ""
+
+
+def _plain_by_name(col: str) -> bool:
+    """True when the name itself says plain number: a count, or a pre-scaled crore/lakh
+    figure. Such a column never inherits ₹ from the column it aggregates."""
+    words = _name_words(col)
+    return bool(words) and (words[-1] in _COUNT_TAIL or words[-1] in _PRESCALED_TAIL)
 
 
 def infer_kind(col: str) -> str:
     c = col.lower()
     if _YEAR.search(c):
         return "year"
-    if _PCT.search(c):
+    words = _name_words(c)
+    tail = words[-1] if words else ""
+    if tail in _PRESCALED_TAIL:
+        return "num"
+    # before the count test: share_of_units is a share, not a count
+    if _PCT.search(c) or "_".join(words).endswith(_PCT_RATES):
         return "pct"
+    if tail == "rate":
+        return "inr" if len(words) > 1 and words[-2] in _PRICE_RATE_WORDS else "pct"
+    if tail in _COUNT_TAIL:
+        return "num"   # before the money test (see _COUNT_TAIL)
     if _DAYS.search(c):
         return "days"
     if _INR.search(c):
@@ -175,7 +394,10 @@ def col_kind(col: str, rows: list) -> str:
     return infer_kind(col)
 
 
-def _fmt(v, kind):
+def _fmt(v, kind, pct_dp: int = 1):
+    # pct_dp is 2 only for the Jun–Aug 2026 reports: the Formulary and Spend pages print
+    # compliance as 98.42%, and "98.4%" beside it reads as a disagreement. Everything else
+    # keeps 1 dp, so run_sql answers and the evals are unchanged.
     if v is None or v == "":
         return None
     if kind == "text":
@@ -201,7 +423,7 @@ def _fmt(v, kind):
             return f"₹{n:.2f}"   # a nonzero paisa-level value must never round to "₹0" — indistinguishable from a true zero
         return f"₹{n:.0f}"
     if kind == "pct":
-        return f"{n:.1f}%"
+        return f"{n:.{pct_dp}f}%"
     if kind == "days":
         return f"{n:,.0f} d"
     if abs(n) >= 1000 or n == int(n):
@@ -216,17 +438,93 @@ def _format_result(res: dict, limit: int = 30) -> dict:
     # An alias with no unit in its name inherits one from the column it aggregates: the
     # model's own `SUM(line_value) AS total_procurement` otherwise reached the prose as a
     # bare 1740233400.36 instead of ₹174.02 Cr.
+    # A count or pre-scaled alias keeps "num" even so: SUM(revenue) AS revenue_cr is
+    # already crore, and inheriting ₹ would format 9.68 as "₹10".
     inherited = _deep_engine._alias_units(res.get("sql") or "")
     kinds = {}
     for c in cols:
         k = col_kind(c, res["rows"])
-        kinds[c] = inherited.get(c.lower(), k) if k == "num" else k
-    rows = [{c: _fmt(r.get(c), kinds[c]) for c in cols} for r in res["rows"][:limit]]
+        kinds[c] = inherited.get(c.lower(), k) if k == "num" and not _plain_by_name(c) else k
+    dp = int(res.get("pct_dp") or 1)
+    rows = [{c: _fmt(r.get(c), kinds[c], dp) for c in cols} for r in res["rows"][:limit]]
     return {"columns": cols, "rows": rows, "row_count": res["row_count"],
             "truncated": res.get("truncated", False)}
 
 
-def _format_kpi_payload(obj, _depth: int = 0):
+def _report_pct_dp(obj) -> int:
+    """2 for a Jun–Aug 2026 report payload, else 1. Accepts the report's data dict (it carries
+    `data_window`) or call_kpi's wrapper around it, which is what deep mode formats."""
+    if isinstance(obj, dict):
+        if obj.get("data_window"):
+            return 2
+        inner = obj.get("data")
+        if isinstance(inner, dict) and inner.get("data_window"):
+            return 2
+        key = obj.get("_kpi_key")
+        if isinstance(key, str) and (kpi_registry.KPI_REGISTRY.get(key) or {}).get("window"):
+            return 2
+    return 1
+
+
+def _dumps(obj) -> str:
+    """JSON for a message to the model. ensure_ascii=False: the default turned every ₹ into
+    a six-character escape, about 10% more tokens on a money-heavy result for nothing."""
+    return json.dumps(obj, default=str, ensure_ascii=False)
+
+
+def _trim_lists(obj, n: int, trimmed: dict, path: str = "", max_str: int | None = None):
+    """A copy of `obj` with every list cut to its first `n` items (recording the original
+    length of each cut list in `trimmed`) and, optionally, every string cut to `max_str`."""
+    if isinstance(obj, dict):
+        return {k: _trim_lists(v, n, trimmed, f"{path}.{k}" if path else str(k), max_str) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if len(obj) > n:
+            trimmed[path or "list"] = len(obj)
+        return [_trim_lists(v, n, trimmed, path, max_str) for v in obj[:n]]
+    if max_str and isinstance(obj, str) and len(obj) > max_str:
+        return obj[:max_str] + "…"
+    return obj
+
+
+def _fit(obj, budget: int = 6000) -> str:
+    """JSON for a tool result that fits `budget` characters AND still parses.
+
+    Tool results used to be `json.dumps(x)[:6000]`, which cut mid-string: revenue-margin
+    lost the end of top_items and all of by_category, reorder-priority most of its items.
+    The model then reasoned from broken JSON while the chart was drawn from the full data —
+    a ready source of prose that disagrees with its own chart. This shortens lists from the
+    tail instead (rows come most-important first) and says which lists were cut and how long
+    they were, so the model knows it is looking at the top of a longer list. Every top-level
+    key survives; as a last resort the largest values are replaced by a marker."""
+    s = _dumps(obj)
+    if len(s) <= budget:
+        return s
+    t = obj
+    for n, max_str in ((20, None), (10, None), (5, None), (3, 300), (1, 120)):
+        trimmed: dict = {}
+        t = _trim_lists(obj, n, trimmed, max_str=max_str)
+        if not isinstance(t, dict):
+            t = {"data": t}
+        if trimmed:
+            t = {**t, "_trimmed": {"note": f"lists cut to their first {n} rows; full lengths here",
+                                   **{k: v for k, v in list(trimmed.items())[:12]}}}
+        s = _dumps(t)
+        if len(s) <= budget:
+            return s
+    # Still too big (very wide rows, or many keys): keep every key, drop the largest values.
+    while len(s) > budget:
+        big = max((k for k in t if t[k] != "(omitted: too large)" and k != "_trimmed"),
+                  key=lambda k: len(_dumps(t[k])), default=None)
+        if big is None:
+            break
+        t = {**t, big: "(omitted: too large)"}
+        s = _dumps(t)
+    if len(s) > budget:
+        s = _dumps({"_note": "result too large to show", "keys": [str(k) for k in list(t)[:40]]})
+    return s
+
+
+def _format_kpi_payload(obj, pct_dp: int | None = None, _depth: int = 0):
     """Pre-format a get_kpi() response the SAME way run_sql rows already are (_format_result
     above) before it ever reaches the model as a tool result. get_kpi's raw dict/list payload
     is straight from the KPI function — real rupee/day/percent values, e.g.
@@ -242,7 +540,13 @@ def _format_kpi_payload(obj, _depth: int = 0):
     reads as money/percent/days with the identical pre-formatted string run_sql gets, so the
     model quotes it verbatim instead of re-deriving it. Only touches the copy sent to the
     model — the raw `data` object used for `chartable`/the deterministic chart pipeline is
-    untouched, so chart/table values keep coming from code, never model math."""
+    untouched, so chart/table values keep coming from code, never model math.
+
+    `pct_dp` left as None picks 2 decimals for a Jun–Aug 2026 report payload (to match the
+    Formulary and Spend pages) and 1 for everything else. Deep mode calls this with the
+    payload alone, so the choice has to be made here rather than by the caller."""
+    if pct_dp is None:
+        pct_dp = _report_pct_dp(obj)
     if _depth > 6:
         return obj
     if isinstance(obj, dict):
@@ -250,13 +554,45 @@ def _format_kpi_payload(obj, _depth: int = 0):
         for k, v in obj.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 kind = infer_kind(str(k))
-                out[k] = _fmt(v, kind) if kind != "num" else v
+                out[k] = _fmt(v, kind, pct_dp) if kind != "num" else v
             else:
-                out[k] = _format_kpi_payload(v, _depth + 1)
+                out[k] = _format_kpi_payload(v, pct_dp, _depth + 1)
         return out
     if isinstance(obj, list):
-        return [_format_kpi_payload(v, _depth + 1) for v in obj]
+        return [_format_kpi_payload(v, pct_dp, _depth + 1) for v in obj]
     return obj
+
+
+def _kpi_evidence(kpi_key: str, purpose: str, data, pct_dp: int = 1) -> list[dict]:
+    """The rows a get_kpi payload contributes to this turn's evidence, in the shape run_sql
+    results have, so the existing chart/table pipeline and both number checks read them.
+
+    Two kinds. The HEADLINE: a flat `totals` dict (compliance %, drug cost, margin loss) as a
+    one-row result. Only the breakdown list used to be registered, so the headline figure
+    the answer leads with was evidence to neither the number check nor the auditor — a
+    correct headline could be flagged as a 10x error of some row, and a real scale error in
+    it could not be caught. The BREAKDOWN: the first list of dicts in the payload (every
+    /insights route returns at least one — worst/best/tiers/by_plant/buckets/rows...), found
+    by shape rather than a per-KPI field name. The breakdown goes last so it stays results[-1]
+    for the auto-chart and the table."""
+    out: list[dict] = []
+    if not isinstance(data, dict):
+        return out
+    totals = data.get("totals")
+    if isinstance(totals, dict):
+        flat = {k: v for k, v in totals.items()
+                if not isinstance(v, (dict, list, tuple)) and not str(k).startswith("_")}
+        if flat:
+            out.append({"sql": f"-- get_kpi('{kpi_key}') totals", "purpose": purpose + " — headline",
+                        "columns": list(flat), "rows": [flat], "row_count": 1, "truncated": False,
+                        "pct_dp": pct_dp})
+    for v in data.values():
+        if isinstance(v, list) and v and all(isinstance(row, dict) for row in v) and len(v) <= 200:
+            out.append({"sql": f"-- get_kpi('{kpi_key}')", "purpose": purpose,
+                        "columns": list(v[0].keys()), "rows": v, "row_count": len(v), "truncated": False,
+                        "pct_dp": pct_dp})
+            break
+    return out
 
 
 SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question about the data by writing DuckDB SQL against the warehouse below and reasoning over the REAL results. You never invent numbers.
@@ -265,9 +601,10 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 
 HOW YOU WORK — like a sharp, friendly human analyst:
 • NAMED KPI? If the question names or clearly maps to one of the KNOWN KPIS listed in get_kpi's own description, call get_kpi FIRST — it returns the exact same calculation the dashboard card for that metric uses, not a re-derived approximation. Only fall back to run_sql for that topic if get_kpi genuinely doesn't cover the specific cut being asked for (e.g. a single named item's detail, or a custom breakdown no KPI card offers). get_kpi accepts a specific hospital or category — try that argument before ever telling the user a breakdown "isn't available"; do not reason about whether it's queryable, just call it and see.
+• <<REPORTS>> REPORTS — formulary compliance %, out-of-formulary spend, restricted/preferred brand use (brand rules), scheme/Attis/Healthium brand saving missed, and cash & TPA margin loss — exist ONLY through get_kpi keys formulary-compliance, brand-rules, scheme-brand-saving, attis-saving, cash-tpa-margin-loss. There is no SQL table for them: never answer them with run_sql or from dim_material.formulary_status (that flag is only for "is item X on the formulary" and the <<SALES_SHORT>> sales share by formulary status). They take month / view / doctor / material / payer / patient_type / segment arguments. The default is the latest month (<<REPORTS_LATEST>>), so pass month for any other month (month="all" with view="trend" for month by month) and always state the month(s) you used. Their percentages are ratios of sums: never add or average them across hospitals — pass several codes (plant="HC05,HC06") for a pooled figure, or view="hospitals" to rank them. They do not overlap the <<SALES>> sales/procurement window.
 • UNDERSTAND the real intent first. If the request is ANSWERABLE from the data but genuinely ambiguous or under-specified (unclear time range, which metric/entity), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
-• NEVER ask permission to give an answer you can already give. If the requested BREAKDOWN does not exist but the figure does, produce the figure and say what is missing — do not stop at "would you like the total instead?". Asked for a monthly sales trend for one item, the right reply states that there is no monthly sales grain AND gives the six-month total in the same breath; asking whether the user wants it is a wasted turn that makes the assistant look like it is refusing. ask_clarification is for choosing BETWEEN real options, never for offering something you could simply have handed over.
-• OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts). If asked for something the data simply doesn't contain — people/roles (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
+• NEVER ask permission to give an answer you can already give. Check the DIMENSIONAL MODEL first: if a table carries the entity AND a time axis (e.g. sales_by_material_month for one product's monthly sales, <<SALES>>), query it. Only if no table carries that combination, give the closest correct figure in the same reply and name what is missing — never end the turn with "would you like … instead?"; asking whether the user wants it is a wasted turn that makes the assistant look like it is refusing. ask_clarification is for choosing BETWEEN real options, never for offering something you could simply have handed over.
+• OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts) and HCG's <<REPORTS>> reports (formulary compliance, brand rules, scheme/Attis brand savings, cash & TPA margin loss). If asked for something the data simply doesn't contain — people/roles OTHER THAN the treating doctors in those reports (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
 • If lookup_item returns probably_not_an_item=true, the name is NOT a product — it is a manufacturer, vendor or hospital, and `also_found_in` says which column holds it. Filter THAT column. "MSD" matched a stationery sticker called STICKER-MSDS on a substring while MSD the manufacturer has 614 procurement lines worth ₹42.34 Cr; answering about the sticker is the wrong entity, not a near miss. Do NOT offer those substring matches back as a clarifying choice either — the flag means they are coincidences, so listing them asks the user to pick between the right answer and noise. Proceed with the manufacturer/vendor and say which you used.
 • SPECIFIC ITEM? For ANY question about a particular product/SKU (named or by code), call lookup_item FIRST. It returns the item's identity (generic, group, manufacturer, formulary status) and a COMPLETE footprint — the row count in EVERY table it touches (sales, PO, GRN, consumption, inventory, forecasts). This guarantees you never miss a source: an item with 0 sales/purchases but rows in fact_inventory is DEAD / NON-MOVING stock (report qty, aging, expiry, formulary) — never call that "no data". Then run_sql only the tables the footprint shows have rows.
 • BEFORE you write a query, check the DIMENSIONAL MODEL above for the table you're about to use: you may only GROUP BY / filter on a dimension in its "slice by" list, and may only show a time trend if its "time axis" isn't NONE. If the cut the user wants (a dimension × a time axis, or two dimensions) doesn't exist together in any one table, that exact breakdown is NOT available — give the closest correct cut and say so. Never take a broader table's numbers and label them as a narrower entity/period.
@@ -501,12 +838,19 @@ def _canon_num(tok: str) -> str | None:
     return f"{v:g}{unit}"
 
 
+_UNIT_RUPEES = {"cr": 1e7, "l": 1e5, "k": 1e3, "": 1.0}
+
+
 def _evidence_numbers(results: list[dict]) -> set[str]:
     """Every pre-formatted figure across every query result this turn, canonicalised."""
     out: set[str] = set()
     for res in results or []:
         cols = res.get("columns") or []
         kinds = {c: col_kind(c, res.get("rows") or []) for c in cols}
+        # A pre-scaled revenue_cr of 9.68 is formatted "9.68", but the prose rightly says
+        # "₹9.68 Cr". Registered with its unit too, so that figure is stated exactly and a
+        # 10x slip of it ("₹96.8 Cr") is caught like any other money figure.
+        units = {c: prescaled_unit(c) for c in cols if kinds[c] == "num"}
         for row in (res.get("rows") or []):
             for c in cols:
                 s = _fmt(row.get(c), kinds[c])
@@ -514,6 +858,10 @@ def _evidence_numbers(results: list[dict]) -> set[str]:
                     continue
                 for tok in _NUM_TOKEN.findall(str(s)) or [str(s)]:
                     cn = _canon_num(str(tok))
+                    if cn:
+                        out.add(cn)
+                if units.get(c) and isinstance(row.get(c), (int, float)):
+                    cn = _canon_num(str(s) + units[c])
                     if cn:
                         out.add(cn)
     return out
@@ -539,13 +887,16 @@ def _unsupported_numbers(answer: str, results: list[dict], _unused: int = 0) -> 
     """
     if not answer or not results:
         return []
+    # Compared in RUPEES, not in the digits as written: "₹45 L" and "₹0.45 Cr" are the same
+    # figure, and comparing 45 with 0.45 called a correct restatement a 100x error. A real
+    # scale slip is still 10x/100x/1000x off in rupees.
     have: list[float] = []
     for cn in _evidence_numbers(results):
         m = _NUM_ONLY.search(cn)
         if m and cn.endswith(("cr", "l", "k")):
             try:
-                have.append(float(m.group(0)))
-            except ValueError:
+                have.append(float(m.group(0)) * _UNIT_RUPEES[cn[m.end():]])
+            except (ValueError, KeyError):
                 pass
     if not have:
         return []
@@ -562,7 +913,7 @@ def _unsupported_numbers(answer: str, results: list[dict], _unused: int = 0) -> 
         if not m:
             continue
         try:
-            v = float(m.group(0))
+            v = float(m.group(0)) * _UNIT_RUPEES.get(cn[m.end():], 1.0)
         except ValueError:
             continue
         if v <= 0:
@@ -596,26 +947,64 @@ PASS (ok=true) when the numbers are SUPPORTED, correctly SCOPED, and correctly L
   • wording/tone/brevity/rounding; describing a correctly-computed median or typical value as "on average" / "typically";
   • a missing caveat or context (e.g. not noting that top items are non-clinical) — desirable, but its absence is not an error;
   • being incomplete but correct (top N instead of all; one lens of several);
-  • an HONEST "this exact breakdown/metric/granularity isn't available" that offers the closest correct, clearly-labelled alternative (e.g. "monthly sales isn't available at item level; here are the item's monthly purchases").
+  • an HONEST "this exact breakdown/metric/granularity isn't available" that offers the closest correct, clearly-labelled alternative (e.g. "sales by hospital per month isn't available; here is each hospital's <<SALES_MONTHS>>-month total"). It is NOT honest when the queries show the breakdown does exist (one product's monthly sales are in sales_by_material_month) — that is category 5.
 When unsure whether it's a real defect or just imperfect phrasing, PASS. Reserve ok=false for numbers that are actually wrong, mis-scoped, or mislabelled in a way that changes their meaning.
 
 Reply ONLY JSON: {"ok": true|false, "issue": "<empty if ok; else the SPECIFIC defect that makes a number wrong/misleading>", "fix": "<empty if ok; else a concrete instruction: which table/filter/metric/grain to use instead>"}."""
 
 
-def _verify(client, query, results, answer, history=None):
+_AUDIT_BUDGET = 14000
+
+
+def _audit_payload(query, results, answer, history=None, budget: int = _AUDIT_BUDGET) -> str:
+    """The auditor's input as JSON that fits `budget` and always parses.
+
+    It used to be {question, answer, prior_conversation (24 messages), queries} cut at
+    14,000 characters. The evidence came LAST, so in a long (shared) session it was the part
+    cut off: measured, 'queries' started at character 12,668, leaving 1,332 characters of
+    evidence in broken JSON. The auditor could not see the numbers and failed correct
+    answers as NUMBER MISMATCH — each bounce another gpt-4o round and another audit. Now the
+    evidence goes before the history, the history is the last 6 messages at 300 characters
+    (the scope a refinement must keep is in the recent turns), and when it is still too long
+    the history goes first, then result rows from the tail, then long SQL text. Every query
+    stays; only if even that cannot fit does the generic _fit trim the list."""
+    p = {"question": query, "answer": answer,
+         "queries": [{"sql": r.get("sql"), "purpose": r.get("purpose"), "result": _format_result(r, 15)}
+                     for r in (results or [])],
+         "prior_conversation": [{"role": h.get("role"), "content": str(h.get("content"))[:300]}
+                                for h in (history or [])[-6:]]}
+    s = _dumps(p)
+    while len(s) > budget and p["prior_conversation"]:
+        p["prior_conversation"].pop(0)
+        s = _dumps(p)
+    while len(s) > budget and any(len(q["result"]["rows"]) > 3 for q in p["queries"]):
+        for q in p["queries"]:
+            q["result"]["rows"] = q["result"]["rows"][:max(3, len(q["result"]["rows"]) // 2)]
+        s = _dumps(p)
+    if len(s) > budget:
+        # many queries with long SQL: shorten the SQL text, never drop a query
+        for q in p["queries"]:
+            q["sql"] = str(q["sql"] or "")[:600]
+        p["answer"] = str(answer or "")[:3000]
+        s = _dumps(p)
+    if len(s) > budget:
+        s = _fit(p, budget)
+    return s
+
+
+def _verify(client, query, results, answer, history=None, _acc: _Usage | None = None):
     """Strict auditor: numbers supported AND correctly scoped/sourced. Returns (ok, issue, fix).
     `history` (prior turns) lets it catch a follow-up that silently drops a scope/filter
     established earlier — invisible from the current turn's query text alone."""
-    payload = {"question": query, "answer": answer,
-               "prior_conversation": [{"role": h.get("role"), "content": str(h.get("content"))[:400]} for h in (history or [])[-HISTORY_MESSAGES:]],
-               "queries": [{"sql": r["sql"], "purpose": r.get("purpose"), "result": _format_result(r, 15)} for r in results]}
+    if _acc is not None:
+        _acc.audits += 1
     try:
-        resp = _chat(client,
+        resp = _chat(client, _acc=_acc, _kind="audit",
             model=AZURE_DEPLOYMENT, temperature=0,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _AUDITOR_SYS},
-                {"role": "user", "content": json.dumps(payload)[:14000]},
+                {"role": "user", "content": _audit_payload(query, results, answer, history)},
             ])
         out = json.loads(resp.choices[0].message.content or "{}")
         return bool(out.get("ok", True)), str(out.get("issue", "")), str(out.get("fix", ""))
@@ -627,13 +1016,15 @@ _FOLLOWUP_SYS = """You suggest 2-3 short follow-up questions a hospital supply-c
 
 You are given a GRAIN MAP: for each table, exactly which dimensions it can be sliced by and whether it has a time axis. This is ground truth — do NOT suggest a breakdown or trend that isn't actually supported by some table's real dimensions/time axis (e.g. never suggest "by department" for a revenue/sales question if no sales-side table lists a department/cost-centre dimension; never suggest "the trend over N months" for a table whose time axis is NONE). When unsure whether something is really sliceable, prefer a SAFER suggestion instead: a top-N variant, a comparison to a specific already-named entity, an outlier/consistency check, or a breakdown by a dimension you can actually see listed for a relevant table.
 
+HCG's <<REPORTS>> REPORTS (formulary compliance, brand rules, scheme/Attis brand saving missed, cash & TPA margin loss) are NOT in the GRAIN MAP: they can be broken down by month (Jun, Jul, Aug 2026 only), hospital, treating doctor, item/brand, segment (onco / non-onco), IP/OP and payer.
+
 Rules:
 1. Ground every suggestion in a SPECIFIC entity, number, or comparison that is actually named in the answer (a real item, vendor, manufacturer, category, plant, month, or metric mentioned there) — never a vague "would you like to explore further?" or "let me know if you want more details".
-2. Only suggest something genuinely answerable given the GRAIN MAP below. Never suggest anything outside the hospital supply-chain domain (no patient records, staff, org chart, external/competitor data).
-3. Keep each suggestion short (under ~9 words), phrased as a natural next question or a concrete drill-down instruction — e.g. "Break this down by hospital", "Which vendor supplies that item?", "Show the monthly trend", "Compare it to last month".
+2. Only suggest something genuinely answerable given the GRAIN MAP below (or, for the <<REPORTS>> reports, the breakdowns listed above). Never suggest anything outside the hospital supply-chain domain (no patient records, staff, org chart, external/competitor data). Treating DOCTORS are fine for the <<REPORTS>> reports — e.g. "Which doctors drove the out-of-formulary spend?" — and for nothing else.
+3. Keep each suggestion short (under ~9 words), phrased as a natural next question or a concrete drill-down instruction — e.g. "Break this down by hospital", "Which vendor supplies that item?", "Show the monthly trend", "Compare it to the previous month".
 4. Do not repeat the question that was just asked, and do not suggest something the answer already fully covered.
 5. If the answer is a simple closed fact with little to drill into, still offer a grounded next angle consistent with the GRAIN MAP — always return AT LEAST 1 suggestion, never an empty list, unless the answer is a decline/out-of-scope message with nothing to build on (then return an empty list).
-6. Specific traps to never fall into (these are the mistakes a generic BI assistant makes by default — do NOT make them here): sales/revenue data has NO vendor dimension (vendor only exists on the procurement side — never suggest "which vendor contributes to revenue" or similar) and NO cost-centre/department dimension (that's consumption-side only) and NO plant/region column at all (sales is hospital-based only). This whole dataset covers only a 6-month window — NEVER suggest a year-over-year / "vs last year" / 12-month-trend comparison; a "trend" suggestion must stay within the 6-month window (e.g. "month over month" is fine, "vs last year" is not).
+6. Specific traps to never fall into (these are the mistakes a generic BI assistant makes by default — do NOT make them here): sales/revenue data has NO vendor dimension (vendor only exists on the procurement side — never suggest "which vendor contributes to revenue" or similar) and NO cost-centre/department dimension (that's consumption-side only) and NO plant/region column at all (sales is hospital-based only). Sales, procurement, inventory and consumption cover only a <<SALES_MONTHS>>-month window (<<SALES>>), and the <<REPORTS>> reports only three months — NEVER suggest a year-over-year / "vs last year" / 12-month-trend comparison, or a comparison between the two windows; a "trend" suggestion must stay within its own window (e.g. "month over month" is fine, "vs last year" is not).
 
 Reply ONLY JSON: {"follow_ups": ["...", "...", "..."]}"""
 
@@ -653,7 +1044,22 @@ def _drop_invalid_cross_domain(suggestions: list[str], query: str, answer: str) 
     return [s for s in suggestions if not _INVALID_CROSS_DOMAIN.search(s)]
 
 
-def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None) -> list[str]:
+def _grain_for(results: list[dict] | None) -> str:
+    """The grain-map lines for the tables this turn's queries actually used. The whole map is
+    ~6.5k characters for ~49 tables, and pushed the payload past its old 10,000-character cut
+    (mid-JSON) on long SQL; the follow-ups only need the tables in play. A turn that ran no
+    SQL (canonical get_kpi only) gets the whole map, as before."""
+    full = warehouse.grain_text()
+    sql = " ".join(str(r.get("sql") or "") for r in (results or [])).lower()
+    if not sql.strip():
+        return full
+    used = [ln for ln in full.splitlines()
+            if ln.split(":", 1)[0].strip() and re.search(r"\b" + re.escape(ln.split(":", 1)[0].strip().lower()) + r"\b", sql)]
+    return "\n".join(used) if used else full
+
+
+def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None,
+                    _acc: _Usage | None = None) -> list[str]:
     """Cheap, dedicated follow-up-question generator on gpt-4o-mini (not gpt-4o — this is
     a lightweight wording task, not analytical SQL reasoning). Runs on every real answer so
     suggestions are reliably present and grounded in what was just discussed, rather than
@@ -665,15 +1071,16 @@ def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None)
     if not answer:
         return []
     try:
-        queries = [{"purpose": r.get("purpose"), "sql": r.get("sql")} for r in (results or []) if r.get("purpose")][:5]
+        queries = [{"purpose": r.get("purpose"), "sql": str(r.get("sql") or "")[:800]}
+                   for r in (results or []) if r.get("purpose")][:5]
         payload = {"question": query, "answer": answer[:1200], "queries_run": queries,
-                   "grain_map": warehouse.grain_text()}
-        resp = _chat(client,
+                   "grain_map": _grain_for(results)}
+        resp = _chat(client, _acc=_acc, _kind="followups",
             model=MINI_DEPLOYMENT, temperature=0.1, max_tokens=200,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _FOLLOWUP_SYS},
-                {"role": "user", "content": json.dumps(payload)[:10000]},
+                {"role": "user", "content": _fit(payload, 10000)},
             ])
         out = json.loads(resp.choices[0].message.content or "{}")
         ups = [str(f).strip() for f in (out.get("follow_ups") or []) if str(f).strip()]
@@ -681,6 +1088,24 @@ def _gen_follow_ups(client, query: str, answer: str, results: list[dict] | None)
         return ups[:3]
     except Exception:
         return []
+
+
+# The follow-up call (~2.9 s on gpt-4o-mini) used to run after everything else, so every turn
+# ended that much later; on audited turns it queued behind the ~2 s audit too. It depends
+# only on the question, the answer text and the queries, all known once the answer is
+# written — so it starts then, on this pool, and runs while the audit does. Module-level so
+# turns share four threads rather than each making its own.
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ai-followups")
+
+
+def _start_follow_ups(client, query: str, answer: str, results: list[dict], acc: _Usage | None):
+    """Start the follow-up call for `answer` in the background. Returns (future, answer) —
+    the answer it was started for, so the end of the turn can tell whether the text it ships
+    is still that one (an audit bounce rewrites it). (None, "") if it could not start."""
+    try:
+        return _POOL.submit(_gen_follow_ups, client, query, answer, list(results or []), acc), answer
+    except Exception:
+        return None, ""
 
 
 _SCOPE_MARK = re.compile(r"\[active scope:\s*(.+?)\s*\]", re.I | re.S)
@@ -763,32 +1188,51 @@ def _derive_scope(results: list[dict]) -> str:
 
 
 def _latest_scope(history: list | None) -> str:
-    """Pull the most recent '[active scope: …]' marker an assistant turn carried
-    (the frontend appends it to the assistant content it echoes back). '' if none."""
+    """The '[active scope: …]' marker the most recent assistant turn carried (the frontend
+    appends it to the assistant content it echoes back). '' if that turn has none.
+
+    Only the most recent assistant turn counts. A clarifying question is stored without a
+    scope, and the reply to it ("yes", a clicked option) is short enough to read as a
+    refinement; walking further back handed that reply the scope of an older, unrelated
+    answer ("top vendors for injections" re-applied to "yes, the 6-month Keytruda total")."""
     for h in reversed(history or []):
         if h.get("role") == "assistant" and h.get("content"):
             m = _SCOPE_MARK.search(str(h["content"]))
-            if m:
-                return m.group(1).strip()[:300]
+            return m.group(1).strip()[:300] if m else ""
     return ""
 
 
-def answer(query: str, history: list | None = None):
-    """Generator of SSE event dicts: step / sql / answer / chart / table / verified / done / error."""
+def answer(query: str, history: list | None = None, context: dict | None = None):
+    """Generator of SSE event dicts: step / sql / answer / chart / table / verified / done / error.
+
+    `context` is the dashboard page the question was asked from (normalised by
+    app/ai/page_context in chat.py / router.py, and again by context_line), or None. The body is _answer; this wrapper only times the turn and logs what it cost,
+    whichever of its many exits it leaves by."""
+    acc = _Usage()
+    try:
+        yield from _answer(query, history, context, acc)
+    finally:
+        _log.info("ai.turn rounds=%d llm_calls=%d audits=%d prompt_tokens=%d cached_tokens=%d "
+                  "completion_tokens=%d secs=%.1f", acc.rounds, acc.calls, acc.audits, acc.prompt,
+                  acc.cached, acc.completion, acc.elapsed())
+
+
+def _answer(query: str, history: list | None, context: dict | None, acc: _Usage):
     if not has_key():
         yield {"type": "error", "text": "The AI Analyst isn't configured — set AZURE_OPENAI_API_KEY on the server."}
         return
+
+    # Fire the first visible progress step IMMEDIATELY, before anything that can take time —
+    # the schema context (built once per process, but the first build is the warehouse
+    # itself), routing's embedding call, then the model. Each is a real wait with nothing
+    # to show otherwise, and users read a long instant silence as "stuck".
+    yield {"type": "step", "text": "Understanding your question"}
     try:
         client = _client()
         ctx = semantics.context()
     except Exception as e:
         yield {"type": "error", "text": f"AI service unavailable: {e}"}
         return
-
-    # Fire the first visible progress step IMMEDIATELY, before any network call (routing's
-    # embedding call, then the model itself) — every one of those is a real few-seconds
-    # wait with nothing to show otherwise, and users read a long instant silence as "stuck".
-    yield {"type": "step", "text": "Understanding your question"}
 
     # IDENTIFY BEFORE QUERYING. Every wrong answer this assistant produced came from acting
     # on a word before typing it: "MSD" answered as a stationery sticker, "Bangalore" as a
@@ -835,6 +1279,13 @@ def answer(query: str, history: list | None = None):
             "to the specific named entity in that scope and FILTER your query to that entity "
             "(e.g. WHERE vendor_name = '<that vendor>'). (If you judge the user has in fact "
             "changed topic, ignore this.)"})
+    # The page the question was asked from: last, next to the question, because it describes
+    # THIS turn — the history above may have been asked from other pages. page_context builds
+    # it from whitelisted values and fixed wording only (deep mode uses the same line), so
+    # nothing the browser typed reaches this system message.
+    _page = page_context.context_line(context)
+    if _page:
+        messages.append({"role": "system", "content": _page})
 
     # Embedding-based routing hint (fail-open: '' on any error → static examples carry it).
     # When a prior scope is active (a refinement), suppress hard intent-locks so they can't
@@ -876,7 +1327,15 @@ def answer(query: str, history: list | None = None):
     # in one round and called present() in the next, and because present()'s `answer` field
     # is now deliberately empty, the turn persisted `"text": ""`. Verified in the DB.
     last_prose = ""
+    # Follow-up chips started in the background for a candidate answer (see _POOL), and the
+    # answer text they were started for.
+    fu_future, fu_text = None, ""
     for step_idx in range(MAX_SQL_STEPS):
+        if results and acc.elapsed() > TURN_DEADLINE_S:
+            # Out of time. Stop gathering; the no-tools "Writing the answer" round below
+            # answers from what is already in hand, which beats another round of waiting.
+            break
+        acc.rounds += 1
         if step_idx > 0:
             # Every iteration's first move is a full, non-streamed model round-trip that
             # decides "run another query" vs "write the final answer" — genuinely a few
@@ -897,7 +1356,7 @@ def answer(query: str, history: list | None = None):
         streamed_prose = ""
         try:
             for kind, payload in _chat_stream(
-                client, model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
+                client, _acc=acc, model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
                 tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL],
                 tool_choice="auto",
             ):
@@ -908,21 +1367,25 @@ def answer(query: str, history: list | None = None):
                     msg = payload
             if streamed_prose.strip():
                 last_prose = streamed_prose
-        except Exception:
+        except Exception as stream_err:
             # A stream cannot be safely retried mid-flight (duplicate or lost text), so fall
-            # back to the non-streaming path, which has its own retry/backoff.
+            # back to the non-streaming path, which has its own retry/backoff. Not when the
+            # stream never opened for a transient reason: _chat already retried that, and the
+            # same call without streaming would only fail the same way four more times.
             if streamed_prose:
                 yield {"type": "answer_reset"}
             try:
-                resp = _chat(client,
+                if isinstance(stream_err, _StreamOpenFailed) and stream_err.retriable:
+                    raise stream_err
+                resp = _chat(client, _acc=acc,
                     model=AZURE_DEPLOYMENT, messages=messages, temperature=0,
                     tools=[GET_KPI_TOOL, RUN_SQL_TOOL, LOOKUP_TOOL, PRESENT_TOOL, CLARIFY_TOOL],
                     tool_choice="auto")
                 msg = resp.choices[0].message
-            except Exception:
+            except Exception as call_err:
                 if results:
                     break
-                yield {"type": "error", "text": "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."}
+                yield {"type": "error", "text": _llm_error_text(call_err)}
                 return
         if msg is not None and not msg.tool_calls:
             if msg.content or last_prose:
@@ -951,12 +1414,29 @@ def answer(query: str, history: list | None = None):
                 _typos = _resolver.spelling_suggestions(query, _resolver.resolve(query))
                 if _typos:
                     _t = _typos[0]
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dumps(
                         {"error": f"Do not ask. \"{_t['typed']}\" is a misspelling of "
                                   f"\"{_t['meant']}\" ({_t['similarity']:.0%} match, "
                                   f"e.g. {', '.join(_t['examples'][:2])}). Proceed on that "
                                   f"reading, state that you read it that way, and answer."})})
                     yield {"type": "step", "text": f"Reading that as \u201c{_t['meant']}\u201d"}
+                    continue
+                # Nor is a question whose answer is one known query. "Get me the sales trend
+                # of keytruda" came back as "there's no monthly breakdown — would you like
+                # the 6-month total instead?" on a build whose prompt already said never to
+                # ask that and whose warehouse had the product's monthly sales. A prompt
+                # rule did not hold, so the refusal is in code: when the resolver can name
+                # the one correct query, asking is not allowed.
+                try:
+                    _canon = _resolver.item_trend_sql(query)
+                except Exception:
+                    _canon = None
+                if _canon:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dumps(
+                        {"error": "Do not ask. This product's monthly sales exist — run exactly this "
+                                  "with run_sql and answer from it (one row per month, <<SALES>>): "
+                                  + _canon})})
+                    yield {"type": "step", "text": "Fetching the product's monthly sales"}
                     continue
                 yield {"type": "clarify", "text": args.get("question", "Could you clarify what you'd like?"),
                        "options": args.get("options", [])}
@@ -970,51 +1450,78 @@ def answer(query: str, history: list | None = None):
                 kpi_key = (args.get("kpi") or "").strip()
                 plant = (args.get("plant") or "").strip() or None
                 category = (args.get("category") or "").strip() or None
+                # month, view, doctor, payer … for the Jun–Aug 2026 reports. Only set values
+                # travel; call_kpi hands back the ones this KPI does not take.
+                extra = {}
+                for _name in kpi_registry.EXTRA_ARGS:
+                    _val = args.get(_name)
+                    if isinstance(_val, str):
+                        _val = _val.strip()
+                    if _val not in (None, "", [], ()):
+                        extra[_name] = _val
+                entry = kpi_registry.KPI_REGISTRY.get(kpi_key) or {}
                 # The canonical path produces no SQL, so every scope guard in this file
                 # sat it out: "Bangalore hospitals spend ₹649.91 Cr" was the whole network.
+                # `ratio`: a percentage KPI's per-site figures must never be summed, so the
+                # advice it gets back is worded differently.
                 from app.ai.deep import tools as _deep_tools
-                _mis = _deep_tools._kpi_scope_mismatch(kpi_key, plant or "", query)
+                _mis = _deep_tools._kpi_scope_mismatch(kpi_key, plant or "", query,
+                                                       ratio=bool(entry.get("ratio")))
                 if _mis:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
-                                     "content": json.dumps({"error": _mis})})
+                                     "content": _dumps({"error": _mis})})
                     any_sql_failed = True
-                    yield {"type": "step", "text": "Scoping that to the named sites"}
+                    yield {"type": "step", "text": ("Querying the product's own rows" if _mis.startswith("COMPANY-WIDE")
+                                                    else "Scoping that to the named sites")}
                     continue
-                if kpi_key not in kpi_registry.KPI_REGISTRY:
+                if not entry:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
-                                      "content": json.dumps({"error": f"Unknown kpi '{kpi_key}'. Valid keys: {sorted(kpi_registry.KPI_REGISTRY)}"})})
+                                      "content": _dumps({"error": f"Unknown kpi '{kpi_key}'. Valid keys: {sorted(kpi_registry.KPI_REGISTRY)}"})})
                     continue
-                label = kpi_registry.KPI_REGISTRY[kpi_key]["label"]
+                label = entry["label"]
                 yield {"type": "step", "text": f"Looking up {label}" + (f" for {plant}" if plant else "")}
                 try:
-                    kr = kpi_registry.call_kpi(kpi_key, plant=plant, category=category)
-                    canonical_kpis_used.append(kpi_key)
+                    kr = kpi_registry.call_kpi(kpi_key, plant=plant, category=category, **extra)
                     data = kr["data"]
-                    purpose = f"{label}" + (f" — {plant}" if plant else "") + (f" — {category}" if category else "")
-                    canonical_scope_hint = purpose + (" (company-wide)" if not plant and not category else "")
-                    # Also register as a chartable "result" using the EXISTING, already-tested
-                    # chart/table pipeline below (_auto_chart / _pick_result / the table
-                    # fallback) instead of a parallel one: scan for the first list-of-dicts
-                    # field in the response (every /insights route already returns at least
-                    # one — worst/best/tiers/by_plant/buckets/reasons/...) rather than
-                    # hardcoding a field name per KPI, which is exactly the kind of
-                    # per-question special-casing this fix is meant to avoid.
-                    chartable = None
-                    for v in data.values():
-                        if isinstance(v, list) and v and all(isinstance(row, dict) for row in v) and len(v) <= 200:
-                            chartable = v
-                            break
+                    # A Jun–Aug report whose data is not loaded answers {"error": ...} rather
+                    # than raising. Registered as canonical evidence it would become a
+                    # "verified" answer about nothing; as a tool error it is read as one.
+                    if isinstance(data, dict) and set(data) == {"error"}:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": _dumps({"error": str(data["error"])[:300]})})
+                        continue
+                    canonical_kpis_used.append(kpi_key)
+                    ignored = list(kr.get("_ignored_args") or [])
+                    used = {k: v for k, v in extra.items() if k not in ignored}
+                    _args_txt = ", ".join(f"{k}={v}" for k, v in used.items())
+                    purpose = (f"{label}" + (f" — {plant}" if plant else "") + (f" — {category}" if category else "")
+                               + (f" — {_args_txt}" if _args_txt else ""))
+                    # "company-wide" only when nothing narrowed it: a month or a view does
+                    # not, a hospital, category, doctor or item does
+                    canonical_scope_hint = purpose + ("" if (plant or category or used.get("doctor") or used.get("material"))
+                                                      else " (company-wide)")
+                    dp = 2 if entry.get("window") else _report_pct_dp(data)
+                    # Registered with the EXISTING, already-tested chart/table pipeline below
+                    # (_auto_chart / _pick_result / the table fallback) rather than a parallel
+                    # one; the headline totals go in too, as evidence (see _kpi_evidence).
+                    evidence = _kpi_evidence(kpi_key, purpose, data, dp)
+                    _shown = ", ".join([f"plant={plant!r}", f"category={category!r}"]
+                                       + [f"{k}={v!r}" for k, v in used.items()])
                     yield {"type": "sql", "purpose": purpose,
-                           "sql": f"-- get_kpi('{kpi_key}', plant={plant!r}, category={category!r})  [canonical dashboard calculation, not a derived query]",
-                           "rows": len(chartable) if chartable else 1}
-                    if chartable:
-                        cols = list(chartable[0].keys())
-                        synth = {"sql": f"-- get_kpi('{kpi_key}')", "purpose": purpose,
-                                 "columns": cols, "rows": chartable, "row_count": len(chartable), "truncated": False}
-                        results.append(synth)
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_format_kpi_payload(data), default=str)[:6000]})
+                           "sql": f"-- get_kpi('{kpi_key}', {_shown})  [canonical dashboard calculation, not a derived query]",
+                           "rows": evidence[-1]["row_count"] if evidence else 1}
+                    results.extend(evidence)
+                    view = _format_kpi_payload(data, dp)
+                    if ignored:
+                        # call_kpi reports these on its wrapper, not in `data`, so the model
+                        # would otherwise never learn that its month did nothing here
+                        view = {**(view if isinstance(view, dict) else {"data": view}),
+                                "_ignored_args": ignored,
+                                "_ignored_note": (f"{', '.join(ignored)} do not apply to {kpi_key} and were NOT "
+                                                  f"used — this figure is not filtered by them.")}
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _fit(view, 6000)})
                 except Exception as e:
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:300]})})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dumps({"error": str(e)[:300]})})
                 continue
             if tc.function.name == "lookup_item":
                 name = (args.get("name") or "").strip()
@@ -1030,12 +1537,17 @@ def answer(query: str, history: list | None = None):
                             _v = str(_m.get(_k) or "").strip()
                             if _v:
                                 bound_entity.append(_v)
-                                for _w in re.findall(r"[A-Za-z]{4,}", _v)[:2]:
+                                # The first two DISTINCTIVE words. Dosage forms and units are
+                                # skipped: for KEYTRUDA 100MG INJ VIAL the first two words of
+                                # 4+ letters were KEYTRUDA and VIAL, so any query mentioning
+                                # "vial" passed as being about Keytruda.
+                                for _w in [w for w in re.findall(r"[A-Za-z]{4,}", _v)
+                                           if w.lower() not in _resolver._NOISE_TOKENS][:2]:
                                     bound_entity.append(_w)
                     yield {"type": "sql", "purpose": f"footprint of “{name}”", "sql": f"-- lookup_item('{name}')", "rows": fp["match_count"]}
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(fp)[:5000]})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _fit(fp, 5000)})
                 except Exception as e:
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"error": str(e)[:200]})})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dumps({"error": str(e)[:200]})})
                 continue
             # run_sql
             purpose = args.get("purpose") or "querying the data"
@@ -1056,7 +1568,7 @@ def answer(query: str, history: list | None = None):
                              or _scope.explain_zero_rows(sql))
                     if _hint:
                         messages.append({"role": "tool", "tool_call_id": tc.id,
-                                         "content": json.dumps({"error": _hint})})
+                                         "content": _dumps({"error": _hint})})
                         any_sql_failed = True
                         yield {"type": "step", "text": "Checking that against the other tables"}
                         continue
@@ -1073,7 +1585,7 @@ def answer(query: str, history: list | None = None):
                         or _onto.check(sql))
                 if _bad:
                     messages.append({"role": "tool", "tool_call_id": tc.id,
-                                     "content": json.dumps({"error": _bad})})
+                                     "content": _dumps({"error": _bad})})
                     any_sql_failed = True
                     yield {"type": "step", "text": "That total was impossible — re-deriving it"}
                     continue
@@ -1088,7 +1600,7 @@ def answer(query: str, history: list | None = None):
                 _payload = _format_result(res)
                 if res.get("coverage_note"):
                     _payload["coverage"] = res["coverage_note"]
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_payload)})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": _dumps(_payload)})
             except Exception as e:
                 # Keep internal self-corrections invisible: feed the error back to the model
                 # so it fixes the query, but don't surface a scary errored query to the user.
@@ -1097,7 +1609,7 @@ def answer(query: str, history: list | None = None):
                     fabricated_breakdown = True
                 yield {"type": "step", "text": "Refining the query"}
                 messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "content": json.dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
+                                 "content": _dumps({"error": str(e)[:300], "hint": "Fix the SQL and try again (check FROM clause, column names, and the typed schema)."})})
 
         # All tool calls in this batch are now acked. If the model asked to present,
         # AUDIT it before accepting — and on a real problem, send it back to re-query.
@@ -1132,11 +1644,15 @@ def answer(query: str, history: list | None = None):
                        "(they are already formatted as ₹Cr/₹L/%/days). Do not convert or restate "
                        "magnitudes yourself.")
 
+            if ok and cand_ans:
+                # Start the follow-up chips now, so they are written while the audit runs
+                # rather than after it. If the audit bounces this answer they are dropped.
+                fu_future, fu_text = _start_follow_ups(client, query, cand_ans, results, acc)
             if ok and is_canonical_only and cand_ans:
                 verified = "canonical"
             elif ok and results and cand_ans:
                 yield {"type": "step", "text": "Cross-checking the answer against the data"}
-                ok, issue, fix = _verify(client, query, results, cand_ans, history)
+                ok, issue, fix = _verify(client, query, results, cand_ans, history, _acc=acc)
             if ok or present_attempts >= MAX_AUDIT_RETRIES:
                 # Carry the AUDITED prose onto the accepted call. `cand_ans` already resolves
                 # where the answer actually lives — streamed prose first, the tool's own
@@ -1157,6 +1673,16 @@ def answer(query: str, history: list | None = None):
                 break
             # audit failed and we have a retry left → feed the problem back, let it fix
             present_attempts += 1
+            # Take the rejected answer off the screen. Without this the next round's text was
+            # appended to it in the same bubble, and a correction round that re-queried and
+            # called present() without new prose fell back to `last_prose` — the REJECTED
+            # answer — which could then be re-audited and ship as "corrected".
+            if streamed_prose or last_prose:
+                yield {"type": "answer_reset"}
+            last_prose = ""
+            if fu_future is not None:
+                fu_future.cancel()   # chips for an answer that will not ship
+            fu_future, fu_text = None, ""
             yield {"type": "step", "text": "Correcting the analysis"}
             messages.append({"role": "user", "content":
                 "AUDIT FAILED — your last answer was not accepted, do NOT repeat it. Problem: "
@@ -1165,10 +1691,19 @@ def answer(query: str, history: list | None = None):
                 + " If this is a WRONG SCOPE issue on a follow-up ('remove X', 'exclude Y', etc.): find your MOST RECENT run_sql call earlier in this conversation that established the scope (its WHERE/JOIN conditions for category, item type, entity…) and COPY those same conditions into the new query verbatim, adding only the new exclusion — do not rebuild from an unfiltered base."
                 + " Re-run the correct query (right table, filtered to the exact entity/scope the user asked about, right metric) and call present again with corrected numbers. If the data genuinely cannot answer it, say so honestly instead."})
 
-    if not present_args:
-        yield {"type": "answer", "text": "I couldn't resolve that into a query — try rephrasing, or ask about revenue, inventory, procurement, expiry, or forecasts."}
+    if not present_args and not results:
+        yield {"type": "answer", "text": windows.fill(
+            "I couldn't resolve that into a query — try rephrasing, or ask about revenue, inventory, procurement, "
+            "expiry, forecasts, or the <<REPORTS>> formulary compliance, brand rules, scheme savings and cash & TPA "
+            "margin loss reports.")}
         yield {"type": "done"}
         return
+    # Stopped WITHOUT an answer but WITH results — the turn deadline, the step cap, or a
+    # stream that died after real queries had run. Those results used to be thrown away
+    # ("I couldn't resolve that into a query" after four good queries); now the no-tools
+    # round below writes the answer from them.
+    late = present_args is None
+    present_args = present_args or {}
 
     ans = _sanitize_prose((present_args.get("answer") or "").strip())
 
@@ -1189,7 +1724,7 @@ def answer(query: str, history: list | None = None):
         recovered = ""
         try:
             for _kind, _payload in _chat_stream(
-                client, model=AZURE_DEPLOYMENT, temperature=0,
+                client, _acc=acc, _kind="write", model=AZURE_DEPLOYMENT, temperature=0,
                 messages=messages + [{"role": "user", "content":
                     "Write the answer now, as plain prose, using only the figures already "
                     "returned by the tools above — quote them exactly as they were formatted. "
@@ -1202,6 +1737,13 @@ def answer(query: str, history: list | None = None):
         except Exception:
             pass
         ans = _sanitize_prose(recovered.strip())
+        if late and not ans:
+            # no present(), and the writing round failed too: nothing to ship but an apology
+            yield {"type": "answer", "text": "I gathered the figures for that but couldn't finish writing the "
+                                             "answer in time — please ask again, or ask a narrower question.",
+                   "verified": None, "options": []}
+            yield {"type": "done"}
+            return
 
     # HONEST FAILURE: if the model gave up as free-text (no present() call) having gathered
     # ZERO successful query results after a SQL error, its prose is an ungrounded excuse —
@@ -1215,10 +1757,12 @@ def answer(query: str, history: list | None = None):
         # the model kept trying to manufacture a breakdown the table does not carry — and
         # saying so lets the reader ask the question the data CAN answer.
         yield {"type": "answer",
-               "text": ("That table doesn't hold a breakdown along the dimension you asked for — the "
-                        "figures exist only as a single total, so there is no real trend to show. Ask "
-                        "for the total instead, or for a split by a field the data actually carries "
-                        "(hospital, category, vendor)."
+               # Not "the figures exist only as a single total": for one product's monthly
+               # sales they do not, and saying so is the Keytruda reply again.
+               "text": ("That table doesn't hold a breakdown along the dimension you asked for. If you "
+                        "asked for one product's monthly sales, ask “monthly sales of <product>” — "
+                        "that data exists. Otherwise ask for the total, or for a split by a field the "
+                        "data carries (hospital, category, vendor)."
                         if fabricated_breakdown else
                         "I ran into a repeated error building the query for that and couldn't complete "
                         "it — please try rephrasing, or ask it a slightly different way."),
@@ -1235,12 +1779,16 @@ def answer(query: str, history: list | None = None):
     # If the answer came back as plain content (model didn't call present), it was never
     # audited inline — audit it now so EVERY data-backed answer gets the same gate. Same
     # canonical-only exemption as the inline path above.
+    if verified is None and ans and fu_future is None:
+        fu_future, fu_text = _start_follow_ups(client, query, ans, results, acc)   # runs during the audit
     if verified is None and canonical_kpis_used and free_sql_result_count == 0 and ans:
         verified = "canonical"
     elif verified is None and results and ans:
         yield {"type": "step", "text": "Cross-checking the answer against the data"}
-        ok, _issue, _fix = _verify(client, query, results, ans, history)
+        ok, _issue, _fix = _verify(client, query, results, ans, history, _acc=acc)
         verified = "ok" if ok else "flagged"
+    # the text the follow-up chips should be about: the answer as written, before any banner
+    ans_core = ans
 
     # FLAGGED = the auditor could not confirm the numbers after its retries. Don't let that
     # ship looking identical to a clean answer (the frontend badge alone was proven unreliable):
@@ -1322,11 +1870,28 @@ def answer(query: str, history: list | None = None):
                                           "rows": table_res["rows"][:50]},
                "note": ("Showing top 50 of %d rows." % table_res["row_count"]) if table_res.get("truncated") or table_res["row_count"] > 50 else ""}
 
-    # Better, grounded follow-ups (dedicated cheap-model call) computed only NOW — after the
-    # answer/chart/table have already reached the user — so the extra ~1-2s never delays the
-    # answer itself. Patches onto the same message once ready; if it's empty/errors, the
-    # gpt-4o-sourced chips already shown (possibly none) simply stay as they are.
-    better_follow_ups = _gen_follow_ups(client, query, ans, results)
+    # Better, grounded follow-ups (dedicated cheap-model call), delivered after the answer,
+    # chart and table have already reached the user, as a patch onto the same message; if
+    # empty or failed, the gpt-4o-sourced chips already shown (possibly none) simply stay.
+    # The call itself was started when the answer was written (in parallel with the audit),
+    # so usually it is already done. Its result is used only if it was made for the text
+    # that is shipping — a bounce or the writing round can change it.
+    better_follow_ups: list[str] = []
+    if fu_future is not None and _sanitize_prose((fu_text or "").strip()) == ans_core:
+        try:
+            better_follow_ups = fu_future.result(timeout=FOLLOWUP_WAIT_S)
+        except TimeoutError:
+            # One wait, then let it go: the answer ships with the chips already shown. cancel()
+            # frees the pool slot if the call is still queued behind other turns (a running
+            # call just finishes and its result is dropped); the turn never waits a second time.
+            fu_future.cancel()
+            better_follow_ups = []
+        except Exception:
+            better_follow_ups = []
+    else:
+        if fu_future is not None:
+            fu_future.cancel()
+        better_follow_ups = _gen_follow_ups(client, query, ans_core, results, _acc=acc)
     if better_follow_ups and better_follow_ups != follow_ups:
         yield {"type": "followups", "options": better_follow_ups}
 

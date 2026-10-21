@@ -48,20 +48,21 @@ _SHARED_MIN_TABLES = 3
 _JOIN_MIN_OVERLAP = 0.30
 
 
-def _con():
+def _query(sql: str, params: list | None = None, one: bool = False):
+    # Through warehouse.query, never a bare execute on con(): the connection is shared, and an
+    # unlocked execute+fetch can read another thread's result set (see warehouse._lock).
     from app.ai import warehouse
-    return warehouse.con()
+    return warehouse.query(sql, params, one)
 
 
 # ── PHASE A · PROFILE (deterministic) ────────────────────────────────────────────────────
 def profile_column(table: str, column: str, sample: int = 8) -> dict:
     """Measured facts about one column. No interpretation."""
-    c = _con()
     q = f'"{table}"."{column}"'
     try:
-        n, distinct, nulls = c.execute(
+        n, distinct, nulls = _query(
             f'SELECT COUNT(*), COUNT(DISTINCT {q}), COUNT(*) FILTER (WHERE {q} IS NULL) '
-            f'FROM "{table}"').fetchone()
+            f'FROM "{table}"', one=True)
     except Exception:
         return {}
     if not n:
@@ -71,26 +72,25 @@ def profile_column(table: str, column: str, sample: int = 8) -> dict:
            "null_pct": round(100.0 * (nulls or 0) / n, 1),
            "uniqueness": round((distinct or 0) / n, 4)}
     try:
-        dtype = c.execute(
+        dtype = _query(
             "SELECT data_type FROM information_schema.columns "
-            "WHERE table_name = ? AND column_name = ?", [table, column]).fetchone()
+            "WHERE table_name = ? AND column_name = ?", [table, column], one=True)
         out["type"] = str(dtype[0]) if dtype else "?"
     except Exception:
         out["type"] = "?"
     numeric = any(k in out["type"].upper() for k in ("INT", "DOUBLE", "DECIMAL", "FLOAT", "BIG"))
     if numeric:
         try:
-            lo, hi, total, neg = c.execute(
+            lo, hi, total, neg = _query(
                 f'SELECT MIN({q}), MAX({q}), SUM({q}), COUNT(*) FILTER (WHERE {q} < 0) '
-                f'FROM "{table}"').fetchone()
+                f'FROM "{table}"', one=True)
             out.update(min=lo, max=hi, total=total, negatives=neg or 0,
                        all_zero=(lo == 0 and hi == 0))
         except Exception:
             pass
     try:
-        vals = c.execute(
-            f'SELECT DISTINCT {q} FROM "{table}" WHERE {q} IS NOT NULL LIMIT {sample}'
-        ).fetchall()
+        vals = _query(
+            f'SELECT DISTINCT {q} FROM "{table}" WHERE {q} IS NOT NULL LIMIT {sample}')
         out["samples"] = [str(v[0])[:40] for v in vals]
     except Exception:
         out["samples"] = []
@@ -98,8 +98,7 @@ def profile_column(table: str, column: str, sample: int = 8) -> dict:
 
 
 def _same_name_columns() -> dict[str, list[str]]:
-    rows = _con().execute(
-        "SELECT column_name, table_name FROM information_schema.columns").fetchall()
+    rows = _query("SELECT column_name, table_name FROM information_schema.columns")
     by: dict[str, list[str]] = {}
     for col, tbl in rows:
         if str(tbl).startswith("_"):
@@ -117,13 +116,12 @@ def overlap(col_a: str, table_a: str, col_b: str, table_b: str) -> float:
     disjoint code systems on the first day instead of the fortieth.
     """
     try:
-        d = _con().execute(
-            f'SELECT COUNT(DISTINCT "{col_a}") FROM "{table_a}"').fetchone()[0]
+        d = _query(f'SELECT COUNT(DISTINCT "{col_a}") FROM "{table_a}"', one=True)[0]
         if not d:
             return 0.0
-        n = _con().execute(
+        n = _query(
             f'SELECT COUNT(*) FROM (SELECT DISTINCT "{col_a}" v FROM "{table_a}") x '
-            f'WHERE x.v IN (SELECT "{col_b}" FROM "{table_b}")').fetchone()[0]
+            f'WHERE x.v IN (SELECT "{col_b}" FROM "{table_b}")', one=True)[0]
     except Exception:
         return 0.0
     return round(n / d, 3)
@@ -168,15 +166,13 @@ def _same_shape(ta: str, ca: str, tb: str, cb: str) -> bool:
 
 def profile() -> dict:
     """The deterministic skeleton: every table, every column, plus real join evidence."""
-    c = _con()
-    tables = [t[0] for t in c.execute(
-        "SELECT DISTINCT table_name FROM information_schema.tables").fetchall()
+    tables = [t[0] for t in _query(
+        "SELECT DISTINCT table_name FROM information_schema.tables")
         if not str(t[0]).startswith("_")]
     cols: dict[str, list[dict]] = {}
     for t in sorted(tables):
-        names = [r[0] for r in c.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-            [t]).fetchall()]
+        names = [r[0] for r in _query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", [t])]
         cols[t] = [p for p in (profile_column(t, n) for n in names) if p]
 
     # which same-named columns genuinely line up, and which only look like they do
@@ -471,3 +467,10 @@ def primary_measure(table: str, unit: str = "") -> str:
             continue
         return key
     return ""
+
+
+# `python -m app.ai.ontology` is the rebuild command tests/test_ontology.py tells you to run
+# when the ontology goes stale, and without this block it silently did nothing. It still
+# needs the Azure OpenAI key in .env: the classify step calls the LLM.
+if __name__ == "__main__":
+    build()

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
+from sqlalchemy import func
 from sqlalchemy import update as _sa_update
 from sqlalchemy.orm import Session
 
@@ -47,7 +48,13 @@ def _serialize_message(m: ChatMessage) -> Dict:
     }
 
 
-def _history_for_orchestrator(session: ChatSession) -> List[Dict]:
+def _history_limit() -> int:
+    # Read at call time, so a change to the orchestrator's window is picked up here too.
+    # Deep mode reads fewer turns than this (the last 6), so one bound serves both modes.
+    return int(getattr(orchestrator, "HISTORY_MESSAGES", 24))
+
+
+def _history_for_orchestrator(db: Session, session: ChatSession) -> List[Dict]:
     """Rebuild the plain {role, content} history app.ai.orchestrator.answer expects
     from what's actually stored (assistant turns are stored as a JSON envelope, so pull
     just the text back out for conversational context).
@@ -63,9 +70,20 @@ def _history_for_orchestrator(session: ChatSession) -> List[Dict]:
     instead, because the model had zero idea what "that" referred to. `scope` is
     already computed and yielded by orchestrator.answer() on every "answer" event (see
     orchestrator.py's `scope = ...` line just above `yield {"type": "answer", ...}`);
-    the bug was purely that this file discarded it instead of storing it."""
+    the bug was purely that this file discarded it instead of storing it.
+
+    Only the last orchestrator.HISTORY_MESSAGES messages are read, newest first from the
+    database and then put back in order. The orchestrator never looks further back, and
+    sessions are shared by every user, so they only grow: loading `session.messages`
+    pulled and JSON-parsed every stored reply (each with its chart and up to 50 table
+    rows) on every turn, to throw nearly all of it away."""
+    rows = (db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session.id)
+            .order_by(ChatMessage.id.desc())
+            .limit(_history_limit())
+            .all())[::-1]
     history: List[Dict] = []
-    for m in session.messages:
+    for m in rows:
         if m.role == "user":
             history.append({"role": "user", "content": m.content})
         else:
@@ -81,7 +99,16 @@ def _history_for_orchestrator(session: ChatSession) -> List[Dict]:
     return history
 
 
-def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
+def _answer_events(engine, query: str, history: List[Dict], context: Optional[Dict[str, Any]]):
+    """engine.answer(...) with the page context passed only when there is one, so an
+    answer(query, history) that predates the keyword (and every test fake written that
+    way) keeps working for a client that sends no context."""
+    if context:
+        return engine.answer(query, history, context=context)
+    return engine.answer(query, history)
+
+
+def _run_ai_turn(query: str, history: List[Dict], context: Optional[Dict[str, Any]] = None) -> Dict:
     """Consume orchestrator.answer's SSE-event generator into one consolidated reply.
     Never raises — any failure becomes an error-flavoured reply so a message is always
     persisted (and returned) instead of leaving a user turn with no response at all.
@@ -100,7 +127,7 @@ def _run_ai_turn(query: str, history: List[Dict]) -> Dict:
     kind = "answer"
     scope: Optional[str] = None
     try:
-        for ev in orchestrator.answer(query, history):
+        for ev in _answer_events(orchestrator, query, history, context):
             t = ev.get("type")
             if t == "answer":
                 text = ev.get("text")
@@ -155,17 +182,25 @@ def create_session(db: Session, creator: User, title: Optional[str] = None) -> C
 
 
 def list_sessions(db: Session) -> List[Dict]:
+    """Three queries however many sessions there are. It used to run one User query per
+    session and call len(s.messages), which loaded every message body of every session
+    just to count them; sessions are shared by all users, so that grew without limit."""
     sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
+    if not sessions:
+        return []
+    counts = dict(db.query(ChatMessage.session_id, func.count(ChatMessage.id))
+                  .group_by(ChatMessage.session_id).all())
+    creator_ids = {s.created_by for s in sessions}
+    creators = {u.id: u for u in db.query(User).filter(User.id.in_(creator_ids)).all()}
     out = []
     for s in sessions:
-        creator = db.query(User).filter(User.id == s.created_by).first()
         out.append({
             "id": s.id,
             "title": s.title,
             "created_at": _iso(s.created_at),
             "updated_at": _iso(s.updated_at),
-            "created_by": _user_public(creator),
-            "message_count": len(s.messages),
+            "created_by": _user_public(creators.get(s.created_by)),
+            "message_count": int(counts.get(s.id, 0)),
         })
     return out
 
@@ -232,23 +267,47 @@ def rename_session(db: Session, session_id: int, title: str) -> Dict:
     return {"id": session.id, "title": session.title}
 
 
-def stream_message_events(db: Session, session_id: int, query: str, mode: str = "fast"):
+
+def _save_reply(db: Session, sid: int, reply: Dict) -> Optional[ChatMessage]:
+    """Store the assistant's reply and bump the session's updated_at, or return None when the
+    session was deleted while the answer was being written. Sessions are shared and any user
+    can delete one, and the AI turn takes 10-60 s: touching the deleted ChatSession through
+    the ORM raised ObjectDeletedError and the request ended in a 500 with the answer lost.
+    The existence check and a Core UPDATE (0 rows, no error) avoid that."""
+    if db.query(ChatSession.id).filter(ChatSession.id == sid).first() is None:
+        db.rollback()
+        return None
+    msg = ChatMessage(session_id=sid, role="assistant", content=json.dumps(reply))
+    db.add(msg)
+    db.execute(_sa_update(ChatSession).where(ChatSession.id == sid)
+               .values(updated_at=datetime.now(timezone.utc)))
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+_GONE = "This chat was deleted while the answer was being written, so the answer was not saved."
+
+def stream_message_events(db: Session, session_id: int, query: str, mode: str = "fast",
+                          context: Optional[Dict[str, Any]] = None):
     """Generator of SSE-shaped event dicts for a session-backed turn — the live-progress
     counterpart to post_message(). Reuses orchestrator.answer() exactly as post_message
     does (same history, same audit gate), but yields step/sql/answer/chart/table/done AS
     THEY HAPPEN instead of consolidating them into one blocking response, then persists
     the same consolidated shape post_message would have stored, once, after "done".
 
-    Deliberately ADDITIVE: POST /chat/sessions/{id}/messages (post_message, above) is
-    left completely untouched, so none of the 12 existing tests in test_chat.py change
-    behaviour. This is a new route the frontend opts into; the old one stays a working,
-    tested fallback.
+    Deliberately ADDITIVE: POST /chat/sessions/{id}/messages (post_message, below) keeps
+    its blocking shape and its tests. This is a new route the frontend opts into; the old
+    one stays a working, tested fallback.
 
     The user's message is persisted FIRST, before any streaming starts — so if the
     client disconnects mid-answer (closed tab, network drop), the question they asked
-    is never lost, only the reply. Same durability guarantee post_message already gives
-    the user side; this extends it to the reply side by accumulating exactly what
-    _run_ai_turn accumulates and writing it once the stream concludes.
+    is never lost, only the reply. post_message commits it first the same way; this
+    route also accumulates exactly what _run_ai_turn accumulates and writes the reply
+    once the stream concludes.
+
+    `context` is the page context after app/ai/page_context.normalise, a plain dict of
+    known keys and values. It shapes this one turn only and is never stored: the next
+    turn on the same shared session may come from a different page, or a different user.
     """
     session = get_session_or_404(db, session_id)
     query = (query or "").strip()
@@ -263,9 +322,10 @@ def stream_message_events(db: Session, session_id: int, query: str, mode: str = 
     if str(mode).lower() == "deep":
         from app.ai.deep import engine as engine  # noqa: PLC0415
 
-    history = _history_for_orchestrator(session)
+    history = _history_for_orchestrator(db, session)
 
-    user_msg = ChatMessage(session_id=session.id, role="user", content=query)
+    sid = session.id   # read before the commit expires the session object
+    user_msg = ChatMessage(session_id=sid, role="user", content=query)
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
@@ -281,7 +341,7 @@ def stream_message_events(db: Session, session_id: int, query: str, mode: str = 
     scope: Optional[str] = None
 
     try:
-        for ev in engine.answer(query, history):
+        for ev in _answer_events(engine, query, history, context):
             t = ev.get("type")
             if t == "answer":
                 text = ev.get("text"); verified = ev.get("verified")
@@ -316,41 +376,44 @@ def stream_message_events(db: Session, session_id: int, query: str, mode: str = 
     reply = {"text": text, "verified": verified, "options": options, "chart": chart,
              "table": table, "queries": queries, "kind": kind, "scope": scope}
 
-    assistant_msg = ChatMessage(session_id=session.id, role="assistant", content=json.dumps(reply))
-    db.add(assistant_msg)
-    session.updated_at = datetime.now(timezone.utc)
-    db.add(session)
-    db.commit()
-    db.refresh(assistant_msg)
+    assistant_msg = _save_reply(db, sid, reply)
+    if assistant_msg is None:
+        yield {"type": "error", "text": _GONE}
+        return
 
     yield {"type": "persisted", "assistant_message": _serialize_message(assistant_msg)}
 
 
-def post_message(db: Session, session_id: int, query: str) -> Dict:
+def post_message(db: Session, session_id: int, query: str,
+                 context: Optional[Dict[str, Any]] = None) -> Dict:
     session = get_session_or_404(db, session_id)
     query = (query or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Message text is required")
 
-    history = _history_for_orchestrator(session)
+    history = _history_for_orchestrator(db, session)
 
-    user_msg = ChatMessage(session_id=session.id, role="user", content=query)
+    # The question is committed BEFORE the AI turn, the reply in its own commit after it.
+    # One transaction around both (the user message only flushed) held SQLite's write lock
+    # for the whole 10-60 s turn, so every other write in the app (sign-in, another user's
+    # chat, a rename) queued behind it or failed with "database is locked". Committed
+    # first, the question also survives a turn that never finishes, as it already did on
+    # the streaming route. The id is read before the commit expires the session object.
+    sid = session.id
+    user_msg = ChatMessage(session_id=sid, role="user", content=query)
     db.add(user_msg)
-    db.flush()  # assigns an id within the same transaction
-
-    reply = _run_ai_turn(query, history)
-
-    assistant_msg = ChatMessage(session_id=session.id, role="assistant", content=json.dumps(reply))
-    db.add(assistant_msg)
-
-    session.updated_at = datetime.now(timezone.utc)
-    db.add(session)
-
     db.commit()
     db.refresh(user_msg)
-    db.refresh(assistant_msg)
+    user_out = _serialize_message(user_msg)
+
+    # The page context is used for this turn and not stored (see stream_message_events).
+    reply = _run_ai_turn(query, history, context)
+
+    assistant_msg = _save_reply(db, sid, reply)
+    if assistant_msg is None:
+        raise HTTPException(status_code=404, detail=_GONE)
 
     return {
-        "user_message": _serialize_message(user_msg),
+        "user_message": user_out,
         "assistant_message": _serialize_message(assistant_msg),
     }

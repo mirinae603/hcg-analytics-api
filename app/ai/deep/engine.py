@@ -39,7 +39,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-from app.ai import charts, resolve as resolver, scope, warehouse
+from app.ai import charts, page_context, resolve as resolver, scope, warehouse
 from app.ai.deep import answer_gate, verifier, capability, llm, sanity, schemas, shapes, tools
 
 MAX_SUBQUESTIONS = 6
@@ -73,6 +73,24 @@ _MONTHS = ["january", "february", "march", "april", "may", "june",
 _MONTH_INDEX = {m: i for i, m in enumerate(_MONTHS)}
 _MONTH_INDEX.update({m[:3]: i for i, m in enumerate(_MONTHS)})
 
+# The last word of a column that counts things. `purchase_qty` and `sales_qty` carry a money
+# word, and the fast path printed 2,783,870 units as "₹27.84 L"; a count is a count whatever
+# it counts, so the tail decides before any money word is looked at.
+_COUNT_TAILS = {"qty", "quantity", "units", "count", "cnt", "lines", "nos", "skus"}
+# Rates that are always percentages. Any other name ending in "rate" is a percentage too
+# (the stock-out KPI's `rate`), unless the word before it makes it a price: in Indian
+# purchasing `unit_rate` and `avg_rate` are rupees per unit, and one shown as "2783870.0%"
+# was the fast path's other unit bug (see _PRICE_RATE_WORDS).
+_PCT_RATES = ("fill_rate", "fulfillment_rate", "stock_out_rate", "wastage_rate")
+# A model alias already scaled to crore or lakh (`SUM(revenue) / 1e7 AS revenue_cr`). Typed as
+# money, 9.68 crore was printed "₹10" — rupees, and wrong by seven orders of magnitude. It
+# stays a plain number, and the column name it keeps tells the reader the unit.
+_PRESCALED = re.compile(r"_(cr|crore|crores|lakh|lakhs)$")
+# Same list as orchestrator._PRICE_RATE_WORDS: a "rate" after one of these is a price.
+_PRICE_RATE_WORDS = {"unit", "avg", "average", "purchase", "net", "mrp", "price", "per",
+                     "landed", "selling", "sale", "sales", "buy", "cost", "base", "contract",
+                     "po", "item"}
+
 
 def _kind(col: str, rows: list) -> str:
     """Unit of a column, from its name.
@@ -81,13 +99,32 @@ def _kind(col: str, rows: list) -> str:
     "value", so an inr-first check typed it as money and the brief reported "value share
     percentages as high as ₹85" — a percentage rendered as rupees, in the engine whose
     entire purpose is not doing that. The narrower suffixes are therefore tested first;
-    "money" is the fallback, never the first guess.
+    "money" is the fallback, never the first guess. The rules match the fast path's
+    orchestrator.infer_kind, so a column has one unit whichever mode answered.
     """
     c = col.lower()
     if _IDENTIFIER_RE.match(c):
         return "id"
-    if c.endswith("_pct") or c.endswith("_percent") or c.endswith("_%") or "percent" in c or "share_pct" in c:
+    sample = next((r.get(col) for r in rows if r.get(col) is not None), None)
+    words = re.split(r"[_\s]+", c)
+    # Percent names first, as orchestrator.infer_kind does: pct_of_lines and share_of_units
+    # are shares even though they end in a count word.
+    if c.endswith("_pct") or c.endswith("_percent") or c.endswith("_%") or "percent" in c \
+            or "share_pct" in c or c.startswith("pct_"):
         return "pct"
+    # "value_share" holds "value", so this too goes before the money words; `share_note` is
+    # the text beside a share, not one.
+    if (re.search(r"(^|_)share(_of_\w+)?$", c) or c.endswith(_PCT_RATES)) \
+            and not isinstance(sample, str):
+        return "pct"
+    # The stock-out KPI's `rate` / `value_rate` are percentages; unit_rate and avg_rate are
+    # rupee prices.
+    if words[-1] == "rate" and not isinstance(sample, str):
+        return "inr" if len(words) > 1 and words[-2] in _PRICE_RATE_WORDS else "pct"
+    # A count or a pre-scaled figure is a number, unless the rows say it holds text (a
+    # `units` column can be the unit of measure, "Strip", and must not be charted).
+    if words[-1] in _COUNT_TAILS or _PRESCALED.search(c):
+        return "text" if isinstance(sample, str) else "num"
     if c.endswith("_days") or c.endswith("_day") or "lead_time" in c or c.startswith("days_"):
         return "days"
     if any(k in c for k in ("revenue", "cost", "margin", "value", "price", "spend", "amount",
@@ -97,11 +134,12 @@ def _kind(col: str, rows: list) -> str:
         return "pct"
     if "day" in c:
         return "days"
-    sample = next((r.get(col) for r in rows if r.get(col) is not None), None)
     return "num" if isinstance(sample, (int, float)) else "text"
 
 
-def _fmt(v, kind: str) -> str:
+def _fmt(v, kind: str, pct_dp: int = 1) -> str:
+    # pct_dp is 2 only for the Jun–Aug reports: the Formulary page shows compliance as 98.42%
+    # and HCG reconciles against that, so "98.4%" beside it reads as a different number.
     if v is None:
         return "—"
     if kind == "text":
@@ -125,7 +163,7 @@ def _fmt(v, kind: str) -> str:
             return f"₹{n / 1e5:.2f} L"
         return f"₹{n:,.0f}"
     if kind == "pct":
-        return f"{n:.1f}%"
+        return f"{n:.{pct_dp}f}%"
     if kind == "days":
         return f"{round(n)} d"
     return f"{n:,.0f}" if abs(n) >= 1000 or n == int(n) else f"{n:,.2f}"
@@ -180,6 +218,12 @@ def _order_rows(res: dict) -> dict:
     return {**res, "rows": rows}
 
 
+def _is_report(payload) -> bool:
+    """A Jun–Aug report payload (hcg_reports) — every one carries its data window."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return isinstance(data, dict) and bool(data.get("data_window"))
+
+
 def _kpi_rows(out: dict) -> dict:
     """A canonical KPI payload as {columns, rows}, so a KPI-backed finding renders exactly
     like a query-backed one — same table, same chart, same formatting."""
@@ -188,6 +232,7 @@ def _kpi_rows(out: dict) -> dict:
     # "1,739,047,400.36" in the answer where ₹173.90 Cr belonged.
     if out.get("per_site"):
         rows = []
+        dp = 2 if any(_is_report(p) for p in (out["per_site"] or {}).values()) else 1
         for code, payload in (out["per_site"] or {}).items():
             totals = ((payload or {}).get("data") or {}).get("totals")
             if isinstance(totals, dict):
@@ -197,9 +242,10 @@ def _kpi_rows(out: dict) -> dict:
                 rows.append({"hospital": code, "value": str(payload)[:80]})
         if rows:
             cols = list({k: None for r in rows for k in r})
-            return {"columns": cols, "rows": rows, "row_count": len(rows)}
+            return {"columns": cols, "rows": rows, "row_count": len(rows), "pct_dp": dp}
 
     data = ((out.get("payload") or {}).get("data") or {})
+    dp = 2 if _is_report(out.get("payload")) else 1
     # A KPI payload holds several views of itself and the RIGHT one is the breakdown, not
     # the summary. `near-expiry` keys are totals/buckets/timeline/categories/ladder, and
     # "buckets" was missing from this list — so it fell through to `totals` and the answer
@@ -210,7 +256,7 @@ def _kpi_rows(out: dict) -> dict:
         v = data.get(key)
         if isinstance(v, list) and v and isinstance(v[0], dict):
             cols = list(v[0].keys())
-            return {"columns": cols, "rows": v[:200], "row_count": len(v),
+            return {"columns": cols, "rows": v[:200], "row_count": len(v), "pct_dp": dp,
                     "totals": data.get("totals") if isinstance(data.get("totals"), dict) else None}
     # Generic fallback: the largest list of records in the payload. The named list above
     # keeps the RIGHT view winning where two exist (near-expiry: buckets, not categories),
@@ -223,10 +269,10 @@ def _kpi_rows(out: dict) -> dict:
             best_key, best_len = k, len(v)
     if best_key:
         v = data[best_key]
-        return {"columns": list(v[0].keys()), "rows": v[:200], "row_count": len(v)}
+        return {"columns": list(v[0].keys()), "rows": v[:200], "row_count": len(v), "pct_dp": dp}
     totals = data.get("totals")
     if isinstance(totals, dict) and totals:
-        return {"columns": list(totals.keys()), "rows": [totals], "row_count": 1}
+        return {"columns": list(totals.keys()), "rows": [totals], "row_count": 1, "pct_dp": dp}
     return {"columns": ["metric"], "rows": [{"metric": str(data)[:200]}], "row_count": 1}
 
 
@@ -257,7 +303,9 @@ def _alias_units(sql: str) -> dict:
     """{alias: kind} for aggregates whose SOURCE column names a unit."""
     out = {}
     for src, alias in _AGG_ALIAS.findall(sql or ""):
-        if alias.lower() in _SQL_WORDS:
+        # `SUM(revenue / 1e7) AS revenue_cr` aggregates a money column, but the alias says it
+        # is already in crore; inheriting "inr" would print 9.68 crore as "₹10" again
+        if alias.lower() in _SQL_WORDS or _PRESCALED.search(alias.lower()):
             continue
         # a numeric sample is supplied because _kind falls back to "text" when it has no
         # rows to look at, and an alias inheriting "text" would suppress formatting entirely
@@ -273,6 +321,7 @@ def _compact(res: dict, limit: int = 25, sql: str = "") -> str:
     converts. Prose that converts raw rupees itself is where the 10x errors came from."""
     cols = res.get("columns") or []
     rows = res.get("rows") or []
+    dp = int(res.get("pct_dp") or 1)
     inherited = _alias_units(sql)
     kinds = {c: (inherited.get(c.lower()) if _kind(c, rows) == "num" else None) or _kind(c, rows)
              for c in cols}
@@ -295,10 +344,10 @@ def _compact(res: dict, limit: int = 25, sql: str = "") -> str:
                 return "inr"
             return kk
         out.append("TOTALS (authoritative — do not re-derive these by division): "
-                   + ", ".join(f"{k}={_fmt(v, _tkind(k, v))}" for k, v in shown.items()))
+                   + ", ".join(f"{k}={_fmt(v, _tkind(k, v), dp)}" for k, v in shown.items()))
     out.append(" | ".join(cols))
     for r in rows[:limit]:
-        out.append(" | ".join(_fmt(r.get(c), kinds[c]) for c in cols))
+        out.append(" | ".join(_fmt(r.get(c), kinds[c], dp) for c in cols))
     if len(rows) > limit:
         out.append(f"… {len(rows) - limit} more rows")
     return "\n".join(out)
@@ -427,12 +476,14 @@ def _drop_redundant_opener(text: str) -> str:
 def _measure_disclosure(question: str, findings: list[dict], primary: dict | None = None) -> str:
     """Say so, in code, when the answer is about a DIFFERENT measure than was asked for.
 
-    This warehouse has no material-by-month SALES grain, so "sales trend of KEYTRUDA" gets
-    answered from PURCHASING. That substitution is legitimate and useful — silently
-    labelling the result "Sales Trend" is not, and it is a wrong answer however good the
-    arithmetic. The synthesis prompt has asked for this disclosure since the first version
-    and the model supplies it perhaps half the time, which is exactly the reliability a
-    prompt gives you. Plant->Hospital taught the same lesson twice; this is the third.
+    When the evidence for a SALES question turns out to be PURCHASING — a hospital's monthly
+    sales, say, which no sales table carries — that substitution is legitimate and useful.
+    Silently labelling the result "Sales Trend" is not, and it is a wrong answer however good
+    the arithmetic. (An item's monthly sales DO exist, in sales_by_material_month, and then
+    nothing is substituted and this stays silent.) The synthesis prompt has asked for this
+    disclosure since the first version and the model supplies it perhaps half the time, which
+    is exactly the reliability a prompt gives you. Plant->Hospital taught the same lesson
+    twice; this is the third.
     """
     asked = _family_asked(question)
     if not asked:
@@ -513,8 +564,13 @@ def _num_tokens(text: str) -> set[str]:
 
 
 # ── the loop ─────────────────────────────────────────────────────────────────
-def answer(query: str, history: list | None = None):
+def answer(query: str, history: list | None = None, context: dict | None = None):
     """One question, answered.
+
+    `context` is the dashboard page the user is looking at (page, section, view, month,
+    plant, a few filters; app/ai/page_context.py keeps only whitelisted values). It becomes
+    one line in the frame, plan and worker prompts, as defaults for the Jun–Aug report KPIs
+    only.
 
     This wrapper is where a retry would go, and the docstring below is kept because the
     measurement is worth more than the idea. See the note at the final yield in
@@ -534,10 +590,23 @@ def answer(query: str, history: list | None = None):
     flagged answer is re-run once and the UNFLAGGED result preferred, with no judgement about
     content: if the second attempt is clean it wins, if both are flagged the first stands.
     """
-    yield from _answer_once(query, history)
+    yield from _answer_once(query, history, context)
 
 
-def _answer_once(query: str, history: list | None = None):
+def _tool_text(name: str, out: dict) -> str:
+    """A tool result as the worker reads it.
+
+    get_kpi gets its figures formatted first and a larger budget. A raw KPI payload cut at
+    2,600 characters lost its totals and every site after the first, and its rupees arrived
+    as floats for the model to convert itself — the path to the 10x errors. Formatted, the
+    Jun–Aug report payloads are under 4,000 characters by design.
+    """
+    if name == "get_kpi":
+        return tools.compact(tools.kpi_for_model(out), limit=4000)
+    return tools.compact(out)
+
+
+def _answer_once(query: str, history: list | None = None, context: dict | None = None):
     """The pipeline itself. Same generator contract as orchestrator.answer."""
     if not llm.has_key():
         yield {"type": "answer", "text": "Deep analysis needs AZURE_OPENAI_API_KEY to be set.",
@@ -550,6 +619,17 @@ def _answer_once(query: str, history: list | None = None):
     findings: list[dict] = []
     queries: list[dict] = []
     entity_tokens: list[str] = []
+    # The page the user is on, said once to every prompt that decides what to fetch. Built by
+    # page_context from whitelisted values and fixed wording, the same sentence fast mode
+    # uses: the browser's own labels never reach the prompt.
+    page_note = page_context.context_line(context)
+    page_prefix = f"PAGE CONTEXT: {page_note}\n\n" if page_note else ""
+    # Created BEFORE the footprint block, which appends to it. It used to be created after,
+    # so a quoted name that is not a product ("MSD") raised UnboundLocalError inside that
+    # block's try, the except swallowed it, and the frame step lost both the footprint and
+    # the "this is NOT a product" rule.
+    lessons: list[str] = []
+    lesson_lock = Lock()
 
     # ── PHASE 1 · FRAME ──────────────────────────────────────────────────────
     yield {"type": "step", "text": "Framing the question"}
@@ -578,9 +658,6 @@ def _answer_once(query: str, history: list | None = None):
                    "sql": f"-- lookup_item('{name}')", "rows": fp.get("match_count", 0)}
         except Exception:
             pass
-
-    lessons: list[str] = []
-    lesson_lock = Lock()
 
     # The user's vocabulary is not the schema's. Seeded before anything is framed, because
     # a missing synonym gets reported as missing DATA.
@@ -662,7 +739,8 @@ def _answer_once(query: str, history: list | None = None):
                 + "\n\nCANONICAL METRICS (kpi_key — the dashboard's own calculations):\n"
                 + ", ".join(tools.kpi_keys())
                 + "\n\n" + capability.brief()),
-        user=f"Question: {query}\n\nRecent conversation:\n{hist}\n\nItem footprint:\n{footprint}",
+        user=(f"{page_prefix}Question: {query}\n\nRecent conversation:\n{hist}\n\n"
+              f"Item footprint:\n{footprint}"),
         schema_hint=schemas.FRAME)
 
     # The frame agent's "answerable" verdict is ADVISORY and is deliberately NOT a veto.
@@ -687,9 +765,9 @@ def _answer_once(query: str, history: list | None = None):
 
     # SEED the board with what the schema already proves, before any worker spends a step
     # discovering it. Four workers independently hunted for a monthly sales grain and
-    # tunnelled into forecast_sales; the fact that no sales table carries time is
-    # derivable from information_schema in one pass and is exactly the knowledge they
-    # needed. Deterministic facts should never cost a model call.
+    # tunnelled into forecast_sales; which sales tables carry time is derivable from
+    # information_schema in one pass and is exactly the knowledge they needed.
+    # Deterministic facts should never cost a model call.
     # GROUND TRUTH FOR THIS ITEM, not a generalisation. lookup_item already counts the
     # rows this material has in EVERY table — and the planner was never shown it, so it
     # planned a "monthly consumption trend" for an item with zero consumption rows
@@ -722,10 +800,22 @@ def _answer_once(query: str, history: list | None = None):
         if _sales_no_time:
             lessons.append("These sales tables have NO time/month column, so no trend can come "
                            "from them: " + ", ".join(_sales_no_time))
-        lessons.append("There is no material-by-month SALES grain in this warehouse. Monthly "
-                       "figures for an item exist only for PURCHASING (fact_po, fact_grn, "
-                       "mart_procurement, kpi_monthly_purchase_value) and CONSUMPTION "
-                       "(fact_consumption, kpi_units_consumed). Use one of those and say which.")
+        # Checked against the schema, not asserted. This was a fixed sentence — "there is no
+        # material-by-month SALES grain" — given to every plan, while two lines up the derived
+        # list named sales_by_material_month as carrying both the item and time. The planner
+        # believed the sentence, and "sales trend of keytruda" came back as purchasing or as
+        # "no monthly breakdown".
+        if "sales_by_material_month" in capability.schema():
+            lessons.append("Monthly SALES for an item or category come from "
+                           "sales_by_material_month (period 'YYYY-MM', material, material_desc, "
+                           "material_group, revenue, cost, qty): SUM(revenue) … GROUP BY period "
+                           "ORDER BY period. Purchasing and internal consumption are different "
+                           "events — use them only if asked, and name them.")
+        else:
+            lessons.append("There is no material-by-month SALES grain in this warehouse. Monthly "
+                           "figures for an item exist only for PURCHASING (fact_po, fact_grn, "
+                           "mart_procurement, kpi_monthly_purchase_value) and CONSUMPTION "
+                           "(fact_consumption, kpi_units_consumed). Use one of those and say which.")
     except Exception:
         pass
 
@@ -749,7 +839,7 @@ def _answer_once(query: str, history: list | None = None):
                 # the data can do is why the whole turn came back empty.
                 "WHAT THIS DATA CAN AND CANNOT DO — plan within it:\n- "
                 + "\n- ".join(lessons) + "\n\nSCHEMA:\n" + cap_brief),
-        user=f"Question: {query}\n\nFraming: {json.dumps(frame)[:600]}",
+        user=f"{page_prefix}Question: {query}\n\nFraming: {json.dumps(frame)[:600]}",
         schema_hint=schemas.PLAN)
     subs = (plan.get("sub_questions") or [])[:MAX_SUBQUESTIONS]
     if not subs:
@@ -763,6 +853,20 @@ def _answer_once(query: str, history: list | None = None):
     # Deterministic first, the model's suggestion only as a fallback.
     canonical_totals: dict = {}
     kpi_key = capability.kpi_for(query) or (frame.get("kpi_key") or "").strip()
+    # THE JUN–AUG REPORTS NEED ARGUMENTS. Called bare, a report answers for the latest month
+    # and every hospital, and a canonical finding owns the headline — so "compliance at HCG
+    # KR in July" would be answered for August, network-wide, with full authority. When the
+    # question (or the page the user is on) names a month, a hospital or a cut, the workers
+    # call get_kpi with those arguments instead. A sales question is never a report question.
+    if kpi_key and tools.kpi_entry(kpi_key).get("needs"):
+        if capability.mentions_sales(query):
+            kpi_key = ""
+        elif capability.names_report_scope(query) or page_context.sets_report_scope(context):
+            lessons.append(f"{kpi_key} is a <<REPORTS>> report: call get_kpi('{kpi_key}') WITH "
+                           f"the month, hospital and other arguments the question or the page "
+                           f"names. Called bare it answers for the latest month and every "
+                           f"hospital.")
+            kpi_key = ""
     if kpi_key and kpi_key in tools.kpi_keys():
         yield {"type": "step", "text": f"Taking the canonical figure for {kpi_key}"}
         out = tools.get_kpi(kpi_key, question=query)
@@ -796,11 +900,13 @@ def _answer_once(query: str, history: list | None = None):
                     # (see _format_kpi_payload and its regression test: ₹300.21 Cr printed
                     # for ₹30.02 Cr); every number handed to the model must already be in
                     # the form it should quote, so it never has to convert anything.
-                    _flat = {k: (_fmt(v, _kind(k, [{k: v}])) if isinstance(v, (int, float)) else v)
+                    _dp = 2 if _is_report(out.get("payload")) else 1
+                    _flat = {k: (_fmt(v, _kind(k, [{k: v}]), _dp) if isinstance(v, (int, float)) else v)
                              for k, v in _tot.items() if isinstance(v, (int, float, str))}
                     if _flat:
                         lessons.append(f"Canonical {kpi_key} headline figures (authoritative, "
-                                       f"quote directly): {json.dumps(_flat, default=str)[:400]}")
+                                       f"quote directly): "
+                                       f"{json.dumps(_flat, default=str, ensure_ascii=False)[:400]}")
                         canonical_totals = {"canonical_metric": kpi_key, "totals": _flat}
 
     yield {"type": "step", "text": f"Investigating {len(subs)} lines of enquiry"}
@@ -853,7 +959,7 @@ def _answer_once(query: str, history: list | None = None):
 
         with lesson_lock:
             known = list(lessons)
-        user = (f"Original question: {query}\n"
+        user = (f"{page_prefix}Original question: {query}\n"
                 + (f"\nESTABLISHED FACTS (concrete values already found — use them, do not re-derive):\n{facts}\n" if facts else "")
                 + ("\nWHAT OTHER ANALYSTS ALREADY LEARNED ABOUT THIS DATA:\n- " + "\n- ".join(known) + "\n" if known else "")
                 + f"\nYour sub-question: {sub.get('question')}\nWhy it matters: {sub.get('why')}"
@@ -950,10 +1056,11 @@ def _answer_once(query: str, history: list | None = None):
 
                 key = name + "|" + json.dumps(args, sort_keys=True, default=str)[:400]
                 if key in seen_calls and name != "run_query":
-                    msgs.append({"role": "tool", "tool_call_id": c.id, "content": tools.compact(
-                        {**seen_calls[key],
-                         "note": "You already called this with the same arguments. The answer has "
-                                 "not changed. Use it and take a DIFFERENT next step."})})
+                    msgs.append({"role": "tool", "tool_call_id": c.id, "content": _tool_text(
+                        name, {**seen_calls[key],
+                               "note": "You already called this with the same arguments. The "
+                                       "answer has not changed. Use it and take a DIFFERENT "
+                                       "next step."})})
                     continue
                 out = tools.call(name, args, ctx)
                 seen_calls[key] = {k: v for k, v in out.items() if not k.startswith("_")}
@@ -974,7 +1081,7 @@ def _answer_once(query: str, history: list | None = None):
                                 _note_lesson(f"{tbl.group(1)} has NO '{col.group(1)}' column")
                 if name == "describe_table" and out.get("columns"):
                     _note_lesson(f"{out['table']} columns: " + ", ".join(x["name"] for x in out["columns"])[:170])
-                msgs.append({"role": "tool", "tool_call_id": c.id, "content": tools.compact(out)})
+                msgs.append({"role": "tool", "tool_call_id": c.id, "content": _tool_text(name, out)})
             if stop:
                 return stop
 
@@ -1339,11 +1446,13 @@ def _answer_once(query: str, history: list | None = None):
                 "- Cite the evidence block you took each figure from, as [id].\n"
                 "- NAME THE MEASURE YOU ACTUALLY USED. If the question asked for one thing and the "
                 "evidence only supports a related one — asked for SALES, evidence is PURCHASING; "
-                "asked for revenue, evidence is quantity — say so in the FIRST sentence, plainly: "
-                "'There is no monthly sales figure for this item; what follows is monthly "
-                "PURCHASING.' Never label a substitute with the name of the thing that was asked "
-                "for. A brief headed 'Sales trend' that is actually procurement is a wrong answer, "
-                "however good its numbers.\n"
+                "asked for revenue, evidence is quantity; asked for SALES by hospital per month, "
+                "evidence is each hospital's <<SALES_MONTHS>>-month total — say so in the FIRST sentence, "
+                "plainly: 'There is no monthly split by hospital; what follows is each "
+                "hospital's six-month total.' If the evidence IS the measure asked for, never "
+                "open with a sentence denying it. Never label a substitute with the name of the "
+                "thing that was asked for. A brief headed 'Sales trend' that is actually "
+                "procurement is a wrong answer, however good its numbers.\n"
                 "- Say 'hospital', never 'plant'. No trailing rhetorical question.\n"
                 "- If a line of enquiry was ruled out, say so — that is half the value.\n"
                 "- Do not claim anything the evidence does not show."),

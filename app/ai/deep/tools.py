@@ -8,9 +8,10 @@ a month column. It was not being stupid. It was GUESSING, because it had been ha
 description of the warehouse and then asked to produce a final query in one shot, blind.
 
 A human does not do that. They open the table, look at five rows, notice there is no month,
-go looking for one, find `mart_procurement` and `kpi_monthly_purchase_value`, realise no
-monthly SALES grain exists, and answer with monthly PURCHASING while saying so. That is
-eight actions with LOOKING between each one, and the intelligence is in the looking.
+go looking for one with find_columns('period'), find `sales_by_material_month`, and answer
+from that — and only if no sales table had a month would they fall back to monthly
+PURCHASING and say so. That is eight actions with LOOKING between each one, and the
+intelligence is in the looking.
 
 So: give it eyes. Every one of these mirrors something an analyst does before committing to
 a query — list, describe, peek, find the grain, find where a value lives, profile a column,
@@ -20,6 +21,7 @@ Read-only throughout: every query goes through warehouse.validate() and the scop
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 
@@ -279,7 +281,217 @@ def _city_plant_codes(question: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _kpi_scope_mismatch(key: str, plant: str, question: str) -> str | None:
+# A percentage is a ratio of sums. Network formulary compliance is sum(formulary cost) over
+# sum(drug cost) across the sites, never the sum or the average of each site's percentage —
+# and the advice below used to say "SUM them" for every KPI, fill rate and compliance alike.
+# The wording avoids the words sum, add and average altogether, so no part of it can be
+# read as an instruction to combine the figures. The registry marks days-on-hand, lead time
+# and fill rate as ratios too, so it does not say "percentage" alone.
+_RATIO_ADVICE = ("This is a RATIO (a percentage, rate, score or days figure), and figures "
+                 "from different sites cannot be combined into one by arithmetic. Report each "
+                 "site's figure separately.")
+
+
+def _ratio_advice(key: str, codes: list[str], can_view: bool = False) -> str:
+    """The ratio advice, offering only the routes this guard will then let through.
+
+    Fast mode has no per-site fan-out of its own. For "what is the fill rate across Bangalore
+    hospitals?" the advice used to be "call get_kpi once per code, or once with no plant and
+    view='hospitals'" — and this same guard refused both: each single Bangalore plant is
+    UNDER-SCOPED, and the guard never saw `view`, so the no-plant call was UNSCOPED again.
+    The Dec–May KPIs do not take `view` at all. The model looped on refusals until it ran
+    out of steps. So each route is offered only where it works:
+      - `codes` (a city): a Jun–Aug report pools the codes itself; any other KPI is one SQL
+        statement over the codes, because get_kpi takes one plant and one is never the city.
+      - no codes (named hospitals, no city): one call per code passes, so it is offered.
+      - view="hospitals" only for a KPI that takes `view`, and only when the caller hands
+        its arguments to the guard (`can_view`), so the call it suggests is not refused.
+    """
+    view = can_view and _kpi_takes(key, "view")
+    view_text = ("call once with no plant and view=\"hospitals\" and quote the rows for "
+                 "these sites")
+    if codes and _is_report_key(key):
+        # the Jun–Aug reports take several codes and compute the pooled ratio themselves
+        return (_RATIO_ADVICE + f" For one figure covering all of them, call once with "
+                f"plant=\"{','.join(codes)}\" — the report pools them correctly."
+                + (f" Or {view_text}." if view else ""))
+    if codes:
+        return (_RATIO_ADVICE + f" get_kpi takes one plant at a time and one site is not the "
+                f"city, so write one SQL statement filtered to plant IN ({', '.join(codes)}) "
+                f"that computes the ratio for each plant from its own numerator and "
+                f"denominator, and quote one line per site.")
+    return (_RATIO_ADVICE + " Call get_kpi once per hospital code"
+            + (f", or {view_text}" if view else "")
+            + ", or write one SQL statement filtered to those plant codes that computes the "
+              "ratio for each plant.")
+
+
+def _kpi_takes(key: str, arg: str) -> bool:
+    """Whether this registry entry accepts an extra argument such as `material`."""
+    try:
+        from app.ai import kpi_registry
+        return arg in ((kpi_registry.KPI_REGISTRY.get(key) or {}).get("args") or ())
+    except Exception:
+        return False
+
+
+def _is_report_key(key: str) -> bool:
+    """A Jun–Aug report (it needs the formulary or spend data), not a Dec–May dashboard KPI."""
+    try:
+        from app.ai import kpi_registry
+        return bool((kpi_registry.KPI_REGISTRY.get(key) or {}).get("needs"))
+    except Exception:
+        return False
+
+
+# Words a question uses to ASK that also happen to begin a product name in the item master.
+# The resolver forms a "family" from any rare token, and the first version of the product
+# check below counted every family of five or fewer SKUs as one product. On the real
+# warehouse it refused the canonical KPI for 27 ordinary company-wide questions from the evals
+# and the chat starters: "what should we order FIRST" was about FIRST AID BOX-GEN, "the
+# consumption SPLIT" about a SPLIT AC, "how CONCENTRATED is our procurement" about a
+# haemodialysis solution — and the refusal then sent the model off to query that item's rows.
+# The brand-position rule in _product_family drops most of them (TARGET, BAND, AGAINST,
+# NETWORK sit mid-name); this list catches the ones that lead a name. It holds
+# business-question vocabulary, not a dictionary. A brand that is also a listed word is not
+# caught, which only costs the behaviour from before this check existed; an ordinary word
+# that is missing still refuses the KPI, so add it here when one turns up.
+_ORDINARY_WORDS = frozenset({
+    # order, position and comparison
+    "first", "second", "third", "start", "end", "begin", "initial", "final", "early", "late",
+    "peak", "bottom", "rank", "ranking", "equal", "multiple", "various", "general", "overall",
+    "single", "dual", "double", "triple", "three", "four", "five", "half", "whole", "extreme",
+    "superior", "super", "positive", "negative", "neutral", "external", "internal", "national",
+    "universal", "natural", "plain", "true", "false", "empty", "solid", "hard", "easy", "light",
+    "live", "mobile", "immediate", "interim", "provisional", "preventive", "supplementary",
+    # the measures, cuts and shapes analysts ask about
+    "split", "share", "mix", "band", "group", "class", "cluster", "segment", "tier", "target",
+    "budget", "plan", "actual", "forecast", "variance", "gap", "risk", "loss", "profit",
+    "growth", "volume", "value", "cost", "price", "rate", "ratio", "margin", "revenue",
+    "order", "supply", "demand", "stock", "excess", "surplus", "shortage", "free", "cash",
+    "credit", "net", "gross", "factor", "measure", "performance", "signal", "trace", "pause",
+    "block", "back", "ground", "mass", "inflation", "tender", "account", "network", "against",
+    "match", "tracking", "patients", "therapeutic", "injection", "emergency", "referral",
+    "incident", "information", "resource", "reserve", "custom", "specialty", "subject",
+    "option", "display", "register", "file", "text", "sign", "memory", "mind", "welcome",
+    "swift", "pathway", "junction", "alliance", "champion", "masters", "contrast", "culture",
+    "concentrate", "correction", "extension", "documentation", "justification", "suggestion",
+    "changeover", "overtime", "extraction", "examination", "exercise", "tension", "traffic",
+    "vertical", "linear", "circular", "lateral", "periodic", "functional", "visual",
+    "complimentary", "compensatory", "subjective", "educational",
+})
+# Inflected English — "concentrated", "tracking", "weekly" — is almost never a brand's first
+# word, and listing every such form is the losing game the resolver's stoplists already play.
+_INFLECTED = re.compile(r"^[a-z]{3,}(?:ed|ing|ly)$")
+_TOKEN = re.compile(r"[A-Za-z0-9]+")
+
+
+def _ordinary_word(tok: str) -> bool:
+    t = (tok or "").lower()
+    return (t in _ORDINARY_WORDS or (t.endswith("s") and t[:-1] in _ORDINARY_WORDS)
+            or bool(_INFLECTED.match(t)))
+
+
+def _quoted(tok: str, question: str) -> bool:
+    """The user put the word inside double quotes, which is how a name is marked.
+
+    Double quotes only: an apostrophe ("what's our first order's value") would turn half a
+    sentence into a false quotation.
+    """
+    spans = re.findall(r"[\"“]([^\"“”]+)[\"”]", question or "")
+    pat = re.compile(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", re.I)
+    return any(pat.search(s) for s in spans)
+
+
+def _leading_word(value: str) -> str:
+    """The first identifying word of an item name: KEYTRUDA in "KEYTRUDA 100MG INJ VIAL"."""
+    try:
+        from app.ai.resolve import _NOISE_TOKENS as noise
+    except Exception:
+        noise = frozenset()
+    for t in _TOKEN.findall(value or ""):
+        tl = t.lower()
+        if len(tl) >= 3 and not tl.isdigit() and tl not in noise:
+            return tl
+    return ""
+
+
+def _product_family(f: dict, question: str) -> bool:
+    """Whether a resolver FAMILY is the user naming a product, not a word that happens to
+    appear inside a few product names.
+
+    A brand leads its item name — KEYTRUDA 100MG INJ VIAL, OPDYTA 240MG INJ VIAL — while a
+    coincidental word sits anywhere in it: CAR-T DUAL TARGET, MULTI BAND LIGATOR, D-LINK
+    8 PORT NETWORK SWITCH. So the token must lead every name in the family and must not be an
+    ordinary question word, unless the user quoted it.
+    """
+    tok = (f.get("token") or "").lower()
+    ex = f.get("examples") or []
+    # a family of a handful of SKUs is still one product (KEYTRUDA is a family of one); a
+    # family of seventy sutures is a category
+    if f.get("kind") not in ("material", "generic") or f.get("n", 99) > 5 or not ex or not tok:
+        return False
+    if _quoted(tok, question):
+        return True
+    return not _ordinary_word(tok) and all(_leading_word(v) == tok for v in ex)
+
+
+def _named_products(r: dict, question: str) -> list[str]:
+    """The products the question names: exact item or molecule entities, and brand families."""
+    q = question or ""
+    out: list[str] = []
+    for e in r.get("entities") or []:
+        if e.get("kind") not in ("material", "generic"):
+            continue
+        text = str(e.get("text") or "")
+        if e.get("column") == "material":
+            # a code counts only as a whole word in the question: "100" inside "100MG", or a
+            # "180" in "180 days", names nothing
+            if not re.search(rf"(?<![A-Za-z0-9]){re.escape(text)}(?![A-Za-z0-9])", q):
+                continue
+        else:
+            words = [t for t in _TOKEN.findall(text) if len(t) >= 3]
+            if len(words) == 1 and _ordinary_word(words[0]) and not _quoted(words[0], q):
+                continue
+        out.append(text)
+    out += [f["examples"][0] for f in r.get("families") or [] if _product_family(f, q)]
+    return out
+
+
+def _product_scope_mismatch(key: str, r: dict, question: str = "",
+                            sql_tool: str = "") -> str | None:
+    """A KPI with no product filter, asked about one product.
+
+    "Get me the sales trend of keytruda" was answered from get_kpi('revenue-margin'): its
+    per-product rows are six-month totals and its timeline is the WHOLE company, so the reply
+    was "the sales data for Keytruda does not have a monthly breakdown" — while
+    sales_by_material_month held all six months. None of the dashboard KPIs takes a product,
+    so whatever they return for a one-product question is everyone's figure under that
+    product's name. The Jun–Aug reports DO take a `material` argument and are left alone.
+
+    `sql_tool` names the caller's SQL tool (run_query in deep mode). Fast mode's is run_sql
+    and it calls without one, so the default wording names no tool rather than the wrong one.
+    """
+    if _kpi_takes(key, "material"):
+        return None
+    items = _named_products(r, question)
+    if not items:
+        return None
+    sales = "revenue" in key or "sales" in key
+    how = f"with {sql_tool}" if sql_tool else "with one SQL query"
+    return (f"COMPANY-WIDE KPI — this question is about one product ({items[0]}), and "
+            f"get_kpi('{key}') has no product filter: "
+            + ("its per-product rows are <<SALES_MONTHS>>-month totals and any timeline it returns is the "
+               "WHOLE company. " if sales else
+               "whatever it returns is the figure for every product together. ")
+            + f"Do not quote it as {items[0]}'s number. Query the product's own rows {how} "
+            + ("instead — sales_by_material_month (period × material) for monthly sales, "
+               "sales_by_material for its <<SALES_MONTHS>>-month total." if sales else
+               "instead, filtered on material or material_desc."))
+
+
+def _kpi_scope_mismatch(key: str, plant: str, question: str, ratio: bool = False,
+                        extra: dict | None = None, sql_tool: str = "") -> str | None:
     """A company-wide KPI must not be handed back as an entity-scoped answer.
 
     Every other guard in this system inspects SQL. The canonical path produces none — it is
@@ -287,12 +499,24 @@ def _kpi_scope_mismatch(key: str, plant: str, question: str) -> str | None:
     constraint checker all sat it out. Asked what Bangalore hospitals spend on procurement,
     the engine called get_kpi with no plant and reported ₹649.91 Cr: the total for all 51
     sites, labelled as four. Correct by construction, and the wrong question.
+
+    `ratio` is True for a percentage KPI, where the per-site figures must never be added.
+    `extra` is the call's other arguments (month, view …) when the caller forwards them; only
+    then can the guard see view="hospitals", so only then is that route offered. `sql_tool`
+    is the caller's SQL tool name, for the product advice.
     """
     try:
         from app.ai import resolve as _resolve
         r = _resolve.resolve(question or "")
     except Exception:
         return None
+
+    # The product comes first: passing the right plant does not make a company-wide figure
+    # about one drug.
+    product = _product_scope_mismatch(key, r, question or "", sql_tool)
+    if product:
+        return product
+    can_view = extra is not None
 
     # A city covering four hospitals is not answered by ONE of them either. Told only that
     # an unscoped call was wrong, the engine called get_kpi with a single plant and reported
@@ -303,28 +527,63 @@ def _kpi_scope_mismatch(key: str, plant: str, question: str) -> str | None:
         codes = [s.split(" ")[0] for c in multi for s in (r["city_hospitals"].get(c) or [])]
         if plant in codes and len(codes) > 1:
             return (f"UNDER-SCOPED KPI — plant='{plant}' is ONE of the {len(codes)} sites "
-                    f"this question covers ({', '.join(codes)}). Call get_kpi once per code "
-                    f"and SUM them, or write one SQL statement filtered to all of them. "
-                    f"Answering for a single hospital understates the city.")
+                    f"this question covers ({', '.join(codes)}). "
+                    + (_ratio_advice(key, codes, can_view) + " " if ratio else
+                       "Call get_kpi once per code and SUM them, or write one SQL statement "
+                       "filtered to all of them. ")
+                    + "Answering for a single hospital understates the city.")
         return None
     if plant:
         return None
-    sites = [f"{c}: {', '.join((r['city_hospitals'].get(c) or [])[:6])}" for c in r["cities"]]
+    # view="hospitals" returns one row per hospital, so the named sites are in it and are
+    # quoted from it. This is the route the ratio advice offers, and it must not be refused.
+    if (extra or {}).get("view") == "hospitals" and _kpi_takes(key, "view"):
+        return None
+    sites =[f"{c}: {', '.join((r['city_hospitals'].get(c) or [])[:6])}" for c in r["cities"]]
     named = [e["text"] for e in r["entities"] if e["kind"] == "hospital"]
+    if not (sites or named):
+        # A hospital named the way people say it ("KR", "Nagpur", "Panda") is in neither
+        # the city list nor the warehouse's codes, so this guard never saw it: asked what KR
+        # spent on restricted brands, the model dropped the hospital and reported the
+        # network's ₹3.17 Cr as KR's ₹43.47 L (golden fs-kr-*, 10-10-2026).
+        from app.ai import hospitals as _hosp
+        codes = list(dict.fromkeys(c[0] for _a, c in _hosp.mentioned(question or "") if len(c) == 1))
+        if codes:
+            said = ", ".join(a for a, c in _hosp.mentioned(question or "") if len(c) == 1)
+            head = (f"UNSCOPED KPI — this question names {said} = {_hosp.describe(codes)}, and "
+                    f"get_kpi('{key}') without a `plant` argument returns the figure for the WHOLE "
+                    f"network. ")
+            if len(codes) == 1:
+                return head + f"Call get_kpi again with plant='{codes[0]}'."
+            if _is_report_key(key):
+                return head + (f"Call it with plant='{','.join(codes)}' for these hospitals pooled, "
+                               f"or once per code for each hospital's own figure.")
+            return head + ("Call get_kpi once per code: " + ", ".join(codes) + "."
+                           + (" Quote each site's figure on its own; per-site ratios do not combine."
+                              if ratio else ""))
     if not (sites or named):
         return None
     which = "; ".join(sites) or ", ".join(named)
-    return (f"UNSCOPED KPI — this question is about a specific site ({which}), and "
+    head = (f"UNSCOPED KPI — this question is about a specific site ({which}), and "
             f"get_kpi('{key}') without a `plant` argument returns the figure for the WHOLE "
             f"network. Reporting it as that site's number is wrong by a factor of the "
-            f"estate. It covers MORE THAN ONE site: call get_kpi once PER CODE listed "
-            f"above and SUM the results, or write one SQL statement filtered to all of "
-            f"those plant codes at once. Answering for a single site is just as wrong as "
-            f"answering for the network — the first attempt at this returned ₹16.41 Cr, "
-            f"one hospital out of four, against a true total of ₹173.73 Cr.")
+            f"estate. ")
+    # ONE named hospital needs one argument, not a lecture about cities: this used to say
+    # "it covers MORE THAN ONE site" even when exactly one hospital was named.
+    several = len(named) > 1 or any(len(r["city_hospitals"].get(c) or []) > 1 for c in r["cities"])
+    if not several:
+        return head + f"Call get_kpi again with plant=<that hospital's code> ({which})."
+    if ratio:
+        codes = [s.split(" ")[0] for c in r["cities"] for s in (r["city_hospitals"].get(c) or [])]
+        return head + "It covers MORE THAN ONE site. " + _ratio_advice(key, codes, can_view)
+    return head + (f"It covers MORE THAN ONE site: call get_kpi once PER CODE listed "
+                   f"above and SUM the results, or write one SQL statement filtered to all of "
+                   f"those plant codes at once. Answering for a single site is just as wrong as "
+                   f"answering for the network — the first attempt at this returned ₹16.41 Cr, "
+                   f"one hospital out of four, against a true total of ₹173.73 Cr.")
 
 
-def get_kpi(key: str, plant: str = "", category: str = "", question: str = "") -> dict:
+def get_kpi(key: str, plant: str = "", category: str = "", question: str = "", **extra) -> dict:
     """The dashboard's OWN calculation for a named metric — correct by construction.
 
     Deep mode was re-deriving everything with hand-written SQL, including metrics the
@@ -338,18 +597,56 @@ def get_kpi(key: str, plant: str = "", category: str = "", question: str = "") -
     if key not in kpi_registry.KPI_REGISTRY:
         return {"error": f"unknown kpi '{key}'",
                 "available": sorted(kpi_registry.KPI_REGISTRY)[:40]}
+    ratio = bool(kpi_registry.KPI_REGISTRY[key].get("ratio"))
+    # month, payer, view, doctor … for the Jun–Aug reports. Only real values are forwarded;
+    # call_kpi reports any the KPI does not take as `_ignored_args`, so a month passed to a
+    # Dec–May KPI is visibly a no-op rather than silently one.
+    extra = {k: v for k, v in extra.items() if v not in (None, "")}
+    # A product question is refused before the per-site fan-out below: four hospitals'
+    # company-wide figures are still not one drug's figures.
+    try:
+        from app.ai import resolve as _resolve
+        product = _product_scope_mismatch(key, _resolve.resolve(question or ""),
+                                          question or "", sql_tool="run_query")
+    except Exception:
+        product = None
+    if product:
+        return {"error": product}
     # A guard that only refuses leaves the model with nowhere to go: blocking both the
     # unscoped and the single-plant call produced "I couldn't establish anything" and zero
     # queries. Where the right scope is KNOWN — a city resolves to an explicit list of plant
     # codes — fetch every one of them instead of arguing about it.
     codes = _city_plant_codes(question)
+    if codes and (not plant or plant in codes) and len(codes) > 1 and _is_report_key(key):
+        # The Jun–Aug reports pool several hospitals themselves — the ratio of the summed
+        # amounts, which is the city's real figure — so a city is one call, not four figures
+        # the model would be tempted to combine. Views that cannot pool raise, and fall
+        # through to the per-site calls below.
+        try:
+            got = kpi_registry.call_kpi(key, ",".join(codes), category or None, **extra)
+        except Exception:
+            got = None
+        if got is not None:
+            if _report_error(got):
+                return {"error": _report_error(got)[:220]}
+            return {"kpi": key, "canonical": True, "scoped_to": codes, "payload": got,
+                    "note": (f"One pooled figure for the {len(codes)} sites this question "
+                             f"covers ({', '.join(codes)}), computed by the report itself. "
+                             f"Quote it as their figure and say which sites it covers.")}
     if codes and (not plant or plant in codes) and len(codes) > 1:
-        per_site, failed = {}, []
+        per_site, failed, reason = {}, [], ""
         for code in codes:
             try:
-                per_site[code] = kpi_registry.call_kpi(key, code, category or None)
+                got = kpi_registry.call_kpi(key, code, category or None, **extra)
             except Exception as e:
+                reason = reason or str(e)
                 failed.append(f"{code}: {str(e)[:60]}")
+                continue
+            if _report_error(got):
+                reason = reason or _report_error(got)
+                failed.append(f"{code}: {_report_error(got)[:60]}")
+            else:
+                per_site[code] = got
         # PROVE THE FILTER WORKED. Sales metrics ignore `plant` entirely — their tables use
         # a site code system disjoint from dim_plant — so asking for four hospitals returned
         # the company total four times, identically, labelled as four hospitals. That is
@@ -366,21 +663,68 @@ def get_kpi(key: str, plant: str = "", category: str = "", question: str = "") -
                 f"dim_plant). Do NOT present these numbers as {', '.join(codes)}. Either "
                 f"answer for the whole network and say the city cut is unavailable, or use a "
                 f"table that genuinely carries the site.")}
+        if failed and not per_site:
+            # every site failed (data not loaded, a bad argument); the reason is the useful
+            # thing to hand back, not a lecture about scoping
+            return {"error": f"every site failed ({', '.join(codes)}): {reason[:220]}"}
         if per_site:
             return {"kpi": key, "canonical": True, "scoped_to": codes,
                     "per_site": per_site, "errors": failed or None,
                     "note": (f"This question covers {len(codes)} sites ({', '.join(codes)}), "
-                             f"so the metric is returned PER SITE. Sum them for the total "
-                             f"and say which sites are included. Reporting one site, or the "
-                             f"unscoped network figure, is a different answer.")}
-    mismatch = _kpi_scope_mismatch(key, plant, question)
+                             f"so the metric is returned PER SITE. "
+                             + ("It is a RATIO, so these cannot be combined into one city "
+                                "figure by arithmetic. Quote each site's figure and say which "
+                                "sites are included. "
+                                if ratio else
+                                "Sum them for the total and say which sites are included. ")
+                             + "Reporting one site, or the unscoped network figure, is a "
+                               "different answer.")}
+    # the extras go in so view="hospitals" — a route the ratio advice offers — is accepted
+    mismatch = _kpi_scope_mismatch(key, plant, question, ratio=ratio, extra=extra,
+                                   sql_tool="run_query")
     if mismatch:
         return {"error": mismatch}
     try:
-        payload = kpi_registry.call_kpi(key, plant or None, category or None)
+        payload = kpi_registry.call_kpi(key, plant or None, category or None, **extra)
     except Exception as e:
         return {"error": str(e)[:220]}
+    if _report_error(payload):
+        return {"error": _report_error(payload)[:220]}
     return {"kpi": key, "canonical": True, "payload": payload}
+
+
+def _report_error(payload) -> str:
+    """The plain-sentence error a Jun–Aug report returns instead of data, or "".
+
+    A report whose data is not loaded answers {"error": "..."} rather than raising. Passed
+    through as a canonical payload, that sentence would become a one-row "finding" that owns
+    the headline; returned as a tool error, the model reads it as what it is.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict) and set(data) == {"error"}:
+        return str(data["error"])
+    return ""
+
+
+def kpi_for_model(out: dict) -> dict:
+    """The copy of a get_kpi result the MODEL reads, with every figure already formatted.
+
+    The raw payload holds rupees as floats — 604679341.2 — and handed that, the model does
+    its own crore conversion and slips a decimal (₹604.68 Cr for ₹60.47 Cr). Fast mode
+    formats the payload before the model sees it; this uses the same function so the two
+    modes cannot drift. The raw `out` is untouched: charts and tables are built from it in
+    code. Imported here, not at the top, because the orchestrator imports this package.
+    """
+    try:
+        from app.ai.orchestrator import _format_kpi_payload
+    except Exception:
+        return out
+    view = dict(out)
+    if isinstance(view.get("payload"), dict):
+        view["payload"] = _format_kpi_payload(view["payload"])
+    if isinstance(view.get("per_site"), dict):
+        view["per_site"] = {k: _format_kpi_payload(v) for k, v in view["per_site"].items()}
+    return view
 
 
 def kpi_keys() -> list[str]:
@@ -388,10 +732,52 @@ def kpi_keys() -> list[str]:
     return sorted(kpi_registry.KPI_REGISTRY)
 
 
+def kpi_entry(key: str) -> dict:
+    """The registry entry for a key, or {} — so callers can read `needs`/`ratio` safely."""
+    from app.ai import kpi_registry
+    return kpi_registry.KPI_REGISTRY.get(key or "") or {}
+
+
 # ── OpenAI tool schemas ──────────────────────────────────────────────────────
 def _t(name, desc, props, required):
     return {"type": "function", "function": {"name": name, "description": desc,
             "parameters": {"type": "object", "properties": props, "required": required}}}
+
+
+def _get_kpi_spec() -> dict:
+    """get_kpi's arguments, taken from the registry's own schema.
+
+    Deep mode kept a hand-written copy with only key/plant/category, so it could never pass
+    a month, payer or view to the Jun–Aug reports and always answered for the latest month
+    and every hospital. Reading the registry's schema means an argument added there reaches
+    this engine without a second list to keep in step. The registry calls the key `kpi`;
+    this engine has always called it `key`, so it is renamed rather than changing dispatch.
+    """
+    from app.ai import kpi_registry
+    params = copy.deepcopy(kpi_registry.tool_schema()["function"]["parameters"])
+    params["properties"] = {("key" if k == "kpi" else k): v
+                            for k, v in (params.get("properties") or {}).items()}
+    params["required"] = ["key" if r == "kpi" else r for r in params.get("required") or ["key"]]
+    reports = [f"{k} ({e.get('label', k)}): {e.get('about', '')}"
+               for k, e in sorted(kpi_registry.KPI_REGISTRY.items()) if e.get("needs")]
+    desc = ("The dashboard's OWN calculation for a named metric — correct by construction and "
+            "already verified. PREFER THIS over writing SQL whenever the question matches one "
+            "of these metrics; only fall back to run_query for things no KPI covers.")
+    if reports:
+        desc += ("\n<<REPORTS>> REPORTS (no SQL table holds these; they default to the latest "
+                 "month and all hospitals, so pass the month, hospital and other arguments the "
+                 "question names, and say which month you used):\n- " + "\n- ".join(reports)
+                 + "\nEvery other key is a <<SALES>> dashboard KPI and ignores those "
+                   "extra arguments.")
+    return {"type": "function", "function": {"name": "get_kpi", "description": desc,
+                                             "parameters": params}}
+
+
+def _kpi_extras(a: dict) -> dict:
+    """The report arguments (month, payer, view, …) the model passed, by the registry's list."""
+    from app.ai import kpi_registry
+    names = getattr(kpi_registry, "EXTRA_ARGS", ())
+    return {k: a[k] for k in names if a.get(k) not in (None, "")}
 
 
 SPECS = [
@@ -410,13 +796,7 @@ SPECS = [
        {"value": {"type": "string"}}, ["value"]),
     _t("profile_column", "Distinct count, nulls and commonest values of a column.",
        {"table": {"type": "string"}, "column": {"type": "string"}}, ["table", "column"]),
-    _t("get_kpi", "The dashboard's OWN calculation for a named metric — correct by "
-       "construction and already verified. PREFER THIS over writing SQL whenever the "
-       "question matches one of these metrics; only fall back to run_query for things no "
-       "KPI covers.",
-       {"key": {"type": "string", "enum": kpi_keys()},
-        "plant": {"type": "string", "description": "hospital code, or empty for all"},
-        "category": {"type": "string"}}, ["key"]),
+    _get_kpi_spec(),
     _t("run_query", "Run a read-only SELECT and see the rows.",
        {"sql": {"type": "string"}, "purpose": {"type": "string"}}, ["sql", "purpose"]),
     _t("finish", "Call this once you have the rows that answer the sub-question. Pass the SQL "
@@ -435,7 +815,8 @@ DISPATCH = {
     "find_value": lambda a, ctx: find_value(a.get("value", "")),
     "profile_column": lambda a, ctx: profile_column(a.get("table", ""), a.get("column", "")),
     "get_kpi": lambda a, ctx: get_kpi(a.get("key", ""), a.get("plant", ""),
-                                      a.get("category", ""), ctx.get("question", "")),
+                                      a.get("category", ""), ctx.get("question", ""),
+                                      **_kpi_extras(a)),
     "run_query": lambda a, ctx: run_query(a.get("sql", ""), ctx.get("entity_tokens"), ctx.get("question", "")),
 }
 
@@ -451,6 +832,47 @@ def call(name: str, args: dict, ctx: dict) -> dict:
 
 
 def compact(obj: dict, limit: int = 2600) -> str:
+    """A tool result as the model reads it, within `limit` characters.
+
+    Cutting the JSON at the limit used to land mid-string, so a KPI's totals or a second
+    site's figures simply vanished and the model read a half-object. Whole rows are dropped
+    from the longest lists first, with a note of how many, so what arrives is still valid
+    JSON with its totals and notes intact. ensure_ascii=False keeps '₹' as one character
+    instead of six.
+    """
     o = {k: v for k, v in obj.items() if not k.startswith("_")}
-    s = json.dumps(o, default=str)
-    return s if len(s) <= limit else s[:limit] + " …(truncated)"
+    s = json.dumps(o, default=str, ensure_ascii=False)
+    if len(s) <= limit:
+        return s
+    fitted = _drop_rows_to_fit(json.loads(s), limit)
+    return fitted if fitted is not None else s[:limit] + " …(truncated)"
+
+
+def _drop_rows_to_fit(o, limit: int) -> str | None:
+    """Halve the biggest list until the JSON fits; None when lists are not what is big."""
+    hidden: dict[int, int] = {}
+
+    def lists(node):
+        if isinstance(node, list):
+            yield node
+            for x in node:
+                yield from lists(x)
+        elif isinstance(node, dict):
+            for v in node.values():
+                yield from lists(v)
+
+    for _ in range(60):
+        cands = [x for x in lists(o) if len(x) - (1 if id(x) in hidden else 0) > 1]
+        if not cands:
+            return None
+        big = max(cands, key=lambda x: len(json.dumps(x, ensure_ascii=False)))
+        if id(big) in hidden:
+            big.pop()                      # the "… more not shown" marker from last time
+        keep = max(1, len(big) // 2)
+        hidden[id(big)] = hidden.get(id(big), 0) + len(big) - keep
+        del big[keep:]
+        big.append(f"… {hidden[id(big)]} more not shown")
+        s = json.dumps(o, ensure_ascii=False)
+        if len(s) <= limit:
+            return s
+    return None

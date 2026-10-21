@@ -100,8 +100,8 @@ def _no_time_column_available(sql: str) -> bool:
         tables = set(_TABLES_IN.findall(sql or ""))
         if not tables:
             return False
-        rows = warehouse.con().execute(
-            "SELECT table_name, column_name FROM information_schema.columns").fetchall()
+        rows = warehouse.query(
+            "SELECT table_name, column_name FROM information_schema.columns")
     except Exception:
         return False
     return not any(t in tables and _TIME_COL.match(c) for t, c in rows)
@@ -172,16 +172,15 @@ def _sorts_chronologically(sql: str) -> bool:
     tables = re.findall(r"\b(?:FROM|JOIN)\s+\"?([A-Za-z_]\w*)\"?", sql or "", re.I)
     try:
         from app.ai import warehouse
-        con = warehouse.con()
     except Exception:
         return False
     for col in ordered:
         ok = False
         for t in tables:
             try:
-                vals = con.execute(
+                vals = warehouse.query(
                     f'SELECT DISTINCT CAST("{col}" AS VARCHAR) FROM "{t}" '
-                    f'WHERE "{col}" IS NOT NULL LIMIT 5').fetchall()
+                    f'WHERE "{col}" IS NOT NULL LIMIT 5')
             except Exception:
                 continue
             if vals and all(_YYYY_MM.match(str(v[0])) for v in vals):
@@ -230,7 +229,7 @@ def check(question: str, sql: str) -> str | None:
         return None
     bad = violations(question, sql)
     for extra in (wrong_time_ordering(sql), misleading_alias(sql),
-                  under_aggregated_trend(question, sql)):
+                  under_aggregated_trend(question, sql), trend_from_a_total_table(question, sql)):
         if extra:
             bad = bad + [extra]
     if not bad:
@@ -284,6 +283,45 @@ def under_aggregated_trend(question: str, sql: str) -> str | None:
             "without GROUP BY, so any period with more than one matching row appears twice "
             "and the reader is handed two numbers to add. Group by the period column and "
             "SUM the measure, so each period has exactly one value.")
+
+
+# ── A TREND MAY NOT BE ANSWERED FROM A SIX-MONTH TOTAL ───────────────────────────────────
+# The TEMPORAL rule above stands down whenever none of the query's tables has a time column.
+# That exception exists for consumption_all, where demanding a month was a deadlock. It also
+# let "get me the sales trend of keytruda" pass every check as
+# `SELECT SUM(revenue) FROM sales_by_material WHERE material_desc LIKE '%KEYTRUDA%'` — one
+# six-month figure, which the answer then reported as "there is no monthly breakdown" while
+# sales_by_material_month held all six months. The sales side does have a month table, so
+# for SALES the exception is wrong and this names where the months are.
+#
+# `\b` after the table name does not match `sales_by_material_month`, because `_` is a word
+# character, so the month table never trips this.
+_TOTAL_ONLY_SALES = re.compile(
+    r"\b(?:FROM|JOIN)\s+\"?(sales_by_material(?:_hospital|_mfr)?|sales_by_manufacturer|"
+    r"sales_by_hospital|sales_totals)\b", re.I)
+_HAS_SALES_MONTH = re.compile(r"\bsales_by_material_month\b|\bsales_monthly\b", re.I)
+# Bare "month" is left out on purpose: "Keytruda's 6-month total" and "sales last month" are
+# not trend questions, and blocking the six-month table for them would refuse a right answer.
+_ASKS_TREND = re.compile(
+    r"\btrend|\bover time\b|\bmonthly\b|\bmonth[- ]on[- ]month\b|\bmonth[- ]by[- ]month\b|"
+    r"\b(?:by|per|each) month\b|\bmonth-?wise\b", re.I)
+
+
+def trend_from_a_total_table(question: str, sql: str) -> str | None:
+    """A sales trend asked for, answered from a sales table that holds no time axis."""
+    if not sql or not question or not _ASKS_TREND.search(question):
+        return None
+    if not _TOTAL_ONLY_SALES.search(sql) or _HAS_SALES_MONTH.search(sql):
+        return None
+    # A hospital's (or a manufacturer's) monthly sales genuinely do not exist: no sales table
+    # carries hospital or manufacturer together with a month. There the six-month total is
+    # the honest answer, and it must not be blocked into a deadlock.
+    if _grain_is_impossible(question):
+        return None
+    return ("NO TIME AXIS — this sales table is a <<SALES_MONTHS>>-month TOTAL and cannot show a trend. "
+            "Monthly sales per product or category are in sales_by_material_month (period, "
+            "material, material_desc, material_group, revenue, cost, qty); company-wide "
+            "monthly sales are in sales_monthly. GROUP BY period ORDER BY period.")
 
 
 def misleading_alias(sql: str) -> str | None:

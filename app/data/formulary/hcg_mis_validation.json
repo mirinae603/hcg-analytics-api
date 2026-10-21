@@ -1,0 +1,343 @@
+{
+ "built_at": "2026-10-15T06:12:28+00:00",
+ "generator": "app.etl.formulary.hcg_mis",
+ "source_file": "Onco and Non Onco Formulary Compliance Sep 26 - MIS.xlsx",
+ "file_period": "2026-09",
+ "fy_sheet": "FY 26-27 Formulary Compliance %",
+ "fy_periods": [
+  "2026-04",
+  "2026-05",
+  "2026-06",
+  "2026-07",
+  "2026-08",
+  "2026-09"
+ ],
+ "units": 23,
+ "pan_units": 22,
+ "history": {
+  "onco": {
+   "first": "2022-06",
+   "last": "2026-09",
+   "missing_inside": [
+    "2026-07"
+   ]
+  },
+  "non-onco": {
+   "first": "2022-08",
+   "last": "2026-09",
+   "missing_inside": [
+    "2026-07"
+   ]
+  }
+ },
+ "hcg_formula_by_month": {
+  "2026-04": {
+   "oof_over_formulary": 19,
+   "pooled": 3
+  },
+  "2026-05": {
+   "oof_over_formulary": 22,
+   "pooled": 0
+  },
+  "2026-06": {
+   "oof_over_formulary": 20,
+   "pooled": 2
+  },
+  "2026-07": {
+   "oof_over_formulary": 0,
+   "pooled": 22
+  },
+  "2026-08": {
+   "oof_over_formulary": 0,
+   "pooled": 22
+  },
+  "2026-09": {
+   "oof_over_formulary": 0,
+   "pooled": 22
+  }
+ },
+ "pan": [
+  {
+   "period": "2026-04",
+   "printed_pct": 97.5637,
+   "sheet_pooled_pct": 97.5637,
+   "corrected_pooled_pct": 97.0247,
+   "units": 22
+  },
+  {
+   "period": "2026-05",
+   "printed_pct": 96.0069,
+   "sheet_pooled_pct": 96.0069,
+   "corrected_pooled_pct": 96.0069,
+   "units": 22
+  },
+  {
+   "period": "2026-06",
+   "printed_pct": 98.0101,
+   "sheet_pooled_pct": 98.0101,
+   "corrected_pooled_pct": 98.0101,
+   "units": 22
+  },
+  {
+   "period": "2026-07",
+   "printed_pct": 97.8901,
+   "sheet_pooled_pct": 97.8902,
+   "corrected_pooled_pct": 97.8902,
+   "units": 22
+  },
+  {
+   "period": "2026-08",
+   "printed_pct": 97.554,
+   "sheet_pooled_pct": 97.554,
+   "corrected_pooled_pct": 97.554,
+   "units": 22
+  },
+  {
+   "period": "2026-09",
+   "printed_pct": 97.6609,
+   "sheet_pooled_pct": 97.6609,
+   "corrected_pooled_pct": 97.6609,
+   "units": 22
+  }
+ ],
+ "corrections": [
+  {
+   "plant": "AH01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 40417.95,
+   "history": 425827.56,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC05",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 1638625.53,
+   "history": 77205.41,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC06",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 156504.97,
+   "history": 17187.87,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC13",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 380958.99,
+   "history": 233856.97,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC16",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 437.7,
+   "history": 661144.63,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC17",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 217093.09,
+   "history": 12823.25,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC22",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 182144.96,
+   "history": 2022245.91,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC24",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 91249.77,
+   "history": 18841.04,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC25",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 191876.8,
+   "history": 42175.07,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC26",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 49544.74,
+   "history": 2520.54,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC27",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 400493.45,
+   "history": 78521.42,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC31",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 230435.88,
+   "history": 102712.25,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC32",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 417653.28,
+   "history": 51952.67,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC33",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 9020.61,
+   "history": 66514.61,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HE01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 68994.09,
+   "history": 337076.71,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HM01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 255082.1,
+   "history": 161691.5,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC38",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 169228.16,
+   "history": 448743.37,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HO01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 225765.42,
+   "history": 57281.02,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HC35",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 83986.74,
+   "history": 90934.85,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "HS01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 142683.08,
+   "history": 1256866.32,
+   "used": "history",
+   "reason": "non-onco OOF repeats the onco OOF in the FY sheet"
+  },
+  {
+   "plant": "SH01",
+   "period": "2026-04",
+   "segment": "non-onco",
+   "measure": "out_of_formulary",
+   "fy_sheet": 0.0,
+   "history": 1044444.52,
+   "used": "history",
+   "reason": "the FY sheet and the history sheet differ"
+  }
+ ],
+ "notes": [
+  "Onco Formulary Consumption: unmarked block '2022-04-01 00:00:00' read as percent",
+  "Onco Formulary Consumption: unmarked block '2022-05-01 00:00:00' read as percent",
+  "Onco Formulary Consumption: block 'June -Value' read as 2022-06 (its label has no year)",
+  "Onco Formulary Consumption: block 'July in  Value' read as 2022-07 (its label has no year)",
+  "Onco Formulary Consumption: block 'August in  Value' read as 2022-08 (its label has no year)",
+  "Non Onco Formulary Consumption: block 'August 23 in Value' at column 258 repeats the one at column 11; read once",
+  "Non Onco Formulary Consumption: block 'September 2022 in Value' at column 270 repeats the one at column 23; read once",
+  "Non Onco Formulary Consumption: block 'October 2022 in Value' at column 282 repeats the one at column 35; read once",
+  "Non Onco Formulary Consumption: block 'November 2022 in Value' at column 295 repeats the one at column 48; read once",
+  "Non Onco Formulary Consumption: block 'December 2022 in Value' at column 311 repeats the one at column 64; read once",
+  "Non Onco Formulary Consumption: block 'January 2023 in Value' at column 329 repeats the one at column 82; read once",
+  "Non Onco Formulary Consumption: block 'Feb 2023 in Value' at column 347 repeats the one at column 100; read once",
+  "Non Onco Formulary Consumption: block 'March 2023 in Value' at column 365 repeats the one at column 118; read once",
+  "Non Onco Formulary Consumption: block 'April 2023 in Value' at column 383 repeats the one at column 136; read once",
+  "Non Onco Formulary Consumption: block 'May 2023 in Value' at column 401 repeats the one at column 154; read once",
+  "Non Onco Formulary Consumption: block 'June 2023 in Value' at column 419 repeats the one at column 172; read once",
+  "Non Onco Formulary Consumption: block 'July 2023 in Value' at column 436 repeats the one at column 189; read once",
+  "Non Onco Formulary Consumption: block 'August 2023 in Value' at column 454 repeats the one at column 207; read once",
+  "Non Onco Formulary Consumption: block 'Sep 2023 in Value' at column 472 repeats the one at column 225; read once",
+  "Non Onco Formulary Consumption: block 'August 23 in Value' read as 2022-08 (its label says 2023)"
+ ],
+ "tables": {
+  "hcg_mis_units": 23,
+  "hcg_mis_compliance": 132,
+  "hcg_mis_monthly": 2188,
+  "hcg_mis_pan": 6
+ }
+}

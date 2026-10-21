@@ -24,3 +24,19 @@ app/data/app.db
 app/data/app.db-journal
 app/data/*.db
 app/data/*.db-journal
+
+# Raw HCG client extracts (pharmacy sales with patient names/UHIDs, item and payer
+# masters). They live in master/ next to the code and must never be committed; only the
+# aggregated tables built from them (app/data/formulary/*.parquet) are.
+/master/
+**/master/
+# Line-level build caches (the formulary build defaults to ~/.cache, outside the repo).
+.cache/
+# Client spreadsheets and meeting documents dropped into the checkout.
+*.xlsx
+*.xlsb
+*.docx
+
+# Claude Code's local folder: per-developer launch configs and git worktrees, each a full copy of
+# the checkout with its own .venv and caches (hundreds of MB). Never part of the repository.
+.claude/

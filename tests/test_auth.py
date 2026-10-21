@@ -194,8 +194,8 @@ def test_admin_approve_flips_status_and_user_can_then_signin(client, admin_heade
 
 # ---------- token edge cases ----------
 
-def test_admin_endpoint_without_token_is_401(client):
-    r = client.get("/admin/users")
+def test_admin_endpoint_without_token_is_401(anon_client):
+    r = anon_client.get("/admin/users")
     assert r.status_code == 401
 
 

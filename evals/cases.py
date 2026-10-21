@@ -16,10 +16,17 @@ GROUND TRUTH (checked 2026-08-30, all from the live warehouse):
   Expiry     already expired 4,041 lines ₹83.13 L; within 90d ₹39.97 L / 45,223 units
   Worst margin over ₹1 Cr: POLIVY 30MG INJ VIAL at 5.78%
 
+  KEYTRUDA by month (codes merged, checked 2026-10-10): Dec 9.68 · Jan 9.40 · Feb 7.06 ·
+             Mar 6.58 · Apr 6.84 · May 7.92 (Cr)
+
 STRUCTURAL FACTS the assistant must respect:
-  * No material x month SALES grain. Monthly figures for an item exist only for
-    purchasing (fact_po, fact_grn, mart_procurement, kpi_monthly_purchase_value) and
-    consumption (fact_consumption, kpi_units_consumed).
+  * Material x month SALES exist in sales_by_material_month (period). Hospital x month
+    sales do not. Monthly figures for an item also exist for purchasing (fact_po, fact_grn,
+    mart_procurement, kpi_monthly_purchase_value) and consumption (fact_consumption,
+    kpi_units_consumed).
+  * Formulary compliance and spend (scheme / Attis / cash & TPA) are Jun-Aug 2026 reports,
+    a different window from the Dec-2025..May-2026 warehouse. Their ground truth is in the
+    FS bucket at the end of this file.
   * Sales hospital codes (KABHK, GJHCA) and plant codes (HC05, AH01) share ZERO rows and
     nothing maps between them. Hospital NAMES and cities live only in dim_plant.plant_name,
     so no city can reach the sales tables.
@@ -151,12 +158,20 @@ L1: list[dict] = [
     # plain query, so the check asks for the real series — and still bans the company-wide
     # monthly totals, which is the wrong answer it used to give.
     {"id": "keytruda-trend", "q": 'Show me the sales trend for "KEYTRUDA 100MG INJ VIAL"',
+     # 9.68 and 9.40 are December and January only once the '101313' and '101313.0'
+     # codes are merged. 9.29 used to be accepted here, but it is the undercounted
+     # December (the .xlsb OP half missing), so it must no longer pass.
      "check": all_of(
-         any_of("9.68", "9.29", "7.92"),          # its own monthly figures
+         any_of("9.68", "9.40"),                  # Dec / Jan, merged codes
+         any_of("7.92"),                          # May
          any_of("december", "dec 2025", "2025-12"),
          lacks("89.52", "90.90")),                # the ALL-material monthly totals
      "why": "Dec 2025 ₹9.68 Cr → May 2026 ₹7.92 Cr from sales_by_material_month — its own "
-            "series, never the company-wide monthly total"},
+            "series, never the company-wide monthly total",
+     # The live failure this case exists for was a question back ("no monthly breakdown,
+     # want the 6-month total instead?"), not a wrong number: the series exists, so a
+     # clarification is a fail.
+     "must_answer": True},
 
     # ── traps: wrong entity type, false absence ──────────────────────────────
     {"id": "msd-procurement", "q": "Show me the procurement history for MSD products",
@@ -398,7 +413,7 @@ L3: list[dict] = [
     {"id": "l3-bangalore-sales-trap", "q": "What sold the most in Bangalore last month?",
      "check": any_of("purchas", "procurement", "cannot", "can't", "no city", "plant_name",
                      "not possible", "consumption", "no monthly"),
-     "why": "TRAP: no city reaches sales, and there is no material x month sales grain"},
+     "why": "TRAP: no city reaches sales"},
     {"id": "l3-msd-lead-time-hop",
      "q": "How reliable are the vendors who supply MSD's products?",
      "check": all_of(lacks("no lead times", "no data", "not answerable"),
@@ -585,6 +600,91 @@ L4: list[dict] = [
 ]
 
 
+# ── FS · the Jun-Aug 2026 formulary and spend reports ─────────────────────────────────────
+#
+# Reached only through get_kpi (formulary-compliance, brand-rules, scheme-brand-saving,
+# attis-saving, cash-tpa-margin-loss). Figures are HCG KR Bangalore (plant HC05, HIS code
+# KABHK) for Aug-26 unless stated, verified to the rupee against HCG's own Aug-26 MIS
+# emails and the formulary / spend APIs. Money checks accept both the raw rupee figure and
+# the display form the AI uses (Rs 3.65 L, Rs 78.08 L, Rs 4.52 Cr).
+#
+# Optional per-case keys, used by evals/golden.py:
+#   "mode":    pin the case to "fast" or "deep" whatever mode the run was started with
+#   "context": the page context the dashboard would send (reduced by app/ai/page_context.normalise)
+_KR_AUG_PAGE = {
+    "page": "formulary", "label": "Formulary compliance · Overview", "view": "overview",
+    "month": "2026-08", "monthLabel": "Aug-26", "plant": "HC05", "hospital": "HCG KR, Bangalore",
+    "filters": {"type": "ALL", "segment": "ALL", "payer": "ALL", "method": "pooled"},
+}
+
+FS: list[dict] = [
+    {"id": "fs-kr-compliance-aug",
+     "q": "What was formulary compliance at HCG KR (HC05) in August 2026?",
+     "check": all_of(num_within(98.4191, 0.1), head_lacks("96.6")),
+     "must_answer": True,
+     "why": "98.42% pooled = formulary / (formulary + out of formulary) on drug cost; 96.63% "
+            "is the old mean-of-segments method HCG dropped in Jul-26"},
+
+    {"id": "fs-network-pooled-jun-aug",
+     "q": "What was our network-wide formulary compliance across June to August 2026?",
+     "check": num_within(97.8218, 0.1),
+     "must_answer": True,
+     "why": "97.82% pooled over all hospitals and all three months: a ratio of sums, never an "
+            "average of hospital or monthly percentages"},
+
+    {"id": "fs-kr-restricted-scheme-aug",
+     "q": "How much did KR spend on restricted brands for scheme (GOV) patients in Aug-26, "
+          "and what share of drug spend is that?",
+     "check": all_of(lambda t: num_within(43.47, 1)(t) or num_within(4347340.55, 1)(t),
+                     num_within(4.0987, 1)),
+     "must_answer": True,
+     "why": "Rs 43.47 L (Rs 43,47,340.55) = 4.10% of KR's Aug-26 drug spend"},
+
+    {"id": "fs-kr-preferred-scheme-aug",
+     "q": "How much did KR spend on preferred brands for scheme patients in Aug-26?",
+     "check": lambda t: num_within(2.27, 1.5)(t) or num_within(227385.07, 1)(t),
+     "must_answer": True,
+     "why": "Rs 2.27 L (Rs 2,27,385.07), 0.21% of drug spend"},
+
+    {"id": "fs-kr-restricted-cash-tpa-aug",
+     "q": "How much did KR spend on restricted brands for cash and TPA patients in Aug-26?",
+     "check": lambda t: num_within(4.52, 1)(t) or num_within(45192099.74, 1)(t),
+     "must_answer": True,
+     "why": "Rs 4.52 Cr (Rs 4,51,92,099.74), of which onco Rs 4.08 Cr"},
+
+    {"id": "fs-kr-scheme-saving-aug",
+     "q": "Total scheme saving missed at KR for Aug-26 across all suggested brands?",
+     "check": all_of(lambda t: num_within(365331.00, 1)(t) or num_within(3.6533, 1)(t),
+                     num_within(36.5538, 1)),
+     "must_answer": True,
+     "why": "Rs 3.65 L missed (used Rs 9,99,434.25 vs suggested Rs 6,34,103.24) = 36.55% of used"},
+
+    {"id": "fs-kr-attis-aug",
+     "q": "How much saving did KR miss in Aug-26 by not using Attis brands for scheme patients?",
+     "check": all_of(lambda t: num_within(31030.01, 1)(t) or num_within(31.03, 1.5)(t),
+                     num_within(51.9856, 1)),
+     "must_answer": True,
+     "why": "Rs 31,030.01 missed (used Rs 59,689.63 vs Attis Rs 28,659.61) = 51.99%"},
+
+    {"id": "fs-kr-cash-loss-aug",
+     "q": "What margin did KR lose on cash & TPA patients in Aug-26, and as a share of "
+          "potential margin?",
+     "check": all_of(lambda t: num_within(7808324.11, 1)(t) or num_within(78.08, 1)(t),
+                     num_within(42.7736, 1)),
+     "must_answer": True,
+     "why": "Rs 78.08 L lost (actual Rs 1.04 Cr vs potential Rs 1.83 Cr) = 42.77% of potential"},
+
+    # The same KR Aug-26 figure, but the question names neither the hospital nor the month:
+    # both come from the page the user is on. Fails if the context is not passed through.
+    {"id": "fs-context-kr-aug",
+     "q": "How are we doing on compliance here?",
+     "context": _KR_AUG_PAGE,
+     "check": num_within(98.4191, 0.1),
+     "must_answer": True,
+     "why": "the page says HC05, Aug-26, pooled: 98.42%"},
+]
+
+
 def _classify(bucket: list[dict], default: str) -> None:
     for c in bucket:
         c["level"] = _LEVEL_OF.get(c["id"], default)
@@ -594,5 +694,7 @@ _classify(L1, "L1")
 _classify(L2, "L2")
 _classify(L3, "L3")
 _classify(L4, "L4")
-CASES: list[dict] = L1 + L2 + L3 + L4
-BY_LEVEL = {lv: [c for c in CASES if c["level"] == lv] for lv in ("L1", "L2", "L3", "L4")}
+_classify(FS, "FS")
+CASES: list[dict] = L1 + L2 + L3 + L4 + FS
+LEVELS = ("L1", "L2", "L3", "L4", "FS")
+BY_LEVEL = {lv: [c for c in CASES if c["level"] == lv] for lv in LEVELS}

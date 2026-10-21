@@ -22,12 +22,14 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import SessionLocal, create_all
 from app.core.security import hash_password
 from app.models import User, UserRole, UserStatus
 
 SEED_ADMIN_EMAIL = "admin@hcg.com"
-SEED_ADMIN_PASSWORD = "admin123"  # plaintext known — re-hashed fresh with bcrypt, never migrated from the old sha256
+# The password comes from settings.SEED_ADMIN_PASSWORD (env; dev default "admin123"), read
+# when seeding — re-hashed fresh with bcrypt, never migrated from the old sha256.
 
 USERS_JSON_PATH = Path(__file__).resolve().parents[1] / "data" / "users.json"
 
@@ -39,7 +41,7 @@ def _ensure_seed_admin(db: Session) -> None:
             first_name="HCG",
             last_name="Admin",
             email=SEED_ADMIN_EMAIL,
-            password_hash=hash_password(SEED_ADMIN_PASSWORD),
+            password_hash=hash_password(settings.SEED_ADMIN_PASSWORD),
             role=UserRole.ADMIN,
             status=UserStatus.APPROVED,
         )

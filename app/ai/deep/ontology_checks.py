@@ -140,8 +140,8 @@ def averages_a_skewed_measure(sql: str) -> str | None:
             continue
         try:
             from app.ai import warehouse
-            mean, med = warehouse.con().execute(
-                f'SELECT AVG("{name}"), MEDIAN("{name}") FROM "{table}"').fetchone()
+            mean, med = warehouse.query(
+                f'SELECT AVG("{name}"), MEDIAN("{name}") FROM "{table}"', one=True)
         except Exception:
             return None
         if not mean or not med or med == 0:

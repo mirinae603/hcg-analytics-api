@@ -1,0 +1,3171 @@
+{
+ "built_at": "2026-10-10T20:22:26+00:00",
+ "generator": "python -m app.etl.formulary",
+ "periods": [
+  "2026-06",
+  "2026-07",
+  "2026-08"
+ ],
+ "latest": "2026-08",
+ "rules": {
+  "category": "first digit of MATERIALCODE: 1 Onco Drugs, 2 Other Drugs, 3 Consumables",
+  "formulary_class": "same month's Item Master: FORMULARY+Category | NON FORMULARY | OUT OF FORMULARY | NOT IN MASTER",
+  "groups": "A = class starting FORMULARY, B = OUT OF FORMULARY, C = NON FORMULARY",
+  "compliance": "pooled = A/(A+B) over drugs; mean = average of the onco and non-onco ratios; ratio of sums, never an average of percentages",
+  "payer": "blank -> CASH; payer_overrides.csv; Payer Master first row by CUSTOMERNAME; else CASH(TPA)"
+ },
+ "brand_rules": [
+  {
+   "measure": "restricted_scheme",
+   "label": "Restricted brands for scheme patients",
+   "classes": [
+    "FORMULARYR",
+    "FORMULARYR-OPD"
+   ],
+   "payers": [
+    "GOV"
+   ],
+   "patient_types": [
+    "*"
+   ],
+   "verdict": "breach",
+   "by_doctor": true,
+   "alternatives": [
+    "P-SCH",
+    "SCH",
+    "SCH-OPD"
+   ],
+   "rule_ref": "guidelines 3 and 6",
+   "note": "HCG's report: 'Restricted brand consumption for scheme patient'"
+  },
+  {
+   "measure": "preferred_scheme",
+   "label": "Preferred (cash) brands for scheme patients",
+   "classes": [
+    "FORMULARYP"
+   ],
+   "payers": [
+    "GOV"
+   ],
+   "patient_types": [
+    "*"
+   ],
+   "verdict": "breach",
+   "by_doctor": true,
+   "alternatives": [
+    "P-SCH",
+    "SCH",
+    "SCH-OPD"
+   ],
+   "rule_ref": "guideline 5",
+   "note": "HCG's report: 'Preferred brand consumption for scheme patient'"
+  },
+  {
+   "measure": "oof_scheme",
+   "label": "Out-of-formulary brands for scheme patients",
+   "classes": [
+    "OUT OF FORMULARY"
+   ],
+   "payers": [
+    "GOV"
+   ],
+   "patient_types": [
+    "*"
+   ],
+   "verdict": "breach",
+   "by_doctor": true,
+   "alternatives": [],
+   "rule_ref": "guidelines 4 and 6",
+   "note": "Doctor-wise monitoring of out-of-formulary use for scheme patients"
+  },
+  {
+   "measure": "restricted_cash_tpa",
+   "label": "Restricted brands for cash & TPA patients",
+   "classes": [
+    "FORMULARYR",
+    "FORMULARYR-OPD"
+   ],
+   "payers": [
+    "CASH",
+    "CASH(TPA)"
+   ],
+   "patient_types": [
+    "*"
+   ],
+   "verdict": "watch",
+   "by_doctor": false,
+   "alternatives": [
+    "P",
+    "P-SCH"
+   ],
+   "rule_ref": "guideline 3",
+   "note": "HCG's report: 'Restricted brand consumption for cash&TPA patients'; a figure HCG reports, breach status to confirm with HCG"
+  },
+  {
+   "measure": "opd_brand_inpatient",
+   "label": "Outpatient (-OPD) brands used for inpatients",
+   "classes": [
+    "FORMULARYOPD",
+    "FORMULARYP-OPD",
+    "FORMULARYR-OPD",
+    "FORMULARYSCH-OPD"
+   ],
+   "payers": [
+    "*"
+   ],
+   "patient_types": [
+    "IP"
+   ],
+   "verdict": "info",
+   "by_doctor": false,
+   "alternatives": [],
+   "rule_ref": "to confirm",
+   "note": "Shown for information until HCG confirms what -OPD means"
+  },
+  {
+   "measure": "scheme_brand_cash_tpa",
+   "label": "Scheme (SCH) brands used for cash & TPA patients",
+   "classes": [
+    "FORMULARYSCH",
+    "FORMULARYSCH-OPD"
+   ],
+   "payers": [
+    "CASH",
+    "CASH(TPA)"
+   ],
+   "patient_types": [
+    "*"
+   ],
+   "verdict": "info",
+   "by_doctor": false,
+   "alternatives": [
+    "P",
+    "P-SCH"
+   ],
+   "rule_ref": "guideline 2 (to confirm)",
+   "note": "Shown for information until HCG confirms"
+  }
+ ],
+ "payer_master": {
+  "file": "Copy of Copy of Payer Master Final Sheet.xlsb",
+  "rows": 2586,
+  "bucket_column": "FINAL AFTER DISCUSSION 5.2.2026",
+  "names": 1203,
+  "rule": "first row in sheet order per normalised CUSTOMERNAME",
+  "conflicting_names": [
+   {
+    "name": "CENTRAL GOVERNMENT HEALTH SCHEME (CGHS)",
+    "used": "CASH(TPA)",
+    "rows_by_bucket": {
+     "CASH(TPA)": 1,
+     "GOV": 7
+    }
+   },
+   {
+    "name": "CGHS",
+    "used": "CASH(TPA)",
+    "rows_by_bucket": {
+     "CASH(TPA)": 3,
+     "GOV": 5
+    }
+   }
+  ],
+  "overrides": 15
+ },
+ "hospital_map": {
+  "file": "hospital_map.csv",
+  "hospitals": 30
+ },
+ "months": {
+  "2026-06": {
+   "period": "2026-06",
+   "label": "Jun-26",
+   "source": {
+    "file": "IP&OP Consoildated File June 26 Updated Final File .xlsb",
+    "sheet": "IP&OP Sales Raw June 26 ",
+    "has_hcg_columns": true,
+    "rows_read": 839936,
+    "blank_rows_skipped": 0,
+    "cost_read": 553541011.22,
+    "mrp_read": 914235339.79,
+    "qty_read": 4414298.0,
+    "cost_empty_lines": 483,
+    "dates_missing": 0,
+    "dates_outside_month": 0,
+    "patient_types": {
+     "IP": 720406,
+     "OP": 119530
+    },
+    "extracted_at": "2026-10-09T19:49:57+00:00"
+   },
+   "published": {
+    "lines": 839936,
+    "cost": 553541011.22,
+    "mrp": 914235339.79,
+    "qty": 4414298.0,
+    "cost_diff": 0.0
+   },
+   "item_master": {
+    "file": "ITEM MASTER FOR FORMULARY COMPLIENCE JUne-26.xlsx",
+    "materials": 29172,
+    "flag_column": "FORMULARY"
+   },
+   "drugs": {
+    "lines": 476995,
+    "not_in_master_lines": 0,
+    "not_in_master_cost": 0.0,
+    "found_in_master_pct": 100.0
+   },
+   "unclassified_lines": 0,
+   "doctor_unknown_drug_lines": 486,
+   "hospitals": {
+    "count": 23,
+    "unmapped": [],
+    "names_differ_from_map": []
+   },
+   "payers": {
+    "by_source": {
+     "blank": {
+      "lines": 321140,
+      "cost": 178496919.84,
+      "names": 1
+     },
+     "master": {
+      "lines": 485625,
+      "cost": 355410473.77,
+      "names": 400
+     },
+     "override": {
+      "lines": 25128,
+      "cost": 10652530.2,
+      "names": 9
+     },
+     "unmatched": {
+      "lines": 8043,
+      "cost": 8981087.41,
+      "names": 39
+     }
+    },
+    "unmatched_names": 39,
+    "unmatched_top50": [
+     {
+      "name": "EAST WEST ASSIST TPA PVT LTD.",
+      "lines": 1523,
+      "cost": 1280815.49
+     },
+     {
+      "name": "FHPL",
+      "lines": 644,
+      "cost": 1260208.17
+     },
+     {
+      "name": "HDFC ERGO GENERAL INSURANCE",
+      "lines": 79,
+      "cost": 818379.86
+     },
+     {
+      "name": "HEALTH INSURNACE TPA OF INDIA LTD",
+      "lines": 705,
+      "cost": 804294.76
+     },
+     {
+      "name": "ADITYA BIRLA HEALTH INSUARNCE CO.LIMITED",
+      "lines": 304,
+      "cost": 688511.67
+     },
+     {
+      "name": "MEDI ASSIST TPA GIPSA-PPN",
+      "lines": 217,
+      "cost": 567080.94
+     },
+     {
+      "name": "HERITAGE HEALTH INSURANCE TPA PRIVATE&AMP;AMP;AMP;#160;LIMITED - GIPSA",
+      "lines": 55,
+      "cost": 509333.85
+     },
+     {
+      "name": "BHARAT ELECTRONICS LIMITED",
+      "lines": 50,
+      "cost": 393766.85
+     },
+     {
+      "name": "ROYAL GOVERNMENT OF BHUTAN (RGOB) (REP. BY-RBCG)",
+      "lines": 708,
+      "cost": 308998.79
+     },
+     {
+      "name": "CARE HEALTH INSURANCE COMPANY LTD",
+      "lines": 100,
+      "cost": 240676.15
+     },
+     {
+      "name": "FAMILY HEALTH PLAN TPA (GIPSA-PPN )",
+      "lines": 181,
+      "cost": 240606.86
+     },
+     {
+      "name": "METALLURGICAL AND ENGINEERING CONSULTANA",
+      "lines": 380,
+      "cost": 218333.34
+     },
+     {
+      "name": "IFFCO-TOKIO GENERAL INSURANCE PRIVATE LIMITED",
+      "lines": 425,
+      "cost": 205046.85
+     },
+     {
+      "name": "WEST CENTRAL RAILWAY",
+      "lines": 331,
+      "cost": 180989.09
+     },
+     {
+      "name": "HANUMANAY HEALTHCARE PRIVATE LIMITED",
+      "lines": 113,
+      "cost": 177685.37
+     },
+     {
+      "name": "CENTRAL WAREHOUSING CORPORATION (CWC)",
+      "lines": 24,
+      "cost": 140620.77
+     },
+     {
+      "name": "CHIEF MINISTER RELIEF FUND",
+      "lines": 168,
+      "cost": 131091.44
+     },
+     {
+      "name": "NIVA BUPA HEALTH INSURANCE",
+      "lines": 326,
+      "cost": 112458.65
+     },
+     {
+      "name": "VOLO HEALTH INSURANCE TPA PVT. LIMITED",
+      "lines": 273,
+      "cost": 96972.98
+     },
+     {
+      "name": "INDIAN WESTERN RAILWAY",
+      "lines": 93,
+      "cost": 96926.39
+     },
+     {
+      "name": "KARTHIKA CONSULTING AND SOLUTIONS PRIVATE LIMITED",
+      "lines": 215,
+      "cost": 89530.59
+     },
+     {
+      "name": "PARAMOUNT HEALTH TPA (GIPSA-PPN )",
+      "lines": 239,
+      "cost": 74701.4
+     },
+     {
+      "name": "HEALTH ASSIST INSURANCE TPA",
+      "lines": 177,
+      "cost": 67492.08
+     },
+     {
+      "name": "ERICSON INSURANCE TPA (GIPSA-PPN )",
+      "lines": 26,
+      "cost": 51387.83
+     },
+     {
+      "name": "HCG HEBBAL UNIT",
+      "lines": 55,
+      "cost": 50638.61
+     },
+     {
+      "name": "NATIONAL AEROSPACE LABORATORIES(NAL)",
+      "lines": 121,
+      "cost": 50537.0
+     },
+     {
+      "name": "HEALTH INDIA TPA (GIPSA-PPN )",
+      "lines": 81,
+      "cost": 31900.2
+     },
+     {
+      "name": "RELIANCE HEALTH INSURANCE COMPANY LIMITED",
+      "lines": 76,
+      "cost": 19576.87
+     },
+     {
+      "name": "VIDAL HEALTH TPA PRIVATE LIMITED",
+      "lines": 45,
+      "cost": 12959.65
+     },
+     {
+      "name": "HCG ICR FUND",
+      "lines": 3,
+      "cost": 12526.8
+     },
+     {
+      "name": "HERITAGE HEALTH INSURANCE TPA PVT.LTD",
+      "lines": 78,
+      "cost": 12163.37
+     },
+     {
+      "name": "HCG NBL INPSLAB3",
+      "lines": 26,
+      "cost": 9591.92
+     },
+     {
+      "name": "HEALTH INDIA INSURANCE TPA&AMP;AMP;AMP;#160;SERVICES&AMP;AMP;AMP;#160;PRIVATE LIMITED - GIPSA",
+      "lines": 23,
+      "cost": 8071.84
+     },
+     {
+      "name": "KARNATAKA POWER TRANSMISSION CORPORATION",
+      "lines": 75,
+      "cost": 5958.23
+     },
+     {
+      "name": "AERONAUTICAL DEVELOPMENT AGENCY (ADA)",
+      "lines": 35,
+      "cost": 5437.22
+     },
+     {
+      "name": "VOLO HEALTH INSURANCE (GIPSA-PPN )",
+      "lines": 11,
+      "cost": 2940.66
+     },
+     {
+      "name": "INDIAN OIL CORPORATION LIMITED (IOCL)",
+      "lines": 30,
+      "cost": 1527.64
+     },
+     {
+      "name": "HMS/CR/ LAMBDA/0327-24/ DR. ANKIT RAIYANI",
+      "lines": 23,
+      "cost": 1301.93
+     },
+     {
+      "name": "MINISTRY OF OMAN",
+      "lines": 5,
+      "cost": 45.3
+     }
+    ],
+    "conflicting_master_names_used": [
+     {
+      "name": "CENTRAL GOVERNMENT HEALTH SCHEME (CGHS)",
+      "lines": 8232,
+      "cost": 7173155.28
+     },
+     {
+      "name": "CGHS",
+      "lines": 1350,
+      "cost": 241937.14
+     }
+    ]
+   },
+   "agreement": {
+    "category": {
+     "lines": 839936,
+     "lines_agree": 839936,
+     "lines_pct": 100.0,
+     "cost": 553541011.22,
+     "cost_agree": 553541011.22,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 9756,
+       "lines_agree": 9756,
+       "lines_pct": 100.0,
+       "cost": 2843768.94,
+       "cost_agree": 2843768.94,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 39797,
+       "lines_agree": 39797,
+       "lines_pct": 100.0,
+       "cost": 16731878.1,
+       "cost_agree": 16731878.1,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 40460,
+       "lines_agree": 40460,
+       "lines_pct": 100.0,
+       "cost": 24882593.68,
+       "cost_agree": 24882593.68,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 75473,
+       "lines_agree": 75473,
+       "lines_pct": 100.0,
+       "cost": 55009346.46,
+       "cost_agree": 55009346.46,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54001,
+       "lines_agree": 54001,
+       "lines_pct": 100.0,
+       "cost": 17277995.5,
+       "cost_agree": 17277995.5,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 57897,
+       "lines_agree": 57897,
+       "lines_pct": 100.0,
+       "cost": 17386324.48,
+       "cost_agree": 17386324.48,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 42806,
+       "lines_agree": 42806,
+       "lines_pct": 100.0,
+       "cost": 18240970.18,
+       "cost_agree": 18240970.18,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 31475,
+       "lines_agree": 31475,
+       "lines_pct": 100.0,
+       "cost": 21296695.49,
+       "cost_agree": 21296695.49,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 32420,
+       "lines_agree": 32420,
+       "lines_pct": 100.0,
+       "cost": 45081693.91,
+       "cost_agree": 45081693.91,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 12332,
+       "lines_agree": 12332,
+       "lines_pct": 100.0,
+       "cost": 12452890.33,
+       "cost_agree": 12452890.33,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 121084,
+       "lines_agree": 121084,
+       "lines_pct": 100.0,
+       "cost": 124468202.75,
+       "cost_agree": 124468202.75,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 9350,
+       "lines_agree": 9350,
+       "lines_pct": 100.0,
+       "cost": 5308069.44,
+       "cost_agree": 5308069.44,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 19285,
+       "lines_agree": 19285,
+       "lines_pct": 100.0,
+       "cost": 7846256.11,
+       "cost_agree": 7846256.11,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 62984,
+       "lines_agree": 62984,
+       "lines_pct": 100.0,
+       "cost": 13745509.87,
+       "cost_agree": 13745509.87,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 15565,
+       "lines_agree": 15565,
+       "lines_pct": 100.0,
+       "cost": 14137825.8,
+       "cost_agree": 14137825.8,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 25010,
+       "lines_agree": 25010,
+       "lines_pct": 100.0,
+       "cost": 21689013.78,
+       "cost_agree": 21689013.78,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5770,
+       "lines_agree": 5770,
+       "lines_pct": 100.0,
+       "cost": 7163921.88,
+       "cost_agree": 7163921.88,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 38691,
+       "lines_agree": 38691,
+       "lines_pct": 100.0,
+       "cost": 44644832.32,
+       "cost_agree": 44644832.32,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 13184,
+       "lines_agree": 13184,
+       "lines_pct": 100.0,
+       "cost": 4426177.46,
+       "cost_agree": 4426177.46,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 18,
+       "lines_agree": 18,
+       "lines_pct": 100.0,
+       "cost": 874.42,
+       "cost_agree": 874.42,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 58021,
+       "lines_agree": 58021,
+       "lines_pct": 100.0,
+       "cost": 30917946.97,
+       "cost_agree": 30917946.97,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 40931,
+       "lines_agree": 40931,
+       "lines_pct": 100.0,
+       "cost": 26000494.14,
+       "cost_agree": 26000494.14,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 33626,
+       "lines_agree": 33626,
+       "lines_pct": 100.0,
+       "cost": 21987729.21,
+       "cost_agree": 21987729.21,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "payer": {
+     "lines": 839936,
+     "lines_agree": 839936,
+     "lines_pct": 100.0,
+     "cost": 553541011.22,
+     "cost_agree": 553541011.22,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 9756,
+       "lines_agree": 9756,
+       "lines_pct": 100.0,
+       "cost": 2843768.94,
+       "cost_agree": 2843768.94,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 39797,
+       "lines_agree": 39797,
+       "lines_pct": 100.0,
+       "cost": 16731878.1,
+       "cost_agree": 16731878.1,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 40460,
+       "lines_agree": 40460,
+       "lines_pct": 100.0,
+       "cost": 24882593.68,
+       "cost_agree": 24882593.68,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 75473,
+       "lines_agree": 75473,
+       "lines_pct": 100.0,
+       "cost": 55009346.46,
+       "cost_agree": 55009346.46,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54001,
+       "lines_agree": 54001,
+       "lines_pct": 100.0,
+       "cost": 17277995.5,
+       "cost_agree": 17277995.5,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 57897,
+       "lines_agree": 57897,
+       "lines_pct": 100.0,
+       "cost": 17386324.48,
+       "cost_agree": 17386324.48,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 42806,
+       "lines_agree": 42806,
+       "lines_pct": 100.0,
+       "cost": 18240970.18,
+       "cost_agree": 18240970.18,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 31475,
+       "lines_agree": 31475,
+       "lines_pct": 100.0,
+       "cost": 21296695.49,
+       "cost_agree": 21296695.49,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 32420,
+       "lines_agree": 32420,
+       "lines_pct": 100.0,
+       "cost": 45081693.91,
+       "cost_agree": 45081693.91,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 12332,
+       "lines_agree": 12332,
+       "lines_pct": 100.0,
+       "cost": 12452890.33,
+       "cost_agree": 12452890.33,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 121084,
+       "lines_agree": 121084,
+       "lines_pct": 100.0,
+       "cost": 124468202.75,
+       "cost_agree": 124468202.75,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 9350,
+       "lines_agree": 9350,
+       "lines_pct": 100.0,
+       "cost": 5308069.44,
+       "cost_agree": 5308069.44,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 19285,
+       "lines_agree": 19285,
+       "lines_pct": 100.0,
+       "cost": 7846256.11,
+       "cost_agree": 7846256.11,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 62984,
+       "lines_agree": 62984,
+       "lines_pct": 100.0,
+       "cost": 13745509.87,
+       "cost_agree": 13745509.87,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 15565,
+       "lines_agree": 15565,
+       "lines_pct": 100.0,
+       "cost": 14137825.8,
+       "cost_agree": 14137825.8,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 25010,
+       "lines_agree": 25010,
+       "lines_pct": 100.0,
+       "cost": 21689013.78,
+       "cost_agree": 21689013.78,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5770,
+       "lines_agree": 5770,
+       "lines_pct": 100.0,
+       "cost": 7163921.88,
+       "cost_agree": 7163921.88,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 38691,
+       "lines_agree": 38691,
+       "lines_pct": 100.0,
+       "cost": 44644832.32,
+       "cost_agree": 44644832.32,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 13184,
+       "lines_agree": 13184,
+       "lines_pct": 100.0,
+       "cost": 4426177.46,
+       "cost_agree": 4426177.46,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 18,
+       "lines_agree": 18,
+       "lines_pct": 100.0,
+       "cost": 874.42,
+       "cost_agree": 874.42,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 58021,
+       "lines_agree": 58021,
+       "lines_pct": 100.0,
+       "cost": 30917946.97,
+       "cost_agree": 30917946.97,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 40931,
+       "lines_agree": 40931,
+       "lines_pct": 100.0,
+       "cost": 26000494.14,
+       "cost_agree": 26000494.14,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 33626,
+       "lines_agree": 33626,
+       "lines_pct": 100.0,
+       "cost": 21987729.21,
+       "cost_agree": 21987729.21,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "segment": {
+     "lines": 839936,
+     "lines_agree": 839935,
+     "lines_pct": 99.9999,
+     "cost": 553541011.22,
+     "cost_agree": 553534277.57,
+     "cost_pct": 99.9988,
+     "by_hospital": {
+      "APONG": {
+       "lines": 9756,
+       "lines_agree": 9756,
+       "lines_pct": 100.0,
+       "cost": 2843768.94,
+       "cost_agree": 2843768.94,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 39797,
+       "lines_agree": 39797,
+       "lines_pct": 100.0,
+       "cost": 16731878.1,
+       "cost_agree": 16731878.1,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 40460,
+       "lines_agree": 40460,
+       "lines_pct": 100.0,
+       "cost": 24882593.68,
+       "cost_agree": 24882593.68,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 75473,
+       "lines_agree": 75473,
+       "lines_pct": 100.0,
+       "cost": 55009346.46,
+       "cost_agree": 55009346.46,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54001,
+       "lines_agree": 54001,
+       "lines_pct": 100.0,
+       "cost": 17277995.5,
+       "cost_agree": 17277995.5,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 57897,
+       "lines_agree": 57897,
+       "lines_pct": 100.0,
+       "cost": 17386324.48,
+       "cost_agree": 17386324.48,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 42806,
+       "lines_agree": 42806,
+       "lines_pct": 100.0,
+       "cost": 18240970.18,
+       "cost_agree": 18240970.18,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 31475,
+       "lines_agree": 31475,
+       "lines_pct": 100.0,
+       "cost": 21296695.49,
+       "cost_agree": 21296695.49,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 32420,
+       "lines_agree": 32420,
+       "lines_pct": 100.0,
+       "cost": 45081693.91,
+       "cost_agree": 45081693.91,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 12332,
+       "lines_agree": 12332,
+       "lines_pct": 100.0,
+       "cost": 12452890.33,
+       "cost_agree": 12452890.33,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 121084,
+       "lines_agree": 121083,
+       "lines_pct": 99.9992,
+       "cost": 124468202.75,
+       "cost_agree": 124461469.1,
+       "cost_pct": 99.9946
+      },
+      "KABHN": {
+       "lines": 9350,
+       "lines_agree": 9350,
+       "lines_pct": 100.0,
+       "cost": 5308069.44,
+       "cost_agree": 5308069.44,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 19285,
+       "lines_agree": 19285,
+       "lines_pct": 100.0,
+       "cost": 7846256.11,
+       "cost_agree": 7846256.11,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 62984,
+       "lines_agree": 62984,
+       "lines_pct": 100.0,
+       "cost": 13745509.87,
+       "cost_agree": 13745509.87,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 15565,
+       "lines_agree": 15565,
+       "lines_pct": 100.0,
+       "cost": 14137825.8,
+       "cost_agree": 14137825.8,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 25010,
+       "lines_agree": 25010,
+       "lines_pct": 100.0,
+       "cost": 21689013.78,
+       "cost_agree": 21689013.78,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5770,
+       "lines_agree": 5770,
+       "lines_pct": 100.0,
+       "cost": 7163921.88,
+       "cost_agree": 7163921.88,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 38691,
+       "lines_agree": 38691,
+       "lines_pct": 100.0,
+       "cost": 44644832.32,
+       "cost_agree": 44644832.32,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 13184,
+       "lines_agree": 13184,
+       "lines_pct": 100.0,
+       "cost": 4426177.46,
+       "cost_agree": 4426177.46,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 18,
+       "lines_agree": 18,
+       "lines_pct": 100.0,
+       "cost": 874.42,
+       "cost_agree": 874.42,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 58021,
+       "lines_agree": 58021,
+       "lines_pct": 100.0,
+       "cost": 30917946.97,
+       "cost_agree": 30917946.97,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 40931,
+       "lines_agree": 40931,
+       "lines_pct": 100.0,
+       "cost": 26000494.14,
+       "cost_agree": 26000494.14,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 33626,
+       "lines_agree": 33626,
+       "lines_pct": 100.0,
+       "cost": 21987729.21,
+       "cost_agree": 21987729.21,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": [
+      {
+       "ours": "Non-Onco",
+       "hcg": "Consumables",
+       "lines": 1,
+       "cost": 6733.65
+      }
+     ]
+    }
+   },
+   "kr": {
+    "plant": "HC05",
+    "lines": 60421,
+    "formulary": 106287077.82,
+    "out_of_formulary": 1034728.16,
+    "non_formulary": 1083892.57,
+    "pooled_pct": 99.0359,
+    "onco_pct": 99.0226,
+    "non_onco_pct": 99.1347,
+    "mean_pct": 99.0786,
+    "scheme": {
+     "restricted": 4478363.26,
+     "preferred": 550285.66
+    }
+   },
+   "all_hospitals": {
+    "lines": 476995,
+    "formulary": 436949565.77,
+    "out_of_formulary": 8869712.97,
+    "non_formulary": 19073151.3,
+    "pooled_pct": 98.0105,
+    "onco_pct": 99.4939,
+    "non_onco_pct": 89.7447,
+    "mean_pct": 94.6193
+   },
+   "brand_rules": {
+    "kr": {
+     "restricted_scheme": {
+      "cost": 4478363.26,
+      "lines": 1120,
+      "share_pct": 4.1311
+     },
+     "preferred_scheme": {
+      "cost": 550285.66,
+      "lines": 626,
+      "share_pct": 0.5076
+     },
+     "oof_scheme": {
+      "cost": 14713.0,
+      "lines": 70,
+      "share_pct": 0.0136
+     },
+     "restricted_cash_tpa": {
+      "cost": 46126104.47,
+      "lines": 14429,
+      "share_pct": 42.5495
+     },
+     "opd_brand_inpatient": {
+      "cost": 1458463.7,
+      "lines": 2857,
+      "share_pct": 1.3454
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 1767213.91,
+      "lines": 588,
+      "share_pct": 1.6302
+     }
+    },
+    "all_hospitals": {
+     "restricted_scheme": {
+      "cost": 30693473.92,
+      "lines": 26802,
+      "share_pct": 6.6023
+     },
+     "preferred_scheme": {
+      "cost": 10256114.62,
+      "lines": 26936,
+      "share_pct": 2.2061
+     },
+     "oof_scheme": {
+      "cost": 1573162.15,
+      "lines": 11958,
+      "share_pct": 0.3384
+     },
+     "restricted_cash_tpa": {
+      "cost": 113201932.16,
+      "lines": 52205,
+      "share_pct": 24.3501
+     },
+     "opd_brand_inpatient": {
+      "cost": 7748009.34,
+      "lines": 20807,
+      "share_pct": 1.6666
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 6184759.08,
+      "lines": 4269,
+      "share_pct": 1.3304
+     }
+    },
+    "rule_book_items": 3013,
+    "per_doctor_rows": 8215,
+    "reconciliation": []
+   },
+   "warnings": [
+    "39 payer names are in neither the Payer Master nor payer_overrides.csv (8,043 lines, cost 8,981,087.41); counted as CASH(TPA)",
+    "segment agrees with HCG's column on 99.9999% of lines / 99.9988% of cost (reported, not an error)"
+   ],
+   "built_at": "2026-10-10T20:22:21+00:00"
+  },
+  "2026-07": {
+   "period": "2026-07",
+   "label": "Jul-26",
+   "source": {
+    "file": "IP and OP Sales Consolidated file July 2026.xlsb",
+    "sheet": "IP&OP Jul 26 WS",
+    "has_hcg_columns": true,
+    "rows_read": 880441,
+    "blank_rows_skipped": 0,
+    "cost_read": 581238298.38,
+    "mrp_read": 970064133.51,
+    "qty_read": 4576245.0,
+    "cost_empty_lines": 512,
+    "dates_missing": 0,
+    "dates_outside_month": 0,
+    "patient_types": {
+     "IP": 753734,
+     "OP": 126707
+    },
+    "extracted_at": "2026-10-09T19:51:51+00:00"
+   },
+   "published": {
+    "lines": 880441,
+    "cost": 581238298.38,
+    "mrp": 970064133.51,
+    "qty": 4576245.0,
+    "cost_diff": -0.0
+   },
+   "item_master": {
+    "file": "Copy of item master for formulary complience July 2026.xlsb",
+    "materials": 29309,
+    "flag_column": "FORMULARY"
+   },
+   "drugs": {
+    "lines": 498480,
+    "not_in_master_lines": 0,
+    "not_in_master_cost": 0.0,
+    "found_in_master_pct": 100.0
+   },
+   "unclassified_lines": 0,
+   "doctor_unknown_drug_lines": 649,
+   "hospitals": {
+    "count": 23,
+    "unmapped": [],
+    "names_differ_from_map": []
+   },
+   "payers": {
+    "by_source": {
+     "blank": {
+      "lines": 339354,
+      "cost": 182418624.83,
+      "names": 1
+     },
+     "master": {
+      "lines": 505592,
+      "cost": 371726237.45,
+      "names": 398
+     },
+     "override": {
+      "lines": 25009,
+      "cost": 12074329.69,
+      "names": 9
+     },
+     "unmatched": {
+      "lines": 10486,
+      "cost": 15019106.41,
+      "names": 43
+     }
+    },
+    "unmatched_names": 43,
+    "unmatched_top50": [
+     {
+      "name": "GLOBUS MEDICARE",
+      "lines": 1399,
+      "cost": 4679149.36
+     },
+     {
+      "name": "KARTHIKA CONSULTING AND SOLUTIONS PRIVATE LIMITED",
+      "lines": 1910,
+      "cost": 1259587.39
+     },
+     {
+      "name": "HEALTH INSURNACE TPA OF INDIA LTD",
+      "lines": 382,
+      "cost": 988973.36
+     },
+     {
+      "name": "EAST WEST ASSIST TPA PVT LTD.",
+      "lines": 865,
+      "cost": 961934.73
+     },
+     {
+      "name": "ADITYA BIRLA HEALTH INSUARNCE CO.LIMITED",
+      "lines": 341,
+      "cost": 879397.3
+     },
+     {
+      "name": "HDFC ERGO GENERAL INSURANCE",
+      "lines": 116,
+      "cost": 841210.35
+     },
+     {
+      "name": "FAMILY HEALTH PLAN TPA (GIPSA-PPN )",
+      "lines": 408,
+      "cost": 734906.33
+     },
+     {
+      "name": "MEDI ASSIST TPA GIPSA-PPN",
+      "lines": 543,
+      "cost": 731077.63
+     },
+     {
+      "name": "FHPL",
+      "lines": 451,
+      "cost": 606045.81
+     },
+     {
+      "name": "WEST CENTRAL RAILWAY",
+      "lines": 238,
+      "cost": 466321.86
+     },
+     {
+      "name": "BHARAT ELECTRONICS LIMITED",
+      "lines": 25,
+      "cost": 391471.83
+     },
+     {
+      "name": "ADITYA BIRLA HEALTH INSURANCE COMPANY LI",
+      "lines": 119,
+      "cost": 387685.5
+     },
+     {
+      "name": "CHIEF MINISTER RELIEF FUND",
+      "lines": 351,
+      "cost": 323349.72
+     },
+     {
+      "name": "ROYAL GOVERNMENT OF BHUTAN (RGOB) (REP. BY-RBCG)",
+      "lines": 521,
+      "cost": 315646.27
+     },
+     {
+      "name": "INDIAN OIL CORPORATION LIMITED (IOCL)",
+      "lines": 250,
+      "cost": 144094.22
+     },
+     {
+      "name": "METALLURGICAL AND ENGINEERING CONSULTANA",
+      "lines": 75,
+      "cost": 141376.46
+     },
+     {
+      "name": "STATE BANK OF INDIA (SBI)",
+      "lines": 75,
+      "cost": 120913.2
+     },
+     {
+      "name": "PARAMOUNT HEALTH TPA (GIPSA-PPN )",
+      "lines": 259,
+      "cost": 115299.47
+     },
+     {
+      "name": "HEALTH INDIA TPA",
+      "lines": 15,
+      "cost": 110479.44
+     },
+     {
+      "name": "CARE HEALTH INSURANCE COMPANY LTD",
+      "lines": 260,
+      "cost": 102412.49
+     },
+     {
+      "name": "VOLO HEALTH INSURANCE TPA PVT. LIMITED",
+      "lines": 71,
+      "cost": 92242.43
+     },
+     {
+      "name": "ERICSON INSURANCE TPA (GIPSA-PPN )",
+      "lines": 36,
+      "cost": 91440.21
+     },
+     {
+      "name": "VIDAL HEALTH TPA PRIVATE LIMITED",
+      "lines": 156,
+      "cost": 81904.12
+     },
+     {
+      "name": "IFFCO-TOKIO GENERAL INSURANCE PRIVATE LIMITED",
+      "lines": 103,
+      "cost": 69550.94
+     },
+     {
+      "name": "CENTRAL WAREHOUSING CORPORATION (CWC)",
+      "lines": 16,
+      "cost": 68430.63
+     },
+     {
+      "name": "NIVA BUPA HEALTH INSURANCE",
+      "lines": 338,
+      "cost": 47191.58
+     },
+     {
+      "name": "MINISTRY OF OMAN",
+      "lines": 67,
+      "cost": 46328.93
+     },
+     {
+      "name": "HEALTH INSURANCE TPA SERVICES (GIPSA-PPN )",
+      "lines": 183,
+      "cost": 41717.93
+     },
+     {
+      "name": "HEALTH INDIA TPA (GIPSA-PPN )",
+      "lines": 76,
+      "cost": 30070.69
+     },
+     {
+      "name": "HANUMANAY HEALTHCARE PRIVATE LIMITED",
+      "lines": 218,
+      "cost": 25931.35
+     },
+     {
+      "name": "KARNATAKA POWER TRANSMISSION CORPORATION",
+      "lines": 31,
+      "cost": 25837.3
+     },
+     {
+      "name": "HEALTH ASSIST INSURANCE TPA",
+      "lines": 24,
+      "cost": 18574.16
+     },
+     {
+      "name": "AERONAUTICAL DEVELOPMENT AGENCY (ADA)",
+      "lines": 99,
+      "cost": 16597.33
+     },
+     {
+      "name": "HEALTH INDIA INSURANCE TPA&AMP;AMP;AMP;#160;SERVICES&AMP;AMP;AMP;#160;PRIVATE LIMITED - GIPSA",
+      "lines": 27,
+      "cost": 10895.42
+     },
+     {
+      "name": "INDIAN WESTERN RAILWAY",
+      "lines": 66,
+      "cost": 10667.27
+     },
+     {
+      "name": "RELIANCE HEALTH INSURANCE COMPANY LIMITED",
+      "lines": 56,
+      "cost": 10252.07
+     },
+     {
+      "name": "NATIONAL AEROSPACE LABORATORIES(NAL)",
+      "lines": 104,
+      "cost": 10015.62
+     },
+     {
+      "name": "NWKSRTC",
+      "lines": 71,
+      "cost": 6007.66
+     },
+     {
+      "name": "HCG ICR FUND",
+      "lines": 1,
+      "cost": 4306.03
+     },
+     {
+      "name": "HMS/CR/ LAMBDA/0327-24/ DR. ANKIT RAIYANI",
+      "lines": 56,
+      "cost": 3325.58
+     },
+     {
+      "name": "LAMBDA THERAPEUTIC RESEARCH",
+      "lines": 64,
+      "cost": 3093.98
+     },
+     {
+      "name": "VIDAL HEALTH INSURANCE TPA (GIPSA-PPN )",
+      "lines": 16,
+      "cost": 3054.48
+     },
+     {
+      "name": "MEDISCOPE",
+      "lines": 4,
+      "cost": 337.98
+     }
+    ],
+    "conflicting_master_names_used": [
+     {
+      "name": "CENTRAL GOVERNMENT HEALTH SCHEME (CGHS)",
+      "lines": 9263,
+      "cost": 3778757.42
+     },
+     {
+      "name": "CGHS",
+      "lines": 1012,
+      "cost": 219474.35
+     }
+    ]
+   },
+   "agreement": {
+    "category": {
+     "lines": 880441,
+     "lines_agree": 880441,
+     "lines_pct": 100.0,
+     "cost": 581238298.38,
+     "cost_agree": 581238298.38,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10543,
+       "lines_agree": 10543,
+       "lines_pct": 100.0,
+       "cost": 3291207.02,
+       "cost_agree": 3291207.02,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 38286,
+       "lines_agree": 38286,
+       "lines_pct": 100.0,
+       "cost": 16171986.42,
+       "cost_agree": 16171986.42,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 38244,
+       "lines_agree": 38244,
+       "lines_pct": 100.0,
+       "cost": 24779220.16,
+       "cost_agree": 24779220.16,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 79555,
+       "lines_agree": 79555,
+       "lines_pct": 100.0,
+       "cost": 55295623.55,
+       "cost_agree": 55295623.55,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54833,
+       "lines_agree": 54833,
+       "lines_pct": 100.0,
+       "cost": 17702596.51,
+       "cost_agree": 17702596.51,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 58304,
+       "lines_agree": 58304,
+       "lines_pct": 100.0,
+       "cost": 16322727.12,
+       "cost_agree": 16322727.12,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 46982,
+       "lines_agree": 46982,
+       "lines_pct": 100.0,
+       "cost": 17751807.82,
+       "cost_agree": 17751807.82,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 32578,
+       "lines_agree": 32578,
+       "lines_pct": 100.0,
+       "cost": 25259200.93,
+       "cost_agree": 25259200.93,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 34091,
+       "lines_agree": 34091,
+       "lines_pct": 100.0,
+       "cost": 44097037.92,
+       "cost_agree": 44097037.92,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 16064,
+       "lines_agree": 16064,
+       "lines_pct": 100.0,
+       "cost": 14550663.01,
+       "cost_agree": 14550663.01,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 119834,
+       "lines_agree": 119834,
+       "lines_pct": 100.0,
+       "cost": 136501353.19,
+       "cost_agree": 136501353.19,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 9557,
+       "lines_agree": 9557,
+       "lines_pct": 100.0,
+       "cost": 6005421.95,
+       "cost_agree": 6005421.95,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 20035,
+       "lines_agree": 20035,
+       "lines_pct": 100.0,
+       "cost": 7852957.24,
+       "cost_agree": 7852957.24,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 71107,
+       "lines_agree": 71107,
+       "lines_pct": 100.0,
+       "cost": 15988233.51,
+       "cost_agree": 15988233.51,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 16513,
+       "lines_agree": 16513,
+       "lines_pct": 100.0,
+       "cost": 13961949.12,
+       "cost_agree": 13961949.12,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 30100,
+       "lines_agree": 30100,
+       "lines_pct": 100.0,
+       "cost": 25465587.64,
+       "cost_agree": 25465587.64,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5493,
+       "lines_agree": 5493,
+       "lines_pct": 100.0,
+       "cost": 4045406.69,
+       "cost_agree": 4045406.69,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 40532,
+       "lines_agree": 40532,
+       "lines_pct": 100.0,
+       "cost": 41636438.98,
+       "cost_agree": 41636438.98,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 15274,
+       "lines_agree": 15274,
+       "lines_pct": 100.0,
+       "cost": 3976953.58,
+       "cost_agree": 3976953.58,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 13,
+       "lines_agree": 13,
+       "lines_pct": 100.0,
+       "cost": 661.74,
+       "cost_agree": 661.74,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64629,
+       "lines_agree": 64629,
+       "lines_pct": 100.0,
+       "cost": 32054502.4,
+       "cost_agree": 32054502.4,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 41251,
+       "lines_agree": 41251,
+       "lines_pct": 100.0,
+       "cost": 30637922.46,
+       "cost_agree": 30637922.46,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 36623,
+       "lines_agree": 36623,
+       "lines_pct": 100.0,
+       "cost": 27888839.42,
+       "cost_agree": 27888839.42,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "payer": {
+     "lines": 880441,
+     "lines_agree": 880441,
+     "lines_pct": 100.0,
+     "cost": 581238298.38,
+     "cost_agree": 581238298.38,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10543,
+       "lines_agree": 10543,
+       "lines_pct": 100.0,
+       "cost": 3291207.02,
+       "cost_agree": 3291207.02,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 38286,
+       "lines_agree": 38286,
+       "lines_pct": 100.0,
+       "cost": 16171986.42,
+       "cost_agree": 16171986.42,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 38244,
+       "lines_agree": 38244,
+       "lines_pct": 100.0,
+       "cost": 24779220.16,
+       "cost_agree": 24779220.16,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 79555,
+       "lines_agree": 79555,
+       "lines_pct": 100.0,
+       "cost": 55295623.55,
+       "cost_agree": 55295623.55,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54833,
+       "lines_agree": 54833,
+       "lines_pct": 100.0,
+       "cost": 17702596.51,
+       "cost_agree": 17702596.51,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 58304,
+       "lines_agree": 58304,
+       "lines_pct": 100.0,
+       "cost": 16322727.12,
+       "cost_agree": 16322727.12,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 46982,
+       "lines_agree": 46982,
+       "lines_pct": 100.0,
+       "cost": 17751807.82,
+       "cost_agree": 17751807.82,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 32578,
+       "lines_agree": 32578,
+       "lines_pct": 100.0,
+       "cost": 25259200.93,
+       "cost_agree": 25259200.93,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 34091,
+       "lines_agree": 34091,
+       "lines_pct": 100.0,
+       "cost": 44097037.92,
+       "cost_agree": 44097037.92,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 16064,
+       "lines_agree": 16064,
+       "lines_pct": 100.0,
+       "cost": 14550663.01,
+       "cost_agree": 14550663.01,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 119834,
+       "lines_agree": 119834,
+       "lines_pct": 100.0,
+       "cost": 136501353.19,
+       "cost_agree": 136501353.19,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 9557,
+       "lines_agree": 9557,
+       "lines_pct": 100.0,
+       "cost": 6005421.95,
+       "cost_agree": 6005421.95,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 20035,
+       "lines_agree": 20035,
+       "lines_pct": 100.0,
+       "cost": 7852957.24,
+       "cost_agree": 7852957.24,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 71107,
+       "lines_agree": 71107,
+       "lines_pct": 100.0,
+       "cost": 15988233.51,
+       "cost_agree": 15988233.51,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 16513,
+       "lines_agree": 16513,
+       "lines_pct": 100.0,
+       "cost": 13961949.12,
+       "cost_agree": 13961949.12,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 30100,
+       "lines_agree": 30100,
+       "lines_pct": 100.0,
+       "cost": 25465587.64,
+       "cost_agree": 25465587.64,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5493,
+       "lines_agree": 5493,
+       "lines_pct": 100.0,
+       "cost": 4045406.69,
+       "cost_agree": 4045406.69,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 40532,
+       "lines_agree": 40532,
+       "lines_pct": 100.0,
+       "cost": 41636438.98,
+       "cost_agree": 41636438.98,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 15274,
+       "lines_agree": 15274,
+       "lines_pct": 100.0,
+       "cost": 3976953.58,
+       "cost_agree": 3976953.58,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 13,
+       "lines_agree": 13,
+       "lines_pct": 100.0,
+       "cost": 661.74,
+       "cost_agree": 661.74,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64629,
+       "lines_agree": 64629,
+       "lines_pct": 100.0,
+       "cost": 32054502.4,
+       "cost_agree": 32054502.4,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 41251,
+       "lines_agree": 41251,
+       "lines_pct": 100.0,
+       "cost": 30637922.46,
+       "cost_agree": 30637922.46,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 36623,
+       "lines_agree": 36623,
+       "lines_pct": 100.0,
+       "cost": 27888839.42,
+       "cost_agree": 27888839.42,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "segment": {
+     "lines": 880441,
+     "lines_agree": 880441,
+     "lines_pct": 100.0,
+     "cost": 581238298.38,
+     "cost_agree": 581238298.38,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10543,
+       "lines_agree": 10543,
+       "lines_pct": 100.0,
+       "cost": 3291207.02,
+       "cost_agree": 3291207.02,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 38286,
+       "lines_agree": 38286,
+       "lines_pct": 100.0,
+       "cost": 16171986.42,
+       "cost_agree": 16171986.42,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 38244,
+       "lines_agree": 38244,
+       "lines_pct": 100.0,
+       "cost": 24779220.16,
+       "cost_agree": 24779220.16,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 79555,
+       "lines_agree": 79555,
+       "lines_pct": 100.0,
+       "cost": 55295623.55,
+       "cost_agree": 55295623.55,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 54833,
+       "lines_agree": 54833,
+       "lines_pct": 100.0,
+       "cost": 17702596.51,
+       "cost_agree": 17702596.51,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 58304,
+       "lines_agree": 58304,
+       "lines_pct": 100.0,
+       "cost": 16322727.12,
+       "cost_agree": 16322727.12,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 46982,
+       "lines_agree": 46982,
+       "lines_pct": 100.0,
+       "cost": 17751807.82,
+       "cost_agree": 17751807.82,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 32578,
+       "lines_agree": 32578,
+       "lines_pct": 100.0,
+       "cost": 25259200.93,
+       "cost_agree": 25259200.93,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 34091,
+       "lines_agree": 34091,
+       "lines_pct": 100.0,
+       "cost": 44097037.92,
+       "cost_agree": 44097037.92,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 16064,
+       "lines_agree": 16064,
+       "lines_pct": 100.0,
+       "cost": 14550663.01,
+       "cost_agree": 14550663.01,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 119834,
+       "lines_agree": 119834,
+       "lines_pct": 100.0,
+       "cost": 136501353.19,
+       "cost_agree": 136501353.19,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 9557,
+       "lines_agree": 9557,
+       "lines_pct": 100.0,
+       "cost": 6005421.95,
+       "cost_agree": 6005421.95,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 20035,
+       "lines_agree": 20035,
+       "lines_pct": 100.0,
+       "cost": 7852957.24,
+       "cost_agree": 7852957.24,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 71107,
+       "lines_agree": 71107,
+       "lines_pct": 100.0,
+       "cost": 15988233.51,
+       "cost_agree": 15988233.51,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 16513,
+       "lines_agree": 16513,
+       "lines_pct": 100.0,
+       "cost": 13961949.12,
+       "cost_agree": 13961949.12,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 30100,
+       "lines_agree": 30100,
+       "lines_pct": 100.0,
+       "cost": 25465587.64,
+       "cost_agree": 25465587.64,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5493,
+       "lines_agree": 5493,
+       "lines_pct": 100.0,
+       "cost": 4045406.69,
+       "cost_agree": 4045406.69,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 40532,
+       "lines_agree": 40532,
+       "lines_pct": 100.0,
+       "cost": 41636438.98,
+       "cost_agree": 41636438.98,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 15274,
+       "lines_agree": 15274,
+       "lines_pct": 100.0,
+       "cost": 3976953.58,
+       "cost_agree": 3976953.58,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 13,
+       "lines_agree": 13,
+       "lines_pct": 100.0,
+       "cost": 661.74,
+       "cost_agree": 661.74,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64629,
+       "lines_agree": 64629,
+       "lines_pct": 100.0,
+       "cost": 32054502.4,
+       "cost_agree": 32054502.4,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 41251,
+       "lines_agree": 41251,
+       "lines_pct": 100.0,
+       "cost": 30637922.46,
+       "cost_agree": 30637922.46,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 36623,
+       "lines_agree": 36623,
+       "lines_pct": 100.0,
+       "cost": 27888839.42,
+       "cost_agree": 27888839.42,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    }
+   },
+   "kr": {
+    "plant": "HC05",
+    "lines": 60037,
+    "formulary": 114606892.4,
+    "out_of_formulary": 968886.6,
+    "non_formulary": 4813423.92,
+    "pooled_pct": 99.1617,
+    "onco_pct": 99.2501,
+    "non_onco_pct": 98.3169,
+    "mean_pct": 98.7835,
+    "scheme": {
+     "restricted": 4752806.16,
+     "preferred": 571193.43
+    }
+   },
+   "all_hospitals": {
+    "lines": 498480,
+    "formulary": 454942110.18,
+    "out_of_formulary": 9802769.26,
+    "non_formulary": 27456028.22,
+    "pooled_pct": 97.8907,
+    "onco_pct": 99.526,
+    "non_onco_pct": 88.9493,
+    "mean_pct": 94.2376
+   },
+   "brand_rules": {
+    "kr": {
+     "restricted_scheme": {
+      "cost": 4752806.16,
+      "lines": 1331,
+      "share_pct": 3.9479
+     },
+     "preferred_scheme": {
+      "cost": 571193.43,
+      "lines": 689,
+      "share_pct": 0.4745
+     },
+     "oof_scheme": {
+      "cost": 20684.16,
+      "lines": 102,
+      "share_pct": 0.0172
+     },
+     "restricted_cash_tpa": {
+      "cost": 53790971.02,
+      "lines": 14419,
+      "share_pct": 44.6809
+     },
+     "opd_brand_inpatient": {
+      "cost": 1603291.73,
+      "lines": 3182,
+      "share_pct": 1.3318
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 1714602.77,
+      "lines": 674,
+      "share_pct": 1.4242
+     }
+    },
+    "all_hospitals": {
+     "restricted_scheme": {
+      "cost": 34899985.93,
+      "lines": 27052,
+      "share_pct": 7.0906
+     },
+     "preferred_scheme": {
+      "cost": 10976940.99,
+      "lines": 25577,
+      "share_pct": 2.2302
+     },
+     "oof_scheme": {
+      "cost": 1628331.58,
+      "lines": 12042,
+      "share_pct": 0.3308
+     },
+     "restricted_cash_tpa": {
+      "cost": 124841122.95,
+      "lines": 55106,
+      "share_pct": 25.3639
+     },
+     "opd_brand_inpatient": {
+      "cost": 8260342.3,
+      "lines": 21328,
+      "share_pct": 1.6782
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 6336711.32,
+      "lines": 4338,
+      "share_pct": 1.2874
+     }
+    },
+    "rule_book_items": 3036,
+    "per_doctor_rows": 7954,
+    "reconciliation": []
+   },
+   "warnings": [
+    "43 payer names are in neither the Payer Master nor payer_overrides.csv (10,486 lines, cost 15,019,106.41); counted as CASH(TPA)"
+   ],
+   "built_at": "2026-10-10T20:22:23+00:00"
+  },
+  "2026-08": {
+   "period": "2026-08",
+   "label": "Aug-26",
+   "source": {
+    "file": "IP & OP Consolidated File August 26.xlsx",
+    "sheet": "IP&OP Con WS August 26",
+    "has_hcg_columns": true,
+    "rows_read": 875717,
+    "blank_rows_skipped": 0,
+    "cost_read": 556648532.4,
+    "mrp_read": 943122638.17,
+    "qty_read": 4490262.0,
+    "cost_empty_lines": 560,
+    "dates_missing": 0,
+    "dates_outside_month": 0,
+    "patient_types": {
+     "IP": 757692,
+     "OP": 118025
+    },
+    "extracted_at": "2026-10-09T19:53:36+00:00"
+   },
+   "published": {
+    "lines": 875717,
+    "cost": 556648532.4,
+    "mrp": 943122638.17,
+    "qty": 4490262.0,
+    "cost_diff": 0.0
+   },
+   "item_master": {
+    "file": "Copy of Item master for formulary complience August -26_Updated.xlsx",
+    "materials": 29391,
+    "flag_column": "FORMULARY FLAGGING"
+   },
+   "drugs": {
+    "lines": 491143,
+    "not_in_master_lines": 0,
+    "not_in_master_cost": 0.0,
+    "found_in_master_pct": 100.0
+   },
+   "unclassified_lines": 0,
+   "doctor_unknown_drug_lines": 503,
+   "hospitals": {
+    "count": 23,
+    "unmapped": [],
+    "names_differ_from_map": []
+   },
+   "payers": {
+    "by_source": {
+     "blank": {
+      "lines": 340368,
+      "cost": 175406774.86,
+      "names": 1
+     },
+     "master": {
+      "lines": 500547,
+      "cost": 360053564.24,
+      "names": 394
+     },
+     "override": {
+      "lines": 25271,
+      "cost": 12181685.47,
+      "names": 11
+     },
+     "unmatched": {
+      "lines": 9531,
+      "cost": 9006507.83,
+      "names": 45
+     }
+    },
+    "unmatched_names": 45,
+    "unmatched_top50": [
+     {
+      "name": "HEALTH INSURNACE TPA OF INDIA LTD",
+      "lines": 1245,
+      "cost": 1238039.14
+     },
+     {
+      "name": "MEDI ASSIST TPA GIPSA-PPN",
+      "lines": 914,
+      "cost": 1040541.93
+     },
+     {
+      "name": "KARTHIKA CONSULTING AND SOLUTIONS PRIVATE LIMITED",
+      "lines": 1269,
+      "cost": 792474.63
+     },
+     {
+      "name": "ENGINEERS INDIA LTD",
+      "lines": 37,
+      "cost": 611772.24
+     },
+     {
+      "name": "ADITYA BIRLA HEALTH INSUARNCE CO.LIMITED",
+      "lines": 446,
+      "cost": 584270.02
+     },
+     {
+      "name": "FAMILY HEALTH PLAN TPA (GIPSA-PPN )",
+      "lines": 46,
+      "cost": 562492.27
+     },
+     {
+      "name": "EAST WEST ASSIST TPA PVT LTD.",
+      "lines": 1059,
+      "cost": 459217.74
+     },
+     {
+      "name": "BHARAT ELECTRONICS LIMITED",
+      "lines": 37,
+      "cost": 410055.0
+     },
+     {
+      "name": "ROYAL GOVERNMENT OF BHUTAN (RGOB) (REP. BY-RBCG)",
+      "lines": 622,
+      "cost": 329851.13
+     },
+     {
+      "name": "WEST CENTRAL RAILWAY",
+      "lines": 127,
+      "cost": 295526.38
+     },
+     {
+      "name": "MD INDIA TPA PVT. LTD. JHK-GEHIS",
+      "lines": 193,
+      "cost": 246653.76
+     },
+     {
+      "name": "VOLO HEALTH INSURANCE TPA PVT. LIMITED",
+      "lines": 242,
+      "cost": 228477.05
+     },
+     {
+      "name": "ERICSON INSURANCE TPA PVT. LTD.",
+      "lines": 67,
+      "cost": 225933.94
+     },
+     {
+      "name": "ADITYA BIRLA HEALTH INSURANCE COMPANY LI",
+      "lines": 28,
+      "cost": 210030.73
+     },
+     {
+      "name": "HDFC ERGO GENERAL INSURANCE",
+      "lines": 52,
+      "cost": 176349.94
+     },
+     {
+      "name": "MEDISCOPE",
+      "lines": 347,
+      "cost": 140376.72
+     },
+     {
+      "name": "CENTRAL WAREHOUSING CORPORATION (CWC)",
+      "lines": 30,
+      "cost": 136913.95
+     },
+     {
+      "name": "NIVA BUPA HEALTH INSURANCE",
+      "lines": 378,
+      "cost": 134618.19
+     },
+     {
+      "name": "METALLURGICAL AND ENGINEERING CONSULTANA",
+      "lines": 34,
+      "cost": 132529.06
+     },
+     {
+      "name": "RELIANCE HEALTH INSURANCE COMPANY LIMITED",
+      "lines": 85,
+      "cost": 113754.47
+     },
+     {
+      "name": "FHPL",
+      "lines": 341,
+      "cost": 107945.4
+     },
+     {
+      "name": "VIDAL HEALTH TPA PRIVATE LIMITED",
+      "lines": 152,
+      "cost": 95223.44
+     },
+     {
+      "name": "EMPLOYEE&AMP;AMP;AMP;#39;S PROVIDENT FUND ORGANIZATION",
+      "lines": 74,
+      "cost": 84845.7
+     },
+     {
+      "name": "CHIEF MINISTER RELIEF FUND",
+      "lines": 1,
+      "cost": 84376.8
+     },
+     {
+      "name": "NATIONAL AEROSPACE LABORATORIES(NAL)",
+      "lines": 284,
+      "cost": 75266.4
+     },
+     {
+      "name": "TATA-AIG GENERAL INSURANCE CO LTD",
+      "lines": 66,
+      "cost": 67954.97
+     },
+     {
+      "name": "HEALTH ASSIST INSURANCE TPA",
+      "lines": 176,
+      "cost": 57065.53
+     },
+     {
+      "name": "ERICSON INSURANCE TPA (GIPSA-PPN )",
+      "lines": 16,
+      "cost": 45562.82
+     },
+     {
+      "name": "HEALTH INDIA TPA SERVICES PVT LTD",
+      "lines": 78,
+      "cost": 41351.08
+     },
+     {
+      "name": "MANIPAL CIGNA HEALTH INSURANCE COMPANY",
+      "lines": 224,
+      "cost": 36478.52
+     },
+     {
+      "name": "HEALTH INDIA TPA (GIPSA-PPN )",
+      "lines": 129,
+      "cost": 35181.74
+     },
+     {
+      "name": "INDIAN OIL CORPORATION LIMITED (IOCL)",
+      "lines": 175,
+      "cost": 31670.77
+     },
+     {
+      "name": "INDIAN WESTERN RAILWAY",
+      "lines": 91,
+      "cost": 30810.42
+     },
+     {
+      "name": "HEALTH INSURANCE TPA SERVICES (GIPSA-PPN )",
+      "lines": 51,
+      "cost": 22062.77
+     },
+     {
+      "name": "VIDAL HEALTH INSURANCE TPA (GIPSA-PPN )",
+      "lines": 33,
+      "cost": 19971.5
+     },
+     {
+      "name": "CARE HEALTH INSURANCE COMPANY LTD",
+      "lines": 78,
+      "cost": 19952.46
+     },
+     {
+      "name": "AERONAUTICAL DEVELOPMENT AGENCY (ADA)",
+      "lines": 96,
+      "cost": 16313.0
+     },
+     {
+      "name": "GENERALI CENTRAL INSURANCE CO LTD.",
+      "lines": 16,
+      "cost": 14855.6
+     },
+     {
+      "name": "KARNATAKA POWER TRANSMISSION CORPORATION",
+      "lines": 15,
+      "cost": 12993.03
+     },
+     {
+      "name": "HCG ICR FUND",
+      "lines": 3,
+      "cost": 12918.09
+     },
+     {
+      "name": "MEDSAVE HEALTH INSURANCE (TPA) LTD.",
+      "lines": 88,
+      "cost": 12425.31
+     },
+     {
+      "name": "IFFCO-TOKIO GENERAL INSURANCE PRIVATE LIMITED",
+      "lines": 26,
+      "cost": 5537.61
+     },
+     {
+      "name": "HEALTH INDIA TPA",
+      "lines": 17,
+      "cost": 3989.11
+     },
+     {
+      "name": "MINISTRY OF OMAN",
+      "lines": 21,
+      "cost": 1417.85
+     },
+     {
+      "name": "LAMBDA THERAPEUTIC RESEARCH",
+      "lines": 22,
+      "cost": 459.62
+     }
+    ],
+    "conflicting_master_names_used": [
+     {
+      "name": "CENTRAL GOVERNMENT HEALTH SCHEME (CGHS)",
+      "lines": 9807,
+      "cost": 3962004.53
+     },
+     {
+      "name": "CGHS",
+      "lines": 1045,
+      "cost": 631865.48
+     }
+    ]
+   },
+   "agreement": {
+    "category": {
+     "lines": 875717,
+     "lines_agree": 875717,
+     "lines_pct": 100.0,
+     "cost": 556648532.4,
+     "cost_agree": 556648532.4,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10404,
+       "lines_agree": 10404,
+       "lines_pct": 100.0,
+       "cost": 3919645.22,
+       "cost_agree": 3919645.22,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 38594,
+       "lines_agree": 38594,
+       "lines_pct": 100.0,
+       "cost": 17054367.02,
+       "cost_agree": 17054367.02,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 38477,
+       "lines_agree": 38477,
+       "lines_pct": 100.0,
+       "cost": 24112134.44,
+       "cost_agree": 24112134.44,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 83325,
+       "lines_agree": 83325,
+       "lines_pct": 100.0,
+       "cost": 57374468.99,
+       "cost_agree": 57374468.99,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 57091,
+       "lines_agree": 57091,
+       "lines_pct": 100.0,
+       "cost": 17197421.75,
+       "cost_agree": 17197421.75,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 53237,
+       "lines_agree": 53237,
+       "lines_pct": 100.0,
+       "cost": 15386900.62,
+       "cost_agree": 15386900.62,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 46905,
+       "lines_agree": 46905,
+       "lines_pct": 100.0,
+       "cost": 16424817.79,
+       "cost_agree": 16424817.79,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 33340,
+       "lines_agree": 33340,
+       "lines_pct": 100.0,
+       "cost": 22957273.63,
+       "cost_agree": 22957273.63,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 35913,
+       "lines_agree": 35913,
+       "lines_pct": 100.0,
+       "cost": 46171165.61,
+       "cost_agree": 46171165.61,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 18576,
+       "lines_agree": 18576,
+       "lines_pct": 100.0,
+       "cost": 14093968.54,
+       "cost_agree": 14093968.54,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 121847,
+       "lines_agree": 121847,
+       "lines_pct": 100.0,
+       "cost": 123988959.51,
+       "cost_agree": 123988959.51,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 8448,
+       "lines_agree": 8448,
+       "lines_pct": 100.0,
+       "cost": 5357482.89,
+       "cost_agree": 5357482.89,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 19941,
+       "lines_agree": 19941,
+       "lines_pct": 100.0,
+       "cost": 7852953.23,
+       "cost_agree": 7852953.23,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 67313,
+       "lines_agree": 67313,
+       "lines_pct": 100.0,
+       "cost": 15220050.97,
+       "cost_agree": 15220050.97,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 15180,
+       "lines_agree": 15180,
+       "lines_pct": 100.0,
+       "cost": 12347437.68,
+       "cost_agree": 12347437.68,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 27589,
+       "lines_agree": 27589,
+       "lines_pct": 100.0,
+       "cost": 19201464.33,
+       "cost_agree": 19201464.33,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5664,
+       "lines_agree": 5664,
+       "lines_pct": 100.0,
+       "cost": 3554460.9,
+       "cost_agree": 3554460.9,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 40270,
+       "lines_agree": 40270,
+       "lines_pct": 100.0,
+       "cost": 40274539.57,
+       "cost_agree": 40274539.57,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 13878,
+       "lines_agree": 13878,
+       "lines_pct": 100.0,
+       "cost": 3862625.99,
+       "cost_agree": 3862625.99,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 6,
+       "lines_agree": 6,
+       "lines_pct": 100.0,
+       "cost": 171.77,
+       "cost_agree": 171.77,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64359,
+       "lines_agree": 64359,
+       "lines_pct": 100.0,
+       "cost": 33046427.98,
+       "cost_agree": 33046427.98,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 42190,
+       "lines_agree": 42190,
+       "lines_pct": 100.0,
+       "cost": 25145925.06,
+       "cost_agree": 25145925.06,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 33170,
+       "lines_agree": 33170,
+       "lines_pct": 100.0,
+       "cost": 32103868.91,
+       "cost_agree": 32103868.91,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "payer": {
+     "lines": 875717,
+     "lines_agree": 875717,
+     "lines_pct": 100.0,
+     "cost": 556648532.4,
+     "cost_agree": 556648532.4,
+     "cost_pct": 100.0,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10404,
+       "lines_agree": 10404,
+       "lines_pct": 100.0,
+       "cost": 3919645.22,
+       "cost_agree": 3919645.22,
+       "cost_pct": 100.0
+      },
+      "APVHM": {
+       "lines": 38594,
+       "lines_agree": 38594,
+       "lines_pct": 100.0,
+       "cost": 17054367.02,
+       "cost_agree": 17054367.02,
+       "cost_pct": 100.0
+      },
+      "APVSP": {
+       "lines": 38477,
+       "lines_agree": 38477,
+       "lines_pct": 100.0,
+       "cost": 24112134.44,
+       "cost_agree": 24112134.44,
+       "cost_pct": 100.0
+      },
+      "GJHCA": {
+       "lines": 83325,
+       "lines_agree": 83325,
+       "lines_pct": 100.0,
+       "cost": 57374468.99,
+       "cost_agree": 57374468.99,
+       "cost_pct": 100.0
+      },
+      "GJHHB": {
+       "lines": 57091,
+       "lines_agree": 57091,
+       "lines_pct": 100.0,
+       "cost": 17197421.75,
+       "cost_agree": 17197421.75,
+       "cost_pct": 100.0
+      },
+      "GJHHR": {
+       "lines": 53237,
+       "lines_agree": 53237,
+       "lines_pct": 100.0,
+       "cost": 15386900.62,
+       "cost_agree": 15386900.62,
+       "cost_pct": 100.0
+      },
+      "GJHMS": {
+       "lines": 46905,
+       "lines_agree": 46905,
+       "lines_pct": 100.0,
+       "cost": 16424817.79,
+       "cost_agree": 16424817.79,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 33340,
+       "lines_agree": 33340,
+       "lines_pct": 100.0,
+       "cost": 22957273.63,
+       "cost_agree": 22957273.63,
+       "cost_pct": 100.0
+      },
+      "JHRNC": {
+       "lines": 35913,
+       "lines_agree": 35913,
+       "lines_pct": 100.0,
+       "cost": 46171165.61,
+       "cost_agree": 46171165.61,
+       "cost_pct": 100.0
+      },
+      "KABHD": {
+       "lines": 18576,
+       "lines_agree": 18576,
+       "lines_pct": 100.0,
+       "cost": 14093968.54,
+       "cost_agree": 14093968.54,
+       "cost_pct": 100.0
+      },
+      "KABHK": {
+       "lines": 121847,
+       "lines_agree": 121847,
+       "lines_pct": 100.0,
+       "cost": 123988959.51,
+       "cost_agree": 123988959.51,
+       "cost_pct": 100.0
+      },
+      "KABHN": {
+       "lines": 8448,
+       "lines_agree": 8448,
+       "lines_pct": 100.0,
+       "cost": 5357482.89,
+       "cost_agree": 5357482.89,
+       "cost_pct": 100.0
+      },
+      "KAGLB": {
+       "lines": 19941,
+       "lines_agree": 19941,
+       "lines_pct": 100.0,
+       "cost": 7852953.23,
+       "cost_agree": 7852953.23,
+       "cost_pct": 100.0
+      },
+      "KAHHS": {
+       "lines": 67313,
+       "lines_agree": 67313,
+       "lines_pct": 100.0,
+       "cost": 15220050.97,
+       "cost_agree": 15220050.97,
+       "cost_pct": 100.0
+      },
+      "KAHUN": {
+       "lines": 15180,
+       "lines_agree": 15180,
+       "lines_pct": 100.0,
+       "cost": 12347437.68,
+       "cost_agree": 12347437.68,
+       "cost_pct": 100.0
+      },
+      "MHHAC": {
+       "lines": 27589,
+       "lines_agree": 27589,
+       "lines_pct": 100.0,
+       "cost": 19201464.33,
+       "cost_agree": 19201464.33,
+       "cost_pct": 100.0
+      },
+      "MHHIK": {
+       "lines": 5664,
+       "lines_agree": 5664,
+       "lines_pct": 100.0,
+       "cost": 3554460.9,
+       "cost_agree": 3554460.9,
+       "cost_pct": 100.0
+      },
+      "MHHNC": {
+       "lines": 40270,
+       "lines_agree": 40270,
+       "lines_pct": 100.0,
+       "cost": 40274539.57,
+       "cost_agree": 40274539.57,
+       "cost_pct": 100.0
+      },
+      "MPIDR": {
+       "lines": 13878,
+       "lines_agree": 13878,
+       "lines_pct": 100.0,
+       "cost": 3862625.99,
+       "cost_agree": 3862625.99,
+       "cost_pct": 100.0
+      },
+      "MPRAT": {
+       "lines": 6,
+       "lines_agree": 6,
+       "lines_pct": 100.0,
+       "cost": 171.77,
+       "cost_agree": 171.77,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64359,
+       "lines_agree": 64359,
+       "lines_pct": 100.0,
+       "cost": 33046427.98,
+       "cost_agree": 33046427.98,
+       "cost_pct": 100.0
+      },
+      "RJHMC": {
+       "lines": 42190,
+       "lines_agree": 42190,
+       "lines_pct": 100.0,
+       "cost": 25145925.06,
+       "cost_agree": 25145925.06,
+       "cost_pct": 100.0
+      },
+      "WBKHE": {
+       "lines": 33170,
+       "lines_agree": 33170,
+       "lines_pct": 100.0,
+       "cost": 32103868.91,
+       "cost_agree": 32103868.91,
+       "cost_pct": 100.0
+      }
+     },
+     "top_differences": []
+    },
+    "segment": {
+     "lines": 875717,
+     "lines_agree": 871407,
+     "lines_pct": 99.5078,
+     "cost": 556648532.4,
+     "cost_agree": 549732832.65,
+     "cost_pct": 98.7576,
+     "by_hospital": {
+      "APONG": {
+       "lines": 10404,
+       "lines_agree": 10348,
+       "lines_pct": 99.4617,
+       "cost": 3919645.22,
+       "cost_agree": 3892868.04,
+       "cost_pct": 99.3168
+      },
+      "APVHM": {
+       "lines": 38594,
+       "lines_agree": 38258,
+       "lines_pct": 99.1294,
+       "cost": 17054367.02,
+       "cost_agree": 16452608.04,
+       "cost_pct": 96.4715
+      },
+      "APVSP": {
+       "lines": 38477,
+       "lines_agree": 37921,
+       "lines_pct": 98.555,
+       "cost": 24112134.44,
+       "cost_agree": 23362258.69,
+       "cost_pct": 96.89
+      },
+      "GJHCA": {
+       "lines": 83325,
+       "lines_agree": 82963,
+       "lines_pct": 99.5656,
+       "cost": 57374468.99,
+       "cost_agree": 57150160.69,
+       "cost_pct": 99.609
+      },
+      "GJHHB": {
+       "lines": 57091,
+       "lines_agree": 56896,
+       "lines_pct": 99.6584,
+       "cost": 17197421.75,
+       "cost_agree": 16844986.52,
+       "cost_pct": 97.9507
+      },
+      "GJHHR": {
+       "lines": 53237,
+       "lines_agree": 52947,
+       "lines_pct": 99.4553,
+       "cost": 15386900.62,
+       "cost_agree": 14943531.09,
+       "cost_pct": 97.1185
+      },
+      "GJHMS": {
+       "lines": 46905,
+       "lines_agree": 46905,
+       "lines_pct": 100.0,
+       "cost": 16424817.79,
+       "cost_agree": 16424817.79,
+       "cost_pct": 100.0
+      },
+      "GJVAD": {
+       "lines": 33340,
+       "lines_agree": 33158,
+       "lines_pct": 99.4541,
+       "cost": 22957273.63,
+       "cost_agree": 22845602.78,
+       "cost_pct": 99.5136
+      },
+      "JHRNC": {
+       "lines": 35913,
+       "lines_agree": 35747,
+       "lines_pct": 99.5378,
+       "cost": 46171165.61,
+       "cost_agree": 46010424.38,
+       "cost_pct": 99.6519
+      },
+      "KABHD": {
+       "lines": 18576,
+       "lines_agree": 18545,
+       "lines_pct": 99.8331,
+       "cost": 14093968.54,
+       "cost_agree": 13995496.98,
+       "cost_pct": 99.3013
+      },
+      "KABHK": {
+       "lines": 121847,
+       "lines_agree": 121432,
+       "lines_pct": 99.6594,
+       "cost": 123988959.51,
+       "cost_agree": 122739797.82,
+       "cost_pct": 98.9925
+      },
+      "KABHN": {
+       "lines": 8448,
+       "lines_agree": 8435,
+       "lines_pct": 99.8461,
+       "cost": 5357482.89,
+       "cost_agree": 5317372.43,
+       "cost_pct": 99.2513
+      },
+      "KAGLB": {
+       "lines": 19941,
+       "lines_agree": 19838,
+       "lines_pct": 99.4835,
+       "cost": 7852953.23,
+       "cost_agree": 7638304.85,
+       "cost_pct": 97.2667
+      },
+      "KAHHS": {
+       "lines": 67313,
+       "lines_agree": 67312,
+       "lines_pct": 99.9985,
+       "cost": 15220050.97,
+       "cost_agree": 15218864.47,
+       "cost_pct": 99.9922
+      },
+      "KAHUN": {
+       "lines": 15180,
+       "lines_agree": 15030,
+       "lines_pct": 99.0119,
+       "cost": 12347437.68,
+       "cost_agree": 12019525.8,
+       "cost_pct": 97.3443
+      },
+      "MHHAC": {
+       "lines": 27589,
+       "lines_agree": 27484,
+       "lines_pct": 99.6194,
+       "cost": 19201464.33,
+       "cost_agree": 19100193.39,
+       "cost_pct": 99.4726
+      },
+      "MHHIK": {
+       "lines": 5664,
+       "lines_agree": 5644,
+       "lines_pct": 99.6469,
+       "cost": 3554460.9,
+       "cost_agree": 3505826.13,
+       "cost_pct": 98.6317
+      },
+      "MHHNC": {
+       "lines": 40270,
+       "lines_agree": 39974,
+       "lines_pct": 99.265,
+       "cost": 40274539.57,
+       "cost_agree": 39747864.19,
+       "cost_pct": 98.6923
+      },
+      "MPIDR": {
+       "lines": 13878,
+       "lines_agree": 13809,
+       "lines_pct": 99.5028,
+       "cost": 3862625.99,
+       "cost_agree": 3741752.43,
+       "cost_pct": 96.8707
+      },
+      "MPRAT": {
+       "lines": 6,
+       "lines_agree": 6,
+       "lines_pct": 100.0,
+       "cost": 171.77,
+       "cost_agree": 171.77,
+       "cost_pct": 100.0
+      },
+      "ODCHP": {
+       "lines": 64359,
+       "lines_agree": 64012,
+       "lines_pct": 99.4608,
+       "cost": 33046427.98,
+       "cost_agree": 32549955.59,
+       "cost_pct": 98.4977
+      },
+      "RJHMC": {
+       "lines": 42190,
+       "lines_agree": 41721,
+       "lines_pct": 98.8884,
+       "cost": 25145925.06,
+       "cost_agree": 24495206.99,
+       "cost_pct": 97.4122
+      },
+      "WBKHE": {
+       "lines": 33170,
+       "lines_agree": 33022,
+       "lines_pct": 99.5538,
+       "cost": 32103868.91,
+       "cost_agree": 31735241.79,
+       "cost_pct": 98.8518
+      }
+     },
+     "top_differences": [
+      {
+       "ours": "Onco",
+       "hcg": "Non-Onco",
+       "lines": 4310,
+       "cost": 6915699.75
+      }
+     ]
+    }
+   },
+   "kr": {
+    "plant": "HC05",
+    "lines": 59805,
+    "formulary": 102061364.55,
+    "out_of_formulary": 1639445.05,
+    "non_formulary": 2364618.45,
+    "pooled_pct": 98.4191,
+    "onco_pct": 99.0177,
+    "non_onco_pct": 94.2446,
+    "mean_pct": 96.6312,
+    "scheme": {
+     "restricted": 4347340.55,
+     "preferred": 227385.07
+    }
+   },
+   "all_hospitals": {
+    "lines": 491143,
+    "formulary": 423943884.36,
+    "out_of_formulary": 10626696.98,
+    "non_formulary": 29088312.4,
+    "pooled_pct": 97.5547,
+    "onco_pct": 99.5996,
+    "non_onco_pct": 87.1014,
+    "mean_pct": 93.3505
+   },
+   "brand_rules": {
+    "kr": {
+     "restricted_scheme": {
+      "cost": 4347340.55,
+      "lines": 953,
+      "share_pct": 4.0987
+     },
+     "preferred_scheme": {
+      "cost": 227385.07,
+      "lines": 500,
+      "share_pct": 0.2144
+     },
+     "oof_scheme": {
+      "cost": 66479.22,
+      "lines": 126,
+      "share_pct": 0.0627
+     },
+     "restricted_cash_tpa": {
+      "cost": 45192099.74,
+      "lines": 12831,
+      "share_pct": 42.6078
+     },
+     "opd_brand_inpatient": {
+      "cost": 1413266.57,
+      "lines": 2822,
+      "share_pct": 1.3324
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 1352311.4,
+      "lines": 611,
+      "share_pct": 1.275
+     }
+    },
+    "all_hospitals": {
+     "restricted_scheme": {
+      "cost": 31695273.7,
+      "lines": 25057,
+      "share_pct": 6.8359
+     },
+     "preferred_scheme": {
+      "cost": 8310561.96,
+      "lines": 23330,
+      "share_pct": 1.7924
+     },
+     "oof_scheme": {
+      "cost": 1867582.02,
+      "lines": 12642,
+      "share_pct": 0.4028
+     },
+     "restricted_cash_tpa": {
+      "cost": 109833817.0,
+      "lines": 53036,
+      "share_pct": 23.6885
+     },
+     "opd_brand_inpatient": {
+      "cost": 7755225.64,
+      "lines": 20222,
+      "share_pct": 1.6726
+     },
+     "scheme_brand_cash_tpa": {
+      "cost": 5742520.37,
+      "lines": 4327,
+      "share_pct": 1.2385
+     }
+    },
+    "rule_book_items": 2558,
+    "per_doctor_rows": 8180,
+    "reconciliation": []
+   },
+   "warnings": [
+    "45 payer names are in neither the Payer Master nor payer_overrides.csv (9,531 lines, cost 9,006,507.83); counted as CASH(TPA)",
+    "segment agrees with HCG's column on 99.5078% of lines / 98.7576% of cost (reported, not an error)"
+   ],
+   "built_at": "2026-10-10T20:22:26+00:00"
+  }
+ },
+ "tables": {
+  "formulary_summary": {
+   "rows": 4105,
+   "kb": 85.6
+  },
+  "formulary_by_doctor": {
+   "rows": 15418,
+   "kb": 191.3
+  },
+  "formulary_by_item": {
+   "rows": 105743,
+   "kb": 1372.7
+  },
+  "formulary_doctor_item": {
+   "rows": 72247,
+   "kb": 662.4
+  },
+  "formulary_rule_breach": {
+   "rows": 24349,
+   "kb": 267.5
+  },
+  "formulary_rules": {
+   "rows": 8607,
+   "kb": 84.1
+  }
+ }
+}

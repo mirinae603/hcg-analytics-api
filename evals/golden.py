@@ -11,6 +11,10 @@ must not, a table that must have been used. Run each case N times and report a p
 
     .venv/bin/python -m evals.golden            # 1 run each
     .venv/bin/python -m evals.golden 3          # 3 runs each, for variance
+    .venv/bin/python -m evals.golden 1 fast FS  # fast mode, the formulary & spend cases only
+
+A case may carry "mode" (pin it to "fast" or "deep" whatever the run's mode) and "context"
+(the dashboard page context, passed to answer() the way chat_service passes it).
 """
 from __future__ import annotations
 
@@ -26,17 +30,22 @@ except Exception:
     pass
 
 
-from evals.cases import CASES  # the 90-question bank + its ground truth
+from evals.cases import CASES, LEVELS  # the question bank + its ground truth
 
 
 def run(case, mode="deep"):
+    # A case may pin its own mode, e.g. one that exercises a path only one engine has.
+    mode = case.get("mode") or mode
     if mode == "deep":
         from app.ai.deep import engine as eng
     else:
         from app.ai import orchestrator as eng
     text, queries, kind, t0 = "", 0, "answer", time.time()
+    # Same rule as chat_service: the keyword only when there is a context, so a case
+    # without one calls answer(query) exactly as before.
+    extra = {"context": case["context"]} if case.get("context") else {}
     try:
-        for ev in eng.answer(case["q"]):
+        for ev in eng.answer(case["q"], **extra):
             t = ev.get("type")
             if t == "answer_delta":
                 text += ev.get("text") or ""
@@ -65,7 +74,7 @@ def main():
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     mode = sys.argv[2] if len(sys.argv) > 2 else "deep"
     only = sys.argv[3] if len(sys.argv) > 3 else ""
-    # a third arg filters by case id OR by level ("L1"/"L2"/"L3")
+    # a third arg filters by case id OR by level ("L1".."L4", or "FS" for formulary & spend)
     cases = [c for c in CASES
              if not only or only in c["id"] or c.get("level", "") == only.upper()]
     print(f"golden set · mode={mode} · {runs} run(s) each · {len(cases)} cases\n", flush=True)
@@ -110,6 +119,8 @@ def main():
         mark = "PASS" if ok == runs else ("FLAKY" if ok else "FAIL")
         kinds = {r.get("kind") for r in results} - {"answer"}
         tag = f"  [{'/'.join(sorted(kinds))}]" if kinds else ""
+        if c.get("mode") and c["mode"] != mode:
+            tag += f"  ({c['mode']} mode)"
         print(f"  [{mark:5s}] {c['id']:26s} {ok}/{len(results)}   {secs:5.1f}s  {q:.1f}q{tag}", flush=True)
         if ok < runs:
             bad = next(r for r in results if not r["ok"])
@@ -117,7 +128,7 @@ def main():
             print(f"           got: {(bad.get('err') or bad['text'])[:200].strip()}", flush=True)
     # per level, because an average hides which KIND of question is failing
     print()
-    for lv in ("L1", "L2", "L3", "L4"):
+    for lv in LEVELS:
         rows = [(c, by_id.get(c["id"], [])) for c in cases if c.get("level") == lv]
         n = sum(len(r) for _, r in rows)
         ok = sum(1 for _, rs in rows for r in rs if r["ok"])

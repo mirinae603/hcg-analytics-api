@@ -23,10 +23,17 @@ import math
 import os
 import re
 import threading
+import time
 
 EMBED_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-large")
 TOP_K = 4
 MIN_SIM = 0.32   # below this, the corpus has nothing relevant — inject nothing
+# Routing is optional, so it must never cost much when it fails. A missing deployment or a
+# stalled endpoint used to be retried on EVERY question with the client's 120 s timeout and
+# SDK retries, all before the model's first round. Now: one short attempt, and a failure is
+# remembered for a few minutes.
+EMBED_TIMEOUT_S = 8.0
+EMBED_RETRY_AFTER_S = 300.0
 
 # ── Deterministic intent LOCKS ───────────────────────────────────────────────
 # Embedding retrieval generalises to unseen phrasings but is probabilistic — on the
@@ -68,9 +75,13 @@ _CORPUS: list[tuple[str, str]] = [
     ("total revenue; total sales; overall margin; revenue and margin; IP vs OP revenue split",
      "REVENUE/MARGIN → sales_totals for the canonical company total (₹521.67 Cr); margin=revenue-cost. NEVER sales_by_manufacturer for an overall total (it undercounts)."),
     ("revenue by manufacturer; top manufacturers; margin by brand/manufacturer",
-     "BY MANUFACTURER → sales_by_manufacturer (revenue side is clean). For by-product revenue use sales_by_material (already de-duplicated)."),
+     "BY MANUFACTURER → sales_by_manufacturer (revenue side is clean). For by-product revenue use sales_by_material (already de-duplicated; <<SALES_MONTHS>>-month total — a product's monthly trend is sales_by_material_month)."),
     ("top products by revenue; most profitable drugs; highest margin items; best selling products",
-     "BY PRODUCT → sales_by_material (deduped) ORDER BY revenue or (revenue-cost); apply a materiality floor before ranking by margin_pct."),
+     "BY PRODUCT → sales_by_material (deduped, <<SALES_MONTHS>>-month TOTAL) ORDER BY revenue or (revenue-cost); apply a materiality floor before ranking by margin_pct. For a product's MONTHLY trend use sales_by_material_month."),
+    # "get me the sales trend of keytruda" had no exemplar of its own, so it retrieved the
+    # company-total and by-product hints above — both pointing at tables with no month.
+    ("sales trend of a product; monthly sales of a drug; how has an item's revenue changed month by month; product revenue over time; category sales trend",
+     "ITEM/CATEGORY SALES TREND → sales_by_material_month: SELECT period, SUM(revenue), SUM(revenue - cost) … WHERE upper(material_desc) LIKE '%<NAME>%' (or material_group = …) GROUP BY period ORDER BY period. NOT sales_by_material (<<SALES_MONTHS>>-month total), NOT sales_monthly (whole company), NOT purchasing."),
     ("total procurement spend; how much did we spend on purchasing; overall purchase value",
      "PROCUREMENT SPEND (total) → SUM(kpi_purchase_value.purchase_value) = ₹649.91 Cr (matches the dashboard). Not fact_grn received value."),
     ("procurement spend by category; spend on pharma or injections or a drug type; category-filtered spend",
@@ -84,7 +95,7 @@ _CORPUS: list[tuple[str, str]] = [
     ("inventory turnover ratio; how fast is stock turning; ITR; turns per year",
      "TURNOVER RATIO → the two-piece additive pattern in the worked examples (internal SUM from kpi_health_score + a SEPARATE, once-only billed SUM from sales_by_material, then ×2.0 to annualize). NEVER `SUM(consumption_cost)*2.0/SUM(closing_stock_value) FROM kpi_health_score` directly for a portfolio/group total — see gotcha #30, that naive form fans out the billed portion by however many plants each material is stocked at (confirmed ~10x too high)."),
     ("what is expiring; near-expiry stock; items expiring soon; expiry exposure",
-     "EXPIRY → fact_inventory, date_diff('day', DATE '2026-05-31', expiry_date); bands per RULES. For cross-plant redistribution check the SAME material at other plants."),
+     "EXPIRY → fact_inventory, date_diff('day', <<SNAPSHOT_SQL>>, expiry_date); bands per RULES. For cross-plant redistribution check the SAME material at other plants."),
     ("which departments or cost centres consume the most; consumption by department; department usage",
      "CONSUMPTION BY DEPARTMENT → kpi_consumption_by_department by cost_ctr (department names are just codes). For item-level detail within a cost centre use fact_consumption (has material)."),
     ("cost per unit consumed; most expensive item to consume; consumption unit cost",
@@ -93,21 +104,39 @@ _CORPUS: list[tuple[str, str]] = [
      "FORECAST → forecast_sales (demand-forecast model only, NOT billed sales). Never use it to answer a revenue question."),
     ("which items will stock out; reorder; replenishment; stockout risk; what to expedite",
      "STOCKOUT/REORDER → stock_replenishment_and_aging_risk (replenishment_quantity>0 = reorder). Flag non-clinical consumables that dominate raw lists."),
-    ("out of formulary stock; formulary compliance; non-formulary items",
-     "FORMULARY → fact_inventory.formulary (or dim_material.formulary). 'OUT OF FORMULARY' often explains dead stock."),
+    # The Jun–Aug 2026 HCG reports have no SQL table: the old single "formulary" row sent
+    # compliance questions to the item-master flag, a different measure over a different window.
+    ("formulary compliance; compliance percentage by hospital or doctor; out-of-formulary spend; restricted brands; preferred brands; brand rules",
+     "FORMULARY COMPLIANCE % / out-of-formulary spend / restricted or preferred brands → get_kpi(\"formulary-compliance\" / \"brand-rules\") (<<REPORTS>> only; no SQL table). The item-master flag dim_material.formulary_status is only for \"is item X formulary\" / sales share by formulary status (<<SALES_SHORT>>)."),
+    ("scheme brand saving; savings on scheme patients; Attis saving; Healthium brand savings; switching to Attis",
+     "SCHEME / ATTIS SAVINGS → get_kpi(\"scheme-brand-saving\" / \"attis-saving\") (<<REPORTS>> only; no SQL table). Report each hospital separately — never add up percentages."),
+    ("cash and TPA margin loss; margin lost on cash patients; TPA margin leakage",
+     "CASH & TPA MARGIN LOSS → get_kpi(\"cash-tpa-margin-loss\") (<<REPORTS>> only; no SQL table). Not the <<SALES_SHORT>> sales tables. Spend on restricted brands for cash & TPA patients is NOT this: brand-rules."),
+    ("spend on restricted brands for cash and TPA patients; restricted brands given to cash patients; restricted brand consumption for cash & TPA",
+     "RESTRICTED BRANDS FOR CASH & TPA → get_kpi(\"brand-rules\", measure=\"restricted_cash_tpa\"): the SPEND and its share of drug spend (<<REPORTS>> only). Not cash-tpa-margin-loss, which is margin lost vs suggested brands."),
+    ("out of formulary stock; non-formulary items; is this item on the formulary; share of sales from non-formulary items",
+     "ITEM FORMULARY FLAG → dim_material.formulary_status (clean values) or fact_inventory.formulary for stock. 'OUT OF FORMULARY' often explains dead stock. Sales share by status joins sales_by_material on material (<<SALES_SHORT>>)."),
     ("procurement spend variance month over month; has spend variance improved; monthly spend change",
      "SPEND VARIANCE → recompute from SUM(purchase_value)/SUM(prev_value) on kpi_procurement_variance; NEVER AVG(variance_pct) (unweighted mean is dominated by tiny-base plants → nonsense %)."),
     ("inventory value by ward type; IP OP OT storage; stock by storage location",
      "WARD/SLOC → join dim_sloc ON plant AND sloc (composite key — sloc alone over-counts ~14x)."),
-    ("who is the CEO; org chart; patient records; weather; external facts; which doctor requested",
-     "OUT OF SCOPE / NOT IN DATA → say plainly it's outside the supply-chain data (no people/roles/patient/doctor/external dimension); do not fabricate or invent a proxy."),
+    # Doctors are no longer out of scope: the formulary/brand-rule/spend reports are broken
+    # down by treating doctor, so they must not be routed to a refusal.
+    ("who is the CEO; org chart; patient records; weather; external facts",
+     "OUT OF SCOPE / NOT IN DATA → say plainly it's outside the supply-chain data (no people/roles/patient/external dimension); do not fabricate or invent a proxy."),
 ]
 
 _lock = threading.Lock()
 _corpus_vecs: list[list[float]] | None = None   # cached embeddings, index-aligned to _CORPUS
+_corpus_failed_at = 0.0                          # monotonic time of the last failed corpus embed
 
 
 def _embed(client, texts: list[str]) -> list[list[float]]:
+    # One short attempt, no SDK retries: on failure the caller falls back to the regex
+    # locks, which is cheaper than making the user wait for a hint.
+    fast = getattr(client, "with_options", None)
+    if callable(fast):
+        client = fast(timeout=EMBED_TIMEOUT_S, max_retries=0)
     resp = client.embeddings.create(model=EMBED_DEPLOYMENT, input=texts)
     return [d.embedding for d in resp.data]
 
@@ -122,14 +151,19 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _ensure_corpus(client) -> list[list[float]] | None:
-    global _corpus_vecs
+    global _corpus_vecs, _corpus_failed_at
     if _corpus_vecs is not None:
         return _corpus_vecs
+    if _corpus_failed_at and time.monotonic() - _corpus_failed_at < EMBED_RETRY_AFTER_S:
+        return None
     with _lock:
         if _corpus_vecs is None:
+            if _corpus_failed_at and time.monotonic() - _corpus_failed_at < EMBED_RETRY_AFTER_S:
+                return None          # another thread failed while this one waited
             try:
                 _corpus_vecs = _embed(client, [c[0] for c in _CORPUS])
             except Exception:
+                _corpus_failed_at = time.monotonic()
                 return None
     return _corpus_vecs
 

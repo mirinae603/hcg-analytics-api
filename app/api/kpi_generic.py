@@ -18,8 +18,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from app.api import formulary
 from app.core import data_access as da
 from app.core import drill_sources as ds
+from app.core import table_query as tq
 
 router = APIRouter()
 
@@ -230,6 +232,41 @@ def kpi_summary(
     return _kpi_summary_cached(table, plant, material, material_group, category)
 
 
+# Each table's own filters, beside the Month / Hospital / Category every table gets from its
+# columns (table_query.standard_facets). Keyed by parquet table, so the keys that share one
+# (inventory-health-score and inventory-turnover-ratio) filter alike. A facet whose column a
+# frame lacks is simply not offered.
+_GROUP, _VENDOR = tq.MATERIAL_GROUP, tq.VENDOR
+TABLE_FACETS: dict[str, tuple] = {
+    "kpi_stock_value": (_GROUP,),
+    "kpi_inventory_aging": (_GROUP, tq.Facet("aging_category", "Aging (days)", order="label")),
+    "kpi_aging_distribution": (_GROUP, tq.Facet("aging_bucket", "Aging bucket", order="label")),
+    "kpi_doh": (_GROUP,),
+    "kpi_health_score": (_GROUP, tq.Facet("health_tier", "Health tier")),
+    "kpi_non_moving": (_GROUP, tq.Facet("reason", "Reason")),
+    "kpi_risk_classification": (_GROUP, tq.Facet("risk_level", "Risk level"),
+                                tq.Facet("consumed", "Consumed", value_label=tq.yes_no)),
+    "kpi_stock_change": (_GROUP,),
+    "kpi_purchase_value": (_VENDOR, tq.Facet("category", "PO category")),
+    "kpi_monthly_purchase_value": (_GROUP,),
+    "kpi_vendor_volume": (_VENDOR,),
+    "kpi_units_consumed": (_GROUP,),
+    "kpi_consumption_by_department": (tq.Facet("department_name", "Department"),),
+    "sales_by_material_hospital": (tq.Facet("hospital", "Hospital", value_label=tq.his_label, order="label"),
+                                   tq.Facet("group", "Material group")),
+    "sales_monthly": (tq.Facet("month", "Month", value_label=tq.month_label, order="newest"),
+                      tq.Facet("patient", "Patient type")),
+    "kpi_billable_consumption": (_GROUP, tq.Facet("scope", "Billed or internal")),
+    "kpi_stock_out": (_GROUP, tq.Facet("stock_status", "Stock status")),
+    "kpi_stock_radar": (_GROUP, tq.Facet("radar_status", "Radar status"), tq.Facet("aging_risk", "Aging risk")),
+    "kpi_aging_risk_forecast": (_GROUP, tq.Facet("aging_risk_forecast", "Aging risk forecast"),
+                                tq.Facet("will_stagnate", "Will stagnate", value_label=tq.yes_no)),
+    "kpi_near_expiry": (_GROUP, tq.Facet("expiry_bucket", "Expiry"),
+                        tq.Facet("expiry_date", "Expiry date", kind="range")),
+    "kpi_vendor_lead_time": (_VENDOR,),
+}
+
+
 @router.get("/kpi/{key}/table")
 def kpi_table(
     key: str,
@@ -239,15 +276,21 @@ def kpi_table(
 ):
     table = _resolve(key)
     _category_unsupported(table, category)
-    params = dict(request.query_params)
     # No Scope param: _ALWAYS_BOTH_SCOPED (see _regrained) already makes these 5
     # keys' SKU table permanently billed+internal, matching their bespoke /insights
     # page. Only Units Consumed per SKU keeps a live Scope toggle, and it reaches
     # this route through a different key (unit-sold-per-sku) not in that map, so
     # _regrained falls through to its normal (unaffected) behaviour for it.
     frame = _regrained(table, category)
-    return da.paginate(table, plant, params, col_map={}, category=category,
-                       frame=frame)
+    df = da.load(table) if frame is None else frame
+    code, cat = da.resolve_plant(plant), da.resolve_category(category)
+    # A regrained frame is built for the category (ds.regrain, _CATEGORY_REGRAIN), so the cut
+    # holds even where no category column is left on it to show so.
+    cut = frame is not None and table not in _ALWAYS_BOTH_SCOPED
+    applied = bool(cat) and (cut or ("category" in df.columns and da._is_derived_category_col(df)))
+    scope = (tq.plant_chip(code, split="plant" in df.columns), tq.category_chip(cat, applied=applied))
+    return da.paginate(table, plant, request.query_params, col_map={}, category=category, frame=df,
+                       facets=TABLE_FACETS.get(table, ()), scope=scope)
 
 
 PORTFOLIOS = {
@@ -307,6 +350,9 @@ def _plant_domains():
 def meta_plants():
     df = da.load("dim_plant")
     inv, con, grn = _plant_domains()
+    # Not part of the cached _plant_domains: read fresh so a formulary rebuild shows up
+    # (an empty set until the data is built).
+    form = formulary.plants_with_data()
     items = []
     for r in df.to_dict("records"):
         code = str(r["plant"])
@@ -317,11 +363,14 @@ def meta_plants():
             domains += ["consumption", "forecasting"]   # forecasts are built from consumption
         if code in grn:
             domains.append("procurement")
+        if code in form:
+            domains.append("formulary")
         items.append({"code": r["plant"], "name": r.get("plant_name", r["plant"]), "domains": domains})
     items = [it for it in items if it["domains"]]        # drop plants with no data at all
     items.sort(key=lambda x: x["name"])
     return {"plants": [{"code": "ALL", "name": "All Plants",
-                        "domains": ["inventory", "consumption", "forecasting", "procurement"]}] + items}
+                        "domains": ["inventory", "consumption", "forecasting", "procurement",
+                                    "formulary"]}] + items}
 
 
 @router.get("/meta/materials")

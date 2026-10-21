@@ -1,0 +1,7 @@
+measure,label,classes,payers,patient_types,verdict,by_doctor,alternatives,rule_ref,note
+restricted_scheme,Restricted brands for scheme patients,FORMULARYR;FORMULARYR-OPD,GOV,*,breach,yes,P-SCH;SCH;SCH-OPD,guidelines 3 and 6,"HCG's report: 'Restricted brand consumption for scheme patient'"
+preferred_scheme,Preferred (cash) brands for scheme patients,FORMULARYP,GOV,*,breach,yes,P-SCH;SCH;SCH-OPD,guideline 5,"HCG's report: 'Preferred brand consumption for scheme patient'"
+oof_scheme,Out-of-formulary brands for scheme patients,OUT OF FORMULARY,GOV,*,breach,yes,,guidelines 4 and 6,Doctor-wise monitoring of out-of-formulary use for scheme patients
+restricted_cash_tpa,Restricted brands for cash & TPA patients,FORMULARYR;FORMULARYR-OPD,CASH;CASH(TPA),*,watch,no,P;P-SCH,guideline 3,"HCG's report: 'Restricted brand consumption for cash&TPA patients'; a figure HCG reports, breach status to confirm with HCG"
+opd_brand_inpatient,Outpatient (-OPD) brands used for inpatients,FORMULARYR-OPD;FORMULARYOPD;FORMULARYP-OPD;FORMULARYSCH-OPD,*,IP,info,no,,to confirm,Shown for information until HCG confirms what -OPD means
+scheme_brand_cash_tpa,Scheme (SCH) brands used for cash & TPA patients,FORMULARYSCH;FORMULARYSCH-OPD,CASH;CASH(TPA),*,info,no,P;P-SCH,guideline 2 (to confirm),Shown for information until HCG confirms

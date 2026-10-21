@@ -3,13 +3,14 @@
 Replaces the old pyodbc/Azure-SQL data layer. KPI aggregate parquet (produced by
 the ETL) are memoized on first read. `paginate` is a pandas port of the old
 `ui_table_filter_controls.build_filter_clause` so every `*-table` endpoint keeps the
-identical `{data,total}` contract and the `filter_field_i/operator_i/value_i` protocol.
+identical `{data,total}` contract; app.core.table_query adds the facet filters, literal search
+and CSV projection every list endpoint shares.
 """
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -192,6 +193,7 @@ def load(table: str) -> pd.DataFrame:
 def refresh_cache() -> None:
     _load_cached.cache_clear()
     _name_to_code.cache_clear()
+    _hospital_map_at.cache_clear()
     _material_category_map.cache_clear()
     sales_material_margin.cache_clear()
 
@@ -519,14 +521,61 @@ def _name_to_code() -> dict:
     return {str(n): str(c) for c, n in zip(dp["plant"], dp["plant_name"])}
 
 
+# ── HIS hospital -> SAP plant ─────────────────────────────────────────────────
+# The formulary tables come from HIS pharmacy sales, which name a hospital by its invoice
+# prefix (KABHK) and LOCATIONNAME ("HCG Hospitals, Rajkot"), not by SAP plant (HS01, "HCG
+# SUN HOSPITALS LLP"). app/data/reference/hospital_map.csv is the hand-checked crosswalk.
+# resolve_plant consults it LAST, so every input that resolved before resolves exactly as
+# before. What changes is that a HIS code or HIS name — which used to resolve to None,
+# i.e. silently ALL plants — now filters to its hospital on every endpoint.
+HOSPITAL_MAP_COLUMNS = ["his_code", "his_location_name", "his_location_id", "sap_plant",
+                        "sap_plant_name", "confidence", "note"]
+
+
+def _alias_key(s) -> str:
+    return " ".join(str(s).split()).upper()
+
+
+@lru_cache(maxsize=4)
+def _hospital_map_at(path: str, stamp: tuple) -> tuple:
+    """(map frame, {HIS code / HIS name (upper) -> SAP plant}) for one version of the file.
+    Keyed on the file's path and mtime so a rebuilt map, or a test pointing
+    REFERENCE_DIR elsewhere, is picked up without a restart."""
+    hm = pd.read_csv(path, dtype=str, keep_default_na=False)
+    alias: dict = {}
+    for r in hm.to_dict("records"):
+        sap = str(r.get("sap_plant", "")).strip()
+        if not sap:
+            continue
+        for k in (r.get("his_code"), r.get("his_location_name")):
+            if k and str(k).strip():
+                alias.setdefault(_alias_key(k), sap)
+    return hm, alias
+
+
+def _hospital_map_entry() -> tuple:
+    p = Path(settings.REFERENCE_DIR) / "hospital_map.csv"
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return pd.DataFrame(columns=HOSPITAL_MAP_COLUMNS), {}
+    return _hospital_map_at(str(p), (st.st_mtime_ns, st.st_size))
+
+
+def hospital_map() -> pd.DataFrame:
+    """The HIS -> SAP hospital crosswalk (empty frame when the file is absent)."""
+    return _hospital_map_entry()[0]
+
+
 def resolve_plant(region: Optional[str]) -> Optional[str]:
-    """Accept a plant code or a hospital name; return the plant code (None => all)."""
+    """Accept a plant code, a hospital name, or a HIS hospital code / name; return the
+    plant code (None => all)."""
     if not region or str(region).upper() in ("ALL", "ALL PLANTS", ""):
         return None
     codes = set(load("dim_plant")["plant"].astype(str))
     if str(region) in codes:
         return str(region)
-    return _name_to_code().get(str(region))
+    return _name_to_code().get(str(region)) or _hospital_map_entry()[1].get(_alias_key(region))
 
 
 def _month_sort_key(df: pd.DataFrame) -> pd.Series:
@@ -698,70 +747,33 @@ def _jsonable(v) -> Optional[float]:
     return None if f != f else f
 
 
-def _apply_filter_protocol(df: pd.DataFrame, params: dict, col_map: dict) -> pd.DataFrame:
-    """Apply filter_field_i/operator_i/value_i + global_filter (LIKE / numeric range)."""
-    i = 0
-    while f"filter_field_{i}" in params:
-        field = params.get(f"filter_field_{i}")
-        value = params.get(f"filter_value_{i}")
-        i += 1
-        col = col_map.get(field, field)
-        if not value or col not in df.columns:
-            continue
-        v = str(value).strip()
-        if "," in v:  # numeric range "a,b" / "a," / ",b"
-            a, b = (p.strip() for p in v.split(",", 1))
-            num = pd.to_numeric(df[col], errors="coerce")
-            if a and b:
-                df = df[(num >= float(a)) & (num <= float(b))]
-            elif a:
-                df = df[num >= float(a)]
-            elif b:
-                df = df[num <= float(b)]
-        else:
-            df = df[df[col].astype(str).str.contains(v, case=False, na=False)]
-    gf = params.get("global_filter")
-    if gf:
-        mask = pd.Series(False, index=df.index)
-        for c in df.columns:
-            mask |= df[c].astype(str).str.contains(str(gf), case=False, na=False)
-        df = df[mask]
-    return df
-
-
-def paginate(table: str, plant: Optional[str], params: dict, col_map: dict,
+def paginate(table: str, plant: Optional[str], params, col_map: dict,
              columns: Optional[list[str]] = None, rename: Optional[dict] = None,
              category: Optional[str] = None,
-             frame: Optional[pd.DataFrame] = None) -> dict:
-    """Server-side table: filter + sort + page. Returns {data, total}.
+             frame: Optional[pd.DataFrame] = None,
+             sum_cols: Optional[list[str]] = None,
+             facets: Sequence = (), scope: Sequence = ()) -> dict:
+    """Server-side table: cut to the plant and category, then filter + search + sort + page
+    (app.core.table_query). Returns {data, total}.
 
+    `params` is the request's query params — pass request.query_params itself (a MultiDict),
+    not dict() of it, so a repeated f.<field> filter keeps every value.
     `frame` substitutes an already-loaded equivalent of `table` — see chart_series.
+    `sum_cols` adds `sums: {col: Σ}` over the same filtered rows the table pages through
+    (search and facet filters included), so a footer "Total" row shows the amount every share
+    column is a share of. `facets` are the table's own filters beside the standard Month /
+    Hospital / Category ones, and `scope` the page filters echoed back; both are only sent
+    with facets=1. Without these the response is exactly {data, total}, as every legacy page
+    expects.
     """
+    # Imported here: table_query builds on this module (labels, month order, records).
+    from app.core import table_query as tq
+
     df = load(table) if frame is None else frame
     df = filter_plant(df, plant)
     df = filter_category(df, category)
-    df = _apply_filter_protocol(df, params, col_map)
-
-    total = len(df)
-
-    sort_field = params.get("sort_field")
-    sort_order = (params.get("sort_order") or "asc").lower()
-    sort_col = col_map.get(sort_field, sort_field) if sort_field else None
-    if sort_col and sort_col in df.columns:
-        df = df.sort_values(sort_col, ascending=(sort_order != "desc"),
-                            kind="mergesort", na_position="last")
-    elif {"year", "month"}.issubset(df.columns):
-        df = df.assign(_mk=_month_sort_key(df)).sort_values(["year", "_mk"]).drop(columns="_mk")
-
-    page = int(params.get("page", 0) or 0)
-    page_size = int(params.get("page_size", 25) or 25)
-    page_df = df.iloc[page * page_size: page * page_size + page_size]
-
-    if columns:
-        page_df = page_df[[c for c in columns if c in page_df.columns]]
-    if rename:
-        page_df = page_df.rename(columns=rename)
-    return {"data": _clean_records(page_df), "total": int(total)}
+    return tq.table_page(df, params, facets=facets, scope=scope, columns=columns, rename=rename,
+                         sum_cols=sum_cols, col_map=col_map)
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:

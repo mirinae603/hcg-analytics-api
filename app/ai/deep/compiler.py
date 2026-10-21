@@ -126,8 +126,8 @@ def _dominant(candidates: list[str]) -> str:
     for key in sorted(hits):
         t, c = key.split(".", 1)
         try:
-            v, n = warehouse.con().execute(
-                f'SELECT SUM("{c}"), COUNT(*) FROM "{t}"').fetchone()
+            v, n = warehouse.query(
+                f'SELECT SUM("{c}"), COUNT(*) FROM "{t}"', one=True)
         except Exception:
             return ""
         if v is None:
