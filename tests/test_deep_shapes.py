@@ -73,8 +73,9 @@ def test_every_shape_declares_what_the_answer_owes():
 
 
 # ── the substitution disclosure, made deterministic ──────────────────────────
-# There is no material-by-month SALES grain, so a "sales trend" is answered from
-# PURCHASING. That substitution is fine; labelling it "Sales Trend" is a wrong answer
+# When the findings hold no sales figure (sales_by_material_month has the item's monthly
+# sales, so this is the fallback, not the rule), a "sales trend" gets answered from
+# PURCHASING. That substitution can be fine; labelling it "Sales Trend" is a wrong answer
 # however good the arithmetic. The prompt has asked for this disclosure since the first
 # version and the model supplies it about half the time — the same reliability that
 # Plant->Hospital taught us twice already.

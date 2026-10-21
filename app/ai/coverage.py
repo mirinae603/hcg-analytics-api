@@ -51,8 +51,8 @@ def _universe_sizes() -> dict[str, int]:
     out = {}
     for kind, (table, col, _) in _UNIVERSE.items():
         try:
-            out[kind] = warehouse.con().execute(
-                f'SELECT COUNT(DISTINCT "{col}") FROM "{table}"').fetchone()[0] or 0
+            out[kind] = warehouse.query(
+                f'SELECT COUNT(DISTINCT "{col}") FROM "{table}"', one=True)[0] or 0
         except Exception:
             out[kind] = 0
     return out
@@ -69,24 +69,23 @@ def measure(table: str, kind: str) -> tuple[int, int, tuple[str, ...]]:
     if not total:
         return (0, 0, ())
     try:
-        cols = {r[0] for r in warehouse.con().execute(
+        cols = {r[0] for r in warehouse.query(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-            [table]).fetchall()}
+            [table])}
     except Exception:
         return (0, 0, ())
     col = next((c for c in candidates if c in cols), None)
     if not col:
         return (0, 0, ())
     try:
-        present = warehouse.con().execute(
-            f'SELECT COUNT(DISTINCT "{col}") FROM "{table}" WHERE "{col}" IS NOT NULL'
-        ).fetchone()[0] or 0
+        present = warehouse.query(
+            f'SELECT COUNT(DISTINCT "{col}") FROM "{table}" WHERE "{col}" IS NOT NULL',
+            one=True)[0] or 0
         # name the missing things, not their codes: "300041" tells a reader nothing
         label = {"hospital": "plant_name", "material": "material_desc"}.get(kind, key)
-        missing = warehouse.con().execute(
+        missing = warehouse.query(
             f'SELECT d."{label}" FROM "{dim}" d WHERE NOT EXISTS '
-            f'(SELECT 1 FROM "{table}" t WHERE t."{col}" = d."{key}") LIMIT 5'
-        ).fetchall()
+            f'(SELECT 1 FROM "{table}" t WHERE t."{col}" = d."{key}") LIMIT 5')
     except Exception:
         return (0, 0, ())
     return (present, total, tuple(str(m[0]) for m in missing if m[0]))

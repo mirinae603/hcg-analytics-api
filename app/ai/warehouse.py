@@ -11,9 +11,11 @@ Governance (why this is safe, unlike exec'ing LLM Python):
 """
 from __future__ import annotations
 import datetime as _dt
+import functools
 import glob
 import os
 import re
+import sys
 import threading
 from decimal import Decimal
 
@@ -23,7 +25,12 @@ _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DIRS = [os.path.join(_HERE, "data", "kpi"), os.path.join(_HERE, "data", "curated")]
 
 _con: duckdb.DuckDBPyConnection | None = None
-_lock = threading.Lock()
+# ONE connection, ONE lock, and every execute+fetch must happen under it. DuckDB keeps a
+# query's result on the connection object, so an unlocked execute() from a second thread
+# silently replaces it and the first thread then reads the OTHER query's rows — no error,
+# just wrong numbers (reproduced: ~700 wrong results in 3,000 with one thread unlocked).
+# Re-entrant because con() takes the lock itself and is called from inside locked blocks.
+_lock = threading.RLock()
 _tables: dict[str, str] = {}   # view name → parquet path
 
 _FORBIDDEN = re.compile(
@@ -100,10 +107,16 @@ def _connect() -> duckdb.DuckDBPyConnection:
 # the view layer, so every consumer (agent SQL, entity picker, deterministic KPI
 # code) sees one correct row per product no matter how the question is phrased,
 # instead of depending on every query remembering to re-aggregate by material.
+#
+# sales_by_material_month was missing from this list, and it is the ONE table that answers
+# "sales trend of <product>". Its '.0' rows (Dec–Mar only, from the .xlsb months) hold
+# ₹29.27 Cr, so filtering material='101313' showed KEYTRUDA at 9.29 Cr in Dec instead of
+# the true 9.68 Cr, and every product's trend looked like it jumped into April.
 _MATERIAL_DUP_VIEWS = {
     "sales_by_material": [],
     "sales_by_material_hospital": ["hospital"],
     "sales_by_material_mfr": ["manufacturer"],
+    "sales_by_material_month": ["period"],
 }
 
 
@@ -432,6 +445,46 @@ def tables() -> list[str]:
     return sorted(_tables.keys())
 
 
+def query(sql: str, params: list | None = None, one: bool = False):
+    """Run a helper query on the shared connection and fetch it under the lock.
+
+    This is for the deterministic checks and lookups (resolve, scope, coverage, the deep
+    checks), not for model SQL — that goes through run_sql with its validation, row cap
+    and timeout. Use this instead of `con().execute(...).fetch*()`: the execute and the
+    fetch must happen under the SAME lock hold, or a query on another thread can swap the
+    result set in between (see _lock)."""
+    c = con()
+    with _lock:
+        cur = c.execute(sql, params or [])
+        return cur.fetchone() if one else cur.fetchall()
+
+
+# Modules whose lru_caches hold facts read from this warehouse (prompt text, the resolver's
+# value index and resolutions, coverage and capability profiles).
+_CACHED_MODULES = ("app.ai.semantics", "app.ai.resolve", "app.ai.scope", "app.ai.coverage",
+                   "app.ai.deep.capability")
+
+
+def reset_caches() -> None:
+    """Forget everything cached from the warehouse.
+
+    The warehouse is a snapshot for the life of the process, so schema_text, grain_text,
+    semantics.context, resolve() and the resolver's index are each built once. Anything
+    that ever changes the data under a live process (a future refresh hook, a test that
+    swaps the data) must call this, or the prompt keeps describing the old tables. Caches
+    refill lazily on next use. It clears caches only: the connection and its materialised
+    marts are not rebuilt."""
+    schema_text.cache_clear()
+    grain_text.cache_clear()
+    for name in _CACHED_MODULES:
+        mod = sys.modules.get(name)   # not imported yet means nothing cached yet
+        if mod is None:
+            continue
+        for obj in list(vars(mod).values()):
+            if callable(getattr(obj, "cache_clear", None)):
+                obj.cache_clear()
+
+
 def _coerce(v):
     if v is None:
         return None
@@ -484,7 +537,9 @@ def _fabricated_dimension(sql: str) -> str | None:
     return ("This query UNIONs the same FROM/WHERE together with hardcoded labels, so every "
             "row would return the identical total under a different name — that is a made-up "
             "breakdown, not a real one. Either GROUP BY a column that actually exists in the "
-            "table, or tell the user plainly that this table has no such breakdown.")
+            "table, or tell the user plainly that this table has no such breakdown. "
+            "(For one product's or one category's monthly SALES, sales_by_material_month has "
+            "a real `period` column — query that instead.)")
 
 
 def validate(sql: str) -> str:
@@ -609,19 +664,24 @@ def _short_type(t: str) -> str:
     return _TYPE_SHORT.get(base, base.lower())
 
 
+@functools.lru_cache(maxsize=1)
 def schema_text() -> str:
     """Compact TYPED schema listing for the agent prompt so it knows exactly what
-    every table holds: `table [N rows]: col:type, col:type, …`."""
+    every table holds: `table [N rows]: col:type, col:type, …`.
+
+    Cached: it is ~100 DESCRIBE/COUNT statements (0.4 s) and the answer cannot change
+    while the process lives. reset_caches() clears it."""
     c = con()
     lines = []
-    for name in tables():
-        try:
-            info = c.execute(f"DESCRIBE {name}").fetchall()
-            n = c.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
-            cols = ", ".join(f"{r[0]}:{_short_type(r[1])}" for r in info)
-            lines.append(f"{name} [{n:,} rows]: {cols}")
-        except Exception:
-            pass
+    with _lock:
+        for name in tables():
+            try:
+                info = c.execute(f"DESCRIBE {name}").fetchall()
+                n = c.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+                cols = ", ".join(f"{r[0]}:{_short_type(r[1])}" for r in info)
+                lines.append(f"{name} [{n:,} rows]: {cols}")
+            except Exception:
+                pass
     return "\n".join(lines)
 
 
@@ -655,15 +715,18 @@ def _classify_col(name: str, dtype: str) -> str:
     return "measure"          # unknown numeric → treat as a measure
 
 
+@functools.lru_cache(maxsize=1)
 def grain_text() -> str:
     """One line per table describing its GRAIN: which dimensions it can be sliced by
     and whether it has a time axis. Derived purely from column names/types — general,
-    no hand-coded per-table rules."""
+    no hand-coded per-table rules. Cached like schema_text (it is asked for twice per
+    answer: once in the prompt, once for the follow-up suggestions)."""
     c = con()
     lines = []
     for name in tables():
         try:
-            info = c.execute(f"DESCRIBE {name}").fetchall()
+            with _lock:
+                info = c.execute(f"DESCRIBE {name}").fetchall()
         except Exception:
             continue
         dims, times = [], []

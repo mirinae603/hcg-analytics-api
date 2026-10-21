@@ -1,0 +1,16 @@
+payer_name,bucket,from_period,to_period,note
+BHARAT HEAVY ELECTRICALS LIMITED (BHEL) - ELECTRONICS DIVISION,GOV,,,not in Payer Master; set by HCG (KR). The master has BHEL itself as GOV
+BHEL,GOV,,,not in Payer Master; set by HCG (Nagpur). The master has BHEL as GOV
+Karnataka Arogya Sanjeevini Scheme,GOV,,,not in Payer Master; set by HCG (Hubli). State scheme
+MADHYA PRADESH POLICE SWASTHYA SURAKSHA,GOV,,,not in Payer Master; set by HCG (Nagpur). State scheme
+CSIR - Central Mechanical Engineering Research Institute,GOV,,,not in Payer Master; set by HCG (Kolkata). Central govt institute
+ICAR - Central Institute Of Cotton Research,GOV,,,not in Payer Master; set by HCG (Nagpur). Central govt institute
+CSIR -Central Glass and ceramic research Institute,GOV,,,not in Payer Master; set by HCG (Kolkata). Central govt institute
+VISVESVARAYA INDUSTRIAL AND TECHNOLOGICAL MUSEUM (VITM),GOV,,,not in Payer Master; set by HCG (KR). Central govt museum
+YSR AROGYASRI,GOV,,,"not a CUSTOMERNAME in Payer Master (only an AGREEMENTNAME of customer AROGYASRI, GOV); set by HCG (Vijayawada). Alias instead of a general agreement-name fallback"
+MD INDIA - RAJYA KARMI SWASTHYA BIMA YOJANA,GOV,,2026-06,not in Payer Master; set by HCG (Ranchi). HCG had GOV in Jun-26
+MD INDIA - RAJYA KARMI SWASTHYA BIMA YOJANA,CASH(TPA),2026-07,,not in Payer Master; set by HCG (Ranchi). HCG changed it to CASH(TPA) from Jul-26; master row 'RAJYA KARMI SWASTHYA BIMA YOJNA (MD INDIA)' is CASH(TPA)
+OIL AND NATURAL GAS CORPORATION (ONGC),GOV,,2026-06,not in Payer Master; set by HCG (KR). HCG had GOV in Jun-26 ('OIL AND NATURAL GAS CORPORATION LTD' is GOV in the master)
+OIL AND NATURAL GAS CORPORATION (ONGC),CASH(TPA),2026-07,,not in Payer Master; set by HCG (KR). HCG changed it to CASH(TPA) from Jul-26
+BESCOM IP AGREEMENT,CASH(TPA),,2026-06,not in Payer Master; set by HCG (DR). HCG had CASH(TPA) in Jun-26
+BESCOM IP AGREEMENT,GOV,2026-07,,not in Payer Master; set by HCG (DR). HCG changed it to GOV from Jul-26

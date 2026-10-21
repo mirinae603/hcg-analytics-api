@@ -274,6 +274,9 @@ def billed_not_internal(sql: str, res: dict) -> str | None:
             f"{qty:,.0f} units (₹{rev / 1e7:,.2f} Cr billed), from {_CONSUMPTION_BILLED}. "
             f"Re-query that table and answer from it. Do NOT report that this item has no "
             f"consumption; say that its consumption is billed rather than internally issued. "
-            f"Note {_CONSUMPTION_BILLED} has no month column, so a month-by-month trend is not "
-            f"available at material grain — say so rather than implying one.")
+            # Not "no trend exists": sales_by_material_month carries the billed qty and
+            # cost per month, and for KEYTRUDA its months sum to the same 2,193 units.
+            f"Note {_CONSUMPTION_BILLED} has no month column; for a month-by-month BILLED "
+            f"trend use sales_by_material_month (SUM(qty), SUM(cost) GROUP BY period) and "
+            f"label it billed-to-patient, not internal issue.")
     return None

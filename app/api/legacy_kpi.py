@@ -16,6 +16,7 @@ import pandas as pd
 
 from app.core import data_access as da
 from app.core import drill_sources as ds
+from app.core import table_query as tq
 
 # Portfolio-overview results are pure functions of the STATIC snapshot parquet, so the
 # output for a given plant never changes until the data is refreshed. We memoize the
@@ -133,10 +134,10 @@ def _monthly(df, measure, label, keep_group=True):
     return out
 
 
-def _table(table, plant, params, colmap, rename):
-    cols = list(rename.keys())
-    return da.paginate(table, _plant(plant), params,
-                       col_map={v: k for k, v in {**colmap}.items()}, columns=cols, rename=rename)
+def _chips(plant, category) -> tuple:
+    """The page filters a table was cut to (echoed with facets=1): every table here is cut to
+    the hospital and the material category before it is aggregated."""
+    return tq.plant_chip(_plant(plant)), tq.category_chip(da.resolve_category(category))
 
 
 # ---------------- STOCK CHANGE (KPI_1) ----------------
@@ -163,12 +164,13 @@ def stock_change(Plant: str = Query(None), Material: str = Query(None),
 
 @router.get("/kpi/stock-change-table")
 def stock_change_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
-    return da.paginate("kpi_stock_change", _plant(Plant), dict(request.query_params), category=Category,
+    return da.paginate("kpi_stock_change", _plant(Plant), request.query_params, category=Category,
         col_map={"year": "year", "period": "month", "materialId": "material",
                  "materialName": "material_desc", "materialGroup": "material_group", "stockChange": "stock_change"},
         columns=["year", "month", "material", "material_desc", "material_group", "stock_change"],
         rename={"year": "year", "month": "period", "material": "materialId",
-                "material_desc": "materialName", "material_group": "materialGroup", "stock_change": "stockChange"})
+                "material_desc": "materialName", "material_group": "materialGroup", "stock_change": "stockChange"},
+        facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category))
 
 
 # ---------------- INVENTORY VALUATION (KPI_2) — snapshot proxy ----------------
@@ -226,9 +228,11 @@ def valuation_insights(Plant: str = Query(None), Category: str = Query(None)):
 def inventory_valuation_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
     df = _pc(da.load("kpi_stock_value"), Plant, Category).copy()
     df["year"] = 2026; df["period"] = "May"
-    return _paginate_df(df, request, ["year", "period", "material", "material_desc", "material_group", "stock_value_cost"],
-        {"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
-         "material_group": "materialGroup", "stock_value_cost": "inventoryValuation"})
+    return da.paginate("kpi_stock_value", None, request.query_params, col_map={}, frame=df,
+        columns=["year", "period", "material", "material_desc", "material_group", "stock_value_cost"],
+        rename={"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
+                "material_group": "materialGroup", "stock_value_cost": "inventoryValuation"},
+        facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category))
 
 
 # ---------------- INVENTORY TURNOVER — velocity insights (A4) ----------------
@@ -383,9 +387,13 @@ def itr_table(request: Request, Plant: str = Query(None), Category: str = Query(
     # additive pattern instead.
     df = _pc(da.health_scoped("both"), Plant, Category).copy()
     df["year"] = 2026; df["period"] = "May"
-    return _paginate_df(df, request, ["year", "period", "material", "material_desc", "material_group", "consumption_cost", "closing_stock_value", "turnover_annualized"],
-        {"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
-         "material_group": "materialGroup", "consumption_cost": "cogs", "closing_stock_value": "averageInventoryValue", "turnover_annualized": "inventoryTurnOverRatio"})
+    return da.paginate("kpi_health_score", None, request.query_params, col_map={}, frame=df,
+        columns=["year", "period", "material", "material_desc", "material_group", "consumption_cost",
+                 "closing_stock_value", "turnover_annualized"],
+        rename={"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
+                "material_group": "materialGroup", "consumption_cost": "cogs",
+                "closing_stock_value": "averageInventoryValue", "turnover_annualized": "inventoryTurnOverRatio"},
+        facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category))
 
 
 # ---------------- RETURN RATE (KPI_4) — no returns => zero proxy ----------------
@@ -403,9 +411,12 @@ def return_rate(Plant: str = Query(None), Material: str = Query(None), MaterialG
 def return_rate_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
     df = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
     df["returned"] = 0; df["rate"] = 0.0
-    return _paginate_df(df, request, ["year", "month", "material", "material_desc", "material_group", "total_units", "returned", "rate"],
-        {"year": "year", "month": "period", "material": "materialId", "material_desc": "materialName",
-         "material_group": "materialGroup", "total_units": "soldUnits", "returned": "returnedUnits", "rate": "returnRate"})
+    return da.paginate("kpi_units_consumed", None, request.query_params, col_map={}, frame=df,
+        columns=["year", "month", "material", "material_desc", "material_group", "total_units", "returned", "rate"],
+        rename={"year": "year", "month": "period", "material": "materialId", "material_desc": "materialName",
+                "material_group": "materialGroup", "total_units": "soldUnits", "returned": "returnedUnits",
+                "rate": "returnRate"},
+        facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category))
 
 
 # ---------------- DAYS OF INVENTORY ON HAND — coverage insights (A3) ----------------
@@ -970,10 +981,14 @@ def inventory_aging(Plant: str = Query(None), Category: str = Query(None)):
 
 @router.get("/kpi/inventory-aging-table")
 def inventory_aging_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
-    return _paginate_df(_pc(da.load("kpi_inventory_aging"), Plant, Category), request,
-        ["material", "material_desc", "age_since_last_sale_days", "age_since_last_purchase_days", "aging_days"],
-        {"material": "materialId", "material_desc": "materialName",
-         "age_since_last_sale_days": "ageSinceLastSale", "age_since_last_purchase_days": "ageSinceLastPurchase", "aging_days": "aging"})
+    return da.paginate("kpi_inventory_aging", None, request.query_params, col_map={},
+        frame=_pc(da.load("kpi_inventory_aging"), Plant, Category),
+        columns=["material", "material_desc", "age_since_last_sale_days", "age_since_last_purchase_days", "aging_days"],
+        rename={"material": "materialId", "material_desc": "materialName",
+                "age_since_last_sale_days": "ageSinceLastSale", "age_since_last_purchase_days": "ageSinceLastPurchase",
+                "aging_days": "aging"},
+        facets=(tq.MATERIAL_GROUP, tq.Facet("aging_category", "Aging (days)", order="label")),
+        scope=_chips(Plant, Category))
 
 
 # ---------------- AGING DISTRIBUTION — category-aware (A7) ----------------
@@ -1501,8 +1516,8 @@ def monthly_purchase_value(Plant: str = Query(None), Material: str = Query(None)
 @router.get("/kpi/monthly-purchase-value-table")
 def monthly_purchase_value_table(request: Request, Plant: str = Query(None),
                                  Category: str = Query(None)):
-    return da.paginate("kpi_monthly_purchase_value", _plant(Plant), dict(request.query_params),
-        category=Category,
+    return da.paginate("kpi_monthly_purchase_value", _plant(Plant), request.query_params,
+        category=Category, facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category),
         col_map={"year": "year", "period": "month", "materialId": "material", "materialName": "material_desc",
                  "materialGroup": "material_group", "monthlyPurchaseValue": "monthly_purchase_value"},
         columns=["year", "month", "material", "material_desc", "material_group", "monthly_purchase_value"],
@@ -1604,12 +1619,13 @@ def vendor_margin(Plant: str = Query(None), Category: str = Query(None)):
 
 @router.get("/kpi/vendor-volume-vs-margin-table")
 def vendor_margin_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
-    g = _vendor_margin(Plant, Category)
-    return _paginate_df(g, request,
-        ["year", "month", "vendor_name", "grn_volume", "unit_cost", "unit_mrp", "margin", "clean_n", "is_stable"],
-        {"year": "year", "month": "period", "vendor_name": "vendorName", "grn_volume": "grnVolume",
-         "unit_cost": "averageUnitCost", "unit_mrp": "sellingPrice", "margin": "margin",
-         "clean_n": "sampleSize", "is_stable": "isStable"})
+    return da.paginate("fact_grn", None, request.query_params, col_map={}, frame=_vendor_margin(Plant, Category),
+        columns=["year", "month", "vendor_name", "grn_volume", "unit_cost", "unit_mrp", "margin", "clean_n", "is_stable"],
+        rename={"year": "year", "month": "period", "vendor_name": "vendorName", "grn_volume": "grnVolume",
+                "unit_cost": "averageUnitCost", "unit_mrp": "sellingPrice", "margin": "margin",
+                "clean_n": "sampleSize", "is_stable": "isStable"},
+        facets=(tq.VENDOR, tq.Facet("is_stable", "Stable (n≥5)", value_label=tq.yes_no)),
+        scope=_chips(Plant, Category))
 
 
 # ---------------- UNITS CONSUMED (KPI_8) ----------------
@@ -1622,7 +1638,8 @@ def units_sold(Plant: str = Query(None), Material: str = Query(None), MaterialGr
 
 @router.get("/kpi/unit-sold-per-sku-table")
 def units_sold_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
-    return da.paginate("kpi_units_consumed", _plant(Plant), dict(request.query_params), category=Category,
+    return da.paginate("kpi_units_consumed", _plant(Plant), request.query_params, category=Category,
+        facets=(tq.MATERIAL_GROUP,), scope=_chips(Plant, Category),
         col_map={"year": "year", "period": "month", "materialId": "material", "materialName": "material_desc",
                  "materialGroup": "material_group", "totalUnitsSold": "total_units"},
         columns=["year", "month", "material", "material_desc", "material_group", "total_units"],
@@ -1646,8 +1663,11 @@ def revenue_distribution_table(request: Request, Plant: str = Query(None), Categ
     df = _pc(da.load("kpi_units_consumed"), Plant, Category).copy()
     g = df.groupby(["year", "month"], as_index=False, observed=True)["consumption_cost"].sum()
     g["op"] = 0.0; g["ip"] = 0.0
-    return _paginate_df(g, request, ["year", "month", "op", "ip", "consumption_cost"],
-        {"year": "year", "month": "period", "op": "opSales", "ip": "ipIssue", "consumption_cost": "internalConsumption"})
+    return da.paginate("kpi_units_consumed", None, request.query_params, col_map={}, frame=g,
+        columns=["year", "month", "op", "ip", "consumption_cost"],
+        rename={"year": "year", "month": "period", "op": "opSales", "ip": "ipIssue",
+                "consumption_cost": "internalConsumption"},
+        scope=_chips(Plant, Category))
 
 
 # ---------------- REVENUE PER STORAGE LOCATION — proxy ----------------
@@ -2684,17 +2704,3 @@ def _num(v):
         return int(v) if pd.notna(v) else None
     except Exception:
         return None
-
-
-def _paginate_df(df: pd.DataFrame, request: Request, columns, rename):
-    """Paginate an in-memory df (filter protocol + sort + page) -> {data,total}."""
-    params = dict(request.query_params)
-    df = da._apply_filter_protocol(df.copy(), params, {v: k for k, v in rename.items()})
-    total = len(df)
-    sf = params.get("sort_field"); so = (params.get("sort_order") or "asc").lower()
-    src = {v: k for k, v in rename.items()}.get(sf, sf)
-    if src and src in df.columns:
-        df = df.sort_values(src, ascending=(so != "desc"), kind="mergesort", na_position="last")
-    page = int(params.get("page", 0) or 0); size = int(params.get("page_size", 25) or 25)
-    page_df = df.iloc[page * size: page * size + size][[c for c in columns if c in df.columns]].rename(columns=rename)
-    return {"data": da._clean_records(page_df), "total": int(total)}

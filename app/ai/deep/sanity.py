@@ -40,9 +40,9 @@ _TOLERANCE = 1.005          # a part may equal the whole; 0.5% absorbs float dri
 
 def _columns(table: str) -> set[str]:
     try:
-        rows = warehouse.con().execute(
+        rows = warehouse.query(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-            [table]).fetchall()
+            [table])
     except Exception:
         return set()
     return {str(r[0]).lower() for r in rows}
@@ -80,8 +80,8 @@ def part_exceeds_whole(sql: str, res: dict) -> str | None:
         if c not in cols:
             continue                      # not this table's own column
         try:
-            total = warehouse.con().execute(
-                f'SELECT SUM("{c}") FROM "{table_name}"').fetchone()[0]
+            total = warehouse.query(
+                f'SELECT SUM("{c}") FROM "{table_name}"', one=True)[0]
         except Exception:
             continue
         if total is None or total <= 0:

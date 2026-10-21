@@ -18,8 +18,8 @@ from app.core.config import settings
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Creates tables on first boot and migrates app/data/users.json (re-seeding
-    # admin@hcg.com fresh with a bcrypt hash of "admin123"). Idempotent — safe on
-    # every restart. Deliberately NOT run at import time so importing `app` (e.g. in
+    # admin@hcg.com fresh with a bcrypt hash of settings.SEED_ADMIN_PASSWORD).
+    # Idempotent — safe on every restart. Deliberately NOT run at import time so importing `app` (e.g. in
     # tests, which override the DB dependency with an isolated test DB) never touches
     # the real on-disk app.db as a side effect — it only runs when the app's lifespan
     # actually starts (a real uvicorn boot, or `with TestClient(app) as c:`).
@@ -30,10 +30,13 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
+# Only the dashboard's own origins may call the API from a browser. The frontend sends a
+# bearer token in a header, never a cookie, so credentialed CORS is not needed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()],
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX or None,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

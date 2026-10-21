@@ -1,0 +1,543 @@
+{
+ "built_at": "2026-10-12T18:27:49+00:00",
+ "generator": "python -m app.etl.spend",
+ "periods": [
+  "2026-06",
+  "2026-07",
+  "2026-08"
+ ],
+ "latest": "2026-08",
+ "rules": {
+  "scheme_patient": "payer bucket GOV (the formulary build's payer rules), IP and OP",
+  "switch": "the line's material has a suggested brand in HCG's SCHEME list",
+  "values": "qty x FY price-list price (HCG Pharma selling price excl GST) of the used brand and of the suggested brand; saving missed = used - suggested; % = saving missed / used",
+  "attis": "the suggested brand is an Attis brand ('Attis Brand' in the list)",
+  "attis_consumption": "every line whose HIS manufacturer is ATTIS ..., every payer",
+  "healthium": "SCHEME rows whose CATEGORY is SUTURES or Endo (HCG's J&J & Covidien vs Healthium line)",
+  "cash_patient": "payer bucket CASH or CASH(TPA), IP and OP",
+  "cash_excluded": "brands in cash_tpa_excluded.csv are not counted (they still count in molecule groups)",
+  "cash_qty": "cash/TPA qty; for a bifurcated brand only the excess over SHARING x the molecule group's all-payer qty at that hospital in that month, never below 0, shared across its rows in proportion to their qty",
+  "cash_values": "unit margin = MRP / (1 + GST%) - HCG Pharma price, FY list, for the used and the suggested brand; actual margin = qty x used margin, potential = qty x suggested margin, loss = potential - actual; % = loss / potential",
+  "oof_patient": "payer bucket CASH or CASH(TPA), IP and OP, material flagged OUT OF FORMULARY in that month's Item Master",
+  "oof_match": "a brand of the CASH&TPA sheet with an FY price, MRP and GST, flagged FORMULARY in that month's Item Master, with the same Minor Group (molecule), strength, dosage form and kind (modified release, liposomal, protein-bound), and an MRP within 10x of the OOF brand's MRP per unit on the bills; of several, the highest unit margin. Derived by the build until HCG sends its own list",
+  "oof_values": "actual margin = bill MRP / (1 + the matched brand's GST%) - bill cost; potential = qty x (matched MRP / (1 + GST%) - matched HCG Pharma price); loss = potential - actual; % = loss / potential; unmatched brands add no margin"
+ },
+ "scheme_list": {
+  "file": "Copy of Onco Formulary ,Non Onco Formulary and Consumbales Complaince  2026-27 -Spend Analysis Main Sheet_11.08.26.xlsx",
+  "sheet": "SCHEME",
+  "financial_year": "2026-27",
+  "brand_rows": 3908,
+  "switches": 1073,
+  "attis_switches": 26,
+  "attis_brands": 18,
+  "healthium_switches": 128,
+  "skipped": [
+   {
+    "material": "101753",
+    "material_desc": "NABCURE 100MG INJ VIAL",
+    "suggested": "102755",
+    "reason": "no price-list price for the suggested brand"
+   },
+   {
+    "material": "305089",
+    "material_desc": "MONOCRYL 4-0(NW1748)-J&J",
+    "suggested": "334386",
+    "reason": "no price-list price for the suggested brand"
+   }
+  ]
+ },
+ "cash_list": {
+  "file": "Copy of Onco Formulary ,Non Onco Formulary and Consumbales Complaince  2026-27 -Spend Analysis Main Sheet_11.08.26.xlsx",
+  "sheet": "CASH&TPA",
+  "financial_year": "2026-27",
+  "brand_rows": 3778,
+  "switches": 552,
+  "skipped": [],
+  "excluded": {
+   "file": "cash_tpa_excluded.csv",
+   "brands": [
+    "100285",
+    "101133",
+    "101134",
+    "102662",
+    "102954",
+    "204436",
+    "205691",
+    "206390",
+    "213069",
+    "219685"
+   ],
+   "not_in_cash_list": [],
+   "source": "brands HCG's KR Aug-26 report leaves out; HCG to confirm"
+  },
+  "bifurcation": {
+   "file": "cash_tpa_bifurcation.csv",
+   "brands": 41,
+   "not_in_cash_list": [],
+   "source": "seeded from HCG KR Aug-26 Spend Analysis; HCG to send the full rules"
+  }
+ },
+ "months": {
+  "2026-06": {
+   "period": "2026-06",
+   "label": "Jun-26",
+   "source_file": "IP&OP Consoildated File June 26 Updated Final File .xlsb",
+   "item_master": "ITEM MASTER FOR FORMULARY COMPLIENCE JUne-26.xlsx",
+   "lines": 839936,
+   "gov": {
+    "lines": 350853,
+    "cost": 201981837.06,
+    "qty": 1431840.0
+   },
+   "scheme": {
+    "used_value": 16798304.97,
+    "suggested_value": 10633461.8,
+    "saving_missed": 6164843.16,
+    "saving_pct": 36.6992,
+    "qty": 301329.0,
+    "lines": 74566,
+    "materials": 722
+   },
+   "attis": {
+    "used_value": 577552.61,
+    "suggested_value": 319900.77,
+    "saving_missed": 257651.84,
+    "saving_pct": 44.611,
+    "qty": 1086.0,
+    "lines": 495,
+    "materials": 25
+   },
+   "healthium": {
+    "used_value": 1718312.34,
+    "suggested_value": 677799.85,
+    "saving_missed": 1040512.49,
+    "saving_pct": 60.5543,
+    "qty": 2317.0,
+    "lines": 1597,
+    "materials": 88
+   },
+   "cash": {
+    "actual_margin": 32636494.66,
+    "potential_margin": 56259693.24,
+    "margin_loss": 23623198.57,
+    "loss_pct": 41.9896,
+    "used_mrp_value": 66563405.43,
+    "suggested_mrp_value": 89717993.97,
+    "topline_increase": 23154588.54,
+    "qty": 310897.5,
+    "cash_qty": 319436.0,
+    "lines": 95684,
+    "materials": 430
+   },
+   "bifurcation": {
+    "brands": 40,
+    "cash_qty": 35815.0,
+    "allowed_qty": 9966.3,
+    "counted_qty": 27276.5
+   },
+   "oof": {
+    "actual_margin": 2909699.44,
+    "potential_margin": 5598953.04,
+    "margin_loss": 2689253.6,
+    "loss_pct": 48.0314,
+    "used_mrp_value": 8179972.82,
+    "suggested_mrp_value": 10650010.51,
+    "topline_increase": 2470037.69,
+    "qty": 274965.0,
+    "cash_qty": 274965.0,
+    "lines": 13474,
+    "materials": 906,
+    "brands": 1316,
+    "matched_brands": 906,
+    "bill_cost": 7296550.82,
+    "matched_cost": 5270273.38,
+    "matched_cost_pct": 72.2297
+   },
+   "kr": {
+    "scheme": {
+     "used_value": 1280205.91,
+     "suggested_value": 764909.47,
+     "saving_missed": 515296.44,
+     "saving_pct": 40.2511,
+     "qty": 7463.0,
+     "lines": 2769,
+     "materials": 178
+    },
+    "attis": {
+     "used_value": 81284.71,
+     "suggested_value": 39346.55,
+     "saving_missed": 41938.16,
+     "saving_pct": 51.5942,
+     "qty": 163.0,
+     "lines": 48,
+     "materials": 14
+    },
+    "healthium": {
+     "used_value": 146431.95,
+     "suggested_value": 67576.12,
+     "saving_missed": 78855.84,
+     "saving_pct": 53.8515,
+     "qty": 94.0,
+     "lines": 49,
+     "materials": 26
+    },
+    "cash": {
+     "actual_margin": 10479026.54,
+     "potential_margin": 17790521.46,
+     "margin_loss": 7311494.92,
+     "loss_pct": 41.0977,
+     "used_mrp_value": 21654709.03,
+     "suggested_mrp_value": 29207880.63,
+     "topline_increase": 7553171.6,
+     "qty": 67170.4,
+     "cash_qty": 68073.0,
+     "lines": 28125,
+     "materials": 163
+    },
+    "oof": {
+     "actual_margin": 171794.63,
+     "potential_margin": 716468.72,
+     "margin_loss": 544674.09,
+     "loss_pct": 76.022,
+     "used_mrp_value": 1158256.87,
+     "suggested_mrp_value": 1435116.29,
+     "topline_increase": 276859.42,
+     "qty": 2848.0,
+     "cash_qty": 2848.0,
+     "lines": 693,
+     "materials": 45,
+     "brands": 55,
+     "matched_brands": 45,
+     "bill_cost": 1020015.16,
+     "matched_cost": 986462.24,
+     "matched_cost_pct": 96.7105
+    }
+   },
+   "attis_consumption": {
+    "lines": 6173,
+    "cost": 8672663.21,
+    "materials": 27
+   },
+   "warnings": []
+  },
+  "2026-07": {
+   "period": "2026-07",
+   "label": "Jul-26",
+   "source_file": "IP and OP Sales Consolidated file July 2026.xlsb",
+   "item_master": "Copy of item master for formulary complience July 2026.xlsb",
+   "lines": 880441,
+   "gov": {
+    "lines": 364000,
+    "cost": 212173553.39,
+    "qty": 1486131.0
+   },
+   "scheme": {
+    "used_value": 18461606.77,
+    "suggested_value": 11638438.06,
+    "saving_missed": 6823168.71,
+    "saving_pct": 36.9587,
+    "qty": 303207.0,
+    "lines": 74612,
+    "materials": 702
+   },
+   "attis": {
+    "used_value": 595087.8,
+    "suggested_value": 352958.04,
+    "saving_missed": 242129.76,
+    "saving_pct": 40.6881,
+    "qty": 1068.0,
+    "lines": 519,
+    "materials": 25
+   },
+   "healthium": {
+    "used_value": 1479229.36,
+    "suggested_value": 576421.03,
+    "saving_missed": 902808.34,
+    "saving_pct": 61.0323,
+    "qty": 2028.0,
+    "lines": 1448,
+    "materials": 85
+   },
+   "cash": {
+    "actual_margin": 34852141.87,
+    "potential_margin": 60842056.66,
+    "margin_loss": 25989914.79,
+    "loss_pct": 42.717,
+    "used_mrp_value": 72077179.07,
+    "suggested_mrp_value": 95377088.51,
+    "topline_increase": 23299909.43,
+    "qty": 330372.0,
+    "cash_qty": 340688.0,
+    "lines": 101561,
+    "materials": 431
+   },
+   "bifurcation": {
+    "brands": 41,
+    "cash_qty": 46014.0,
+    "allowed_qty": 11463.9,
+    "counted_qty": 35698.0
+   },
+   "oof": {
+    "actual_margin": 3661150.61,
+    "potential_margin": 6178305.08,
+    "margin_loss": 2517154.47,
+    "loss_pct": 40.7418,
+    "used_mrp_value": 9739931.02,
+    "suggested_mrp_value": 12124236.32,
+    "topline_increase": 2384305.3,
+    "qty": 265992.0,
+    "cash_qty": 265992.0,
+    "lines": 13648,
+    "materials": 903,
+    "brands": 1309,
+    "matched_brands": 903,
+    "bill_cost": 8174437.68,
+    "matched_cost": 6078780.41,
+    "matched_cost_pct": 74.3633
+   },
+   "kr": {
+    "scheme": {
+     "used_value": 1516047.91,
+     "suggested_value": 953651.24,
+     "saving_missed": 562396.67,
+     "saving_pct": 37.0962,
+     "qty": 8290.0,
+     "lines": 3079,
+     "materials": 174
+    },
+    "attis": {
+     "used_value": 61143.59,
+     "suggested_value": 29393.74,
+     "saving_missed": 31749.85,
+     "saving_pct": 51.9267,
+     "qty": 91.0,
+     "lines": 29,
+     "materials": 12
+    },
+    "healthium": {
+     "used_value": 232278.43,
+     "suggested_value": 111385.19,
+     "saving_missed": 120893.24,
+     "saving_pct": 52.0467,
+     "qty": 103.0,
+     "lines": 59,
+     "materials": 25
+    },
+    "cash": {
+     "actual_margin": 10378181.19,
+     "potential_margin": 17951008.66,
+     "margin_loss": 7572827.47,
+     "loss_pct": 42.1861,
+     "used_mrp_value": 22002769.58,
+     "suggested_mrp_value": 29897352.98,
+     "topline_increase": 7894583.41,
+     "qty": 60716.7,
+     "cash_qty": 62586.0,
+     "lines": 27202,
+     "materials": 162
+    },
+    "oof": {
+     "actual_margin": 133578.94,
+     "potential_margin": 721025.74,
+     "margin_loss": 587446.8,
+     "loss_pct": 81.4738,
+     "used_mrp_value": 979475.9,
+     "suggested_mrp_value": 1323683.76,
+     "topline_increase": 344207.85,
+     "qty": 2388.0,
+     "cash_qty": 2388.0,
+     "lines": 798,
+     "materials": 51,
+     "brands": 59,
+     "matched_brands": 51,
+     "bill_cost": 948202.44,
+     "matched_cost": 845896.96,
+     "matched_cost_pct": 89.2106
+    }
+   },
+   "attis_consumption": {
+    "lines": 6078,
+    "cost": 8637173.86,
+    "materials": 26
+   },
+   "warnings": []
+  },
+  "2026-08": {
+   "period": "2026-08",
+   "label": "Aug-26",
+   "source_file": "IP & OP Consolidated File August 26.xlsx",
+   "item_master": "Copy of Item master for formulary complience August -26_Updated.xlsx",
+   "lines": 875717,
+   "gov": {
+    "lines": 358054,
+    "cost": 208032218.9,
+    "qty": 1453142.0
+   },
+   "scheme": {
+    "used_value": 16674781.21,
+    "suggested_value": 10577272.07,
+    "saving_missed": 6097509.14,
+    "saving_pct": 36.5673,
+    "qty": 286433.0,
+    "lines": 71811,
+    "materials": 703
+   },
+   "attis": {
+    "used_value": 504489.17,
+    "suggested_value": 318349.65,
+    "saving_missed": 186139.52,
+    "saving_pct": 36.8966,
+    "qty": 897.0,
+    "lines": 434,
+    "materials": 25
+   },
+   "healthium": {
+    "used_value": 1476059.74,
+    "suggested_value": 598212.71,
+    "saving_missed": 877847.04,
+    "saving_pct": 59.4723,
+    "qty": 2120.0,
+    "lines": 1501,
+    "materials": 86
+   },
+   "cash": {
+    "actual_margin": 33465127.48,
+    "potential_margin": 58263188.51,
+    "margin_loss": 24798061.02,
+    "loss_pct": 42.5621,
+    "used_mrp_value": 67759565.98,
+    "suggested_mrp_value": 90786286.72,
+    "topline_increase": 23026720.74,
+    "qty": 322084.6,
+    "cash_qty": 332268.0,
+    "lines": 102687,
+    "materials": 446
+   },
+   "bifurcation": {
+    "brands": 41,
+    "cash_qty": 45065.0,
+    "allowed_qty": 11770.9,
+    "counted_qty": 34881.6
+   },
+   "oof": {
+    "actual_margin": 4241714.02,
+    "potential_margin": 7526180.67,
+    "margin_loss": 3284466.65,
+    "loss_pct": 43.6406,
+    "used_mrp_value": 10782441.3,
+    "suggested_mrp_value": 13371415.56,
+    "topline_increase": 2588974.26,
+    "qty": 266080.0,
+    "cash_qty": 266080.0,
+    "lines": 15913,
+    "materials": 1006,
+    "brands": 1468,
+    "matched_brands": 1006,
+    "bill_cost": 8759114.96,
+    "matched_cost": 6540727.28,
+    "matched_cost_pct": 74.6734
+   },
+   "kr": {
+    "scheme": {
+     "used_value": 999434.25,
+     "suggested_value": 634103.24,
+     "saving_missed": 365331.0,
+     "saving_pct": 36.5538,
+     "qty": 6991.0,
+     "lines": 2630,
+     "materials": 164
+    },
+    "attis": {
+     "used_value": 59689.63,
+     "suggested_value": 28659.61,
+     "saving_missed": 31030.01,
+     "saving_pct": 51.9856,
+     "qty": 84.0,
+     "lines": 28,
+     "materials": 12
+    },
+    "healthium": {
+     "used_value": 79074.59,
+     "suggested_value": 30611.27,
+     "saving_missed": 48463.32,
+     "saving_pct": 61.2881,
+     "qty": 73.0,
+     "lines": 49,
+     "materials": 22
+    },
+    "cash": {
+     "actual_margin": 10446684.32,
+     "potential_margin": 18255008.42,
+     "margin_loss": 7808324.11,
+     "loss_pct": 42.7736,
+     "used_mrp_value": 21511386.61,
+     "suggested_mrp_value": 29358412.45,
+     "topline_increase": 7847025.84,
+     "qty": 66404.4,
+     "cash_qty": 68417.0,
+     "lines": 29076,
+     "materials": 163
+    },
+    "oof": {
+     "actual_margin": 383274.95,
+     "potential_margin": 1438065.29,
+     "margin_loss": 1054790.34,
+     "loss_pct": 73.3479,
+     "used_mrp_value": 1930994.08,
+     "suggested_mrp_value": 2219395.75,
+     "topline_increase": 288401.67,
+     "qty": 3864.0,
+     "cash_qty": 3864.0,
+     "lines": 1558,
+     "materials": 70,
+     "brands": 83,
+     "matched_brands": 70,
+     "bill_cost": 1572965.83,
+     "matched_cost": 1547719.13,
+     "matched_cost_pct": 98.395
+    }
+   },
+   "attis_consumption": {
+    "lines": 5654,
+    "cost": 8054135.15,
+    "materials": 26
+   },
+   "warnings": []
+  }
+ },
+ "brand_blocks": {
+  "sheet": "CASH&TPA",
+  "brands": 3774,
+  "blocks": 2659,
+  "multi_brand_blocks": 886,
+  "blocks_with_tied_p1": 75,
+  "blocks_not_summing_to_1": 9,
+  "rule": "P1 = the highest '2026-27 SHARING' in a block of interchangeable brands (proposed, until HCG confirms or sends its Brand Priority Master)"
+ },
+ "tables": {
+  "brand_blocks": {
+   "rows": 3774,
+   "kb": 103.0
+  },
+  "scheme_switch": {
+   "rows": 25249,
+   "kb": 522.9
+  },
+  "attis_consumption": {
+   "rows": 1290,
+   "kb": 24.3
+  },
+  "cash_switch": {
+   "rows": 55248,
+   "kb": 1747.9
+  },
+  "cash_allowance": {
+   "rows": 936,
+   "kb": 17.5
+  },
+  "oof_switch": {
+   "rows": 19532,
+   "kb": 826.5
+  }
+ }
+}

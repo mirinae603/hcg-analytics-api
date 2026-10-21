@@ -8,6 +8,10 @@
 # stand-in. TestClient is used WITHOUT the `with` context manager on purpose: that
 # skips FastAPI's startup event (verified empirically), so importing/exercising the
 # app in tests never touches the real on-disk DB as a side effect.
+#
+# Every data route needs a login (app/api/api_router.py), so `client` carries the seeded
+# admin's bearer token by default; a per-request `headers=` still overrides it. Use
+# `anon_client` (same DB, no token) to test what an unauthenticated caller gets.
 from __future__ import annotations
 
 import sys
@@ -20,12 +24,15 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core.config import settings  # noqa: E402
 from app.core.database import Base, get_db  # noqa: E402
+from app.core.jwt_auth import create_access_token  # noqa: E402
 from app.core.seed import _ensure_seed_admin  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models import User  # noqa: E402
 
 ADMIN_EMAIL = "admin@hcg.com"
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = settings.SEED_ADMIN_PASSWORD
 
 
 @pytest.fixture()
@@ -39,7 +46,7 @@ def db_session_factory(tmp_path):
 
 
 @pytest.fixture()
-def client(db_session_factory):
+def anon_client(db_session_factory):
     def _override_get_db():
         db = db_session_factory()
         try:
@@ -59,6 +66,20 @@ def client(db_session_factory):
     yield test_client
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def client(anon_client, db_session_factory):
+    # A separate TestClient: default headers are per instance, so anon_client stays
+    # anonymous. The token is minted directly rather than via /signin, which would add a
+    # bcrypt check to each of the ~140 tests that use this fixture.
+    db = db_session_factory()
+    try:
+        admin = db.query(User).filter(User.email == ADMIN_EMAIL).first()
+        token = create_access_token(admin)
+    finally:
+        db.close()
+    return TestClient(app, headers=bearer(token))
 
 
 @pytest.fixture()

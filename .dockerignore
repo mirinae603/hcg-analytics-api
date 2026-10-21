@@ -25,3 +25,19 @@ app/data/*.db-journal
 app/data/*.sqlite
 app/data/*.sqlite3
 app/data/users.json
+
+# Raw HCG client data and line-level caches — patient-level pharmacy sales. `COPY . .`
+# would bake them into the image (master/ alone is 2.3 GB). Root-only patterns do not
+# match copies inside .claude/worktrees/<wt>/, so each rule also has a **/ form, and the
+# worktrees themselves (each with its own .venv and caches) are excluded outright.
+master/
+**/master/
+.cache/
+**/.cache/
+.claude/
+*.xlsx
+**/*.xlsx
+*.xlsb
+**/*.xlsb
+*.docx
+**/*.docx

@@ -6,6 +6,7 @@ daysOnHand / inventoryTurnover). Region that isn't a known plant code => all pla
 """
 from __future__ import annotations
 
+import sys
 from fastapi import APIRouter, Header, HTTPException, Query
 from typing import Optional
 import numpy as np
@@ -197,10 +198,22 @@ def refresh_data(x_admin_token: Optional[str] = Header(None)):
     # Also drop the memoized portfolio-overview / summary results so they recompute
     # against the refreshed data (otherwise they'd serve the previous snapshot).
     try:
-        from app.api import legacy_kpi, kpi_generic
+        from app.api import legacy_kpi, kpi_generic, formulary, spend
         legacy_kpi.clear_result_caches()
         kpi_generic._portfolio_summary_cached.cache_clear()
         kpi_generic.clear_kpi_caches()
+        formulary.clear_caches()
+        spend.clear_caches()
     except Exception:
         pass
+    # The AI's prompt text (schema, grain, semantics context, resolve() answers) is cached
+    # for the process too. Clear it only if the AI side is already loaded: importing it here
+    # would open the warehouse on a plain data refresh, and a module never imported has
+    # nothing cached.
+    wh = sys.modules.get("app.ai.warehouse")
+    if wh is not None:
+        try:
+            wh.reset_caches()
+        except Exception:
+            pass
     return {"status": "cache cleared"}

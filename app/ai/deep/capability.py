@@ -316,7 +316,30 @@ def grain_notes(max_tables: int = 18) -> list[str]:
 
 # Words that unambiguously name a canonical metric. Deliberately narrow: a wrong KPI is
 # worse than none, so only phrases that can only mean one metric appear here.
+#
+# ORDER MATTERS: the first key whose phrase appears wins. The Jun–Aug 2026 report keys come
+# first because their phrases are the more specific ones — "overall margin loss for cash
+# patients" contains revenue-margin's "overall margin", and was routed to Dec–May revenue.
+# They never trigger on a bare "formulary", "non-formulary", "cash" or "margin": "what share
+# of sales revenue is non-formulary" is a Dec–May SALES question answered from
+# dim_material.formulary_status (eval l4-nonformulary-share), and a cost-based Jun–Aug
+# compliance figure would take the headline from it. Nor on a bare "compliance %" or
+# "margin loss": "what is the vendor compliance %?" and "which drugs show a margin loss?"
+# are not those reports, and a canonical figure would answer them with full authority. The
+# report needs its own name, or the cash/TPA wording that only it carries.
 _KPI_TRIGGERS: list[tuple[str, tuple[str, ...]]] = [
+    ("formulary-compliance", ("formulary compliance", "formulary-compliance",
+                              "compliance with the formulary", "compliance with formulary",
+                              "compliance to the formulary", "compliance to formulary",
+                              "out-of-formulary spend", "out of formulary spend")),
+    ("brand-rules", ("brand rule", "restricted brand", "preferred brand", "restricted for scheme")),
+    ("attis-saving", ("attis",)),
+    ("scheme-brand-saving", ("scheme brand", "scheme saving", "healthium")),
+    ("cash-tpa-margin-loss", ("cash & tpa", "cash and tpa", "cash/tpa", "tpa margin",
+                              "cash margin loss", "margin loss for cash", "margin losses for cash",
+                              "margin loss on cash", "margin losses on cash",
+                              "cash patients' margin", "cash patients’ margin",
+                              "cash patients margin", "cash patient margin")),
     ("near-expiry", ("expiring", "near expiry", "near-expiry", "about to expire", "expire soon",
                      "expired", "expiry risk")),
     ("non-moving-inventory", ("non-moving", "non moving", "slow moving", "slow-moving", "dead stock",
@@ -341,6 +364,31 @@ _KPI_TRIGGERS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+def _phrase(p: str) -> re.Pattern:
+    """A trigger phrase as a whole word or words, allowing the ordinary endings.
+
+    Substring matching made "aging" fire on "managing". The phrase must start at a word
+    boundary and may end in s/es/ed/ing ("brand rules", "margin losses", "reordering"), but
+    not run on into another word.
+    """
+    return re.compile(r"(?<![a-z0-9])" + re.escape(p) + r"(?:s|es|ed|ing)?(?![a-z0-9])")
+
+
+_KPI_PATTERNS: list[tuple[str, tuple[re.Pattern, ...]]] = [
+    (key, tuple(_phrase(t) for t in triggers)) for key, triggers in _KPI_TRIGGERS]
+
+_SALES_WORDS = re.compile(r"\b(revenue|sales|sold|selling)\b", re.I)
+# "What's our overall margin loss?" holds revenue-margin's "overall margin". That KPI is the
+# Dec–May margin EARNED, and quoting it as a loss answers a different question; a margin-loss
+# question with no cash/TPA wording gets no canonical figure at all.
+_MARGIN_LOSS = _phrase("margin loss")
+
+
+def mentions_sales(question: str) -> bool:
+    """True when the question is about SALES revenue — never a Jun–Aug report question."""
+    return bool(_SALES_WORDS.search(question or ""))
+
+
 def kpi_for(question: str) -> str:
     """Pick the canonical metric deterministically, where the wording is unambiguous.
 
@@ -351,9 +399,52 @@ def kpi_for(question: str) -> str:
     not a judgement call.
     """
     q = (question or "").lower()
-    for key, triggers in _KPI_TRIGGERS:
-        if any(t in q for t in triggers):
+    registry = None
+    for key, pats in _KPI_PATTERNS:
+        if not any(p.search(q) for p in pats):
+            continue
+        if key == "revenue-margin" and _MARGIN_LOSS.search(q):
+            continue
+        if registry is None:
             from app.ai import kpi_registry
-            if key in kpi_registry.KPI_REGISTRY:
-                return key
+            registry = kpi_registry.KPI_REGISTRY
+        entry = registry.get(key)
+        if not entry:
+            continue
+        # A report key (one that needs the formulary/spend data) is never the answer to a
+        # question about revenue or sales: those live in the Dec–May sales tables.
+        if entry.get("needs") and mentions_sales(q):
+            continue
+        return key
     return ""
+
+
+# What makes a Jun–Aug report question need ARGUMENTS. Called with none, a report answers for
+# the latest month and every hospital — right for "what is our formulary compliance?", wrong
+# for "compliance at HCG KR in July", which canonical-first would answer for August, network.
+_REPORT_SCOPE = re.compile(
+    r"\b(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sept?(ember)?|"
+    r"oct(ober)?|nov(ember)?|dec(ember)?)\b|\b20\d\d-\d\d\b|\bmonths?\b|\bmonthly\b|"
+    r"\bquarter|\btrend|\bover time\b|\bhospitals?\b|\bsites?\b|\bcent(re|er)s?\b|"
+    r"\bbranch(es)?\b|\bdoctors?\b|\bdr\.?\s|\bconsultants?\b|\bphysicians?\b|"
+    r"\b(ip|op|in-?patients?|out-?patients?)\b|\bonco(logy)?\b|\bnon-onco\b|\bconsumables\b",
+    re.I)
+_PLANT_CODE = re.compile(r"\b[A-Z]{2}\d{2}\b")
+
+
+def names_report_scope(question: str) -> bool:
+    """True when the question names a month, a hospital, a doctor, a patient/segment cut or a
+    product — anything a report has to be TOLD, because called bare it covers everything."""
+    q = question or ""
+    if _REPORT_SCOPE.search(q) or _PLANT_CODE.search(q):
+        return True
+    try:
+        from app.ai import resolve
+        r = resolve.resolve(q)
+    except Exception:
+        return False
+    kinds = {e.get("kind") for e in r.get("entities") or []}
+    one_product = any(f.get("kind") in ("material", "generic") and f.get("n", 99) <= 5
+                      for f in r.get("families") or [])
+    return bool(r.get("cities") or "hospital" in kinds or kinds & {"material", "generic"}
+                or one_product)

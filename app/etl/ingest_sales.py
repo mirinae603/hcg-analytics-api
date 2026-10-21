@@ -14,9 +14,13 @@ accumulate aggregates the dashboards need:
   sales_totals.parquet         patient → revenue, cost, qty, lines
 
 Revenue = TOTALMRP (billed), Cost = TOTALCOSTPRICE, Margin = revenue − cost (real).
+
+Run from the repo root, pointing SALES_RAW at the folder that holds "IP Sales" and
+"OP Sales" (see RUNBOOK_HCG.md):
+    SALES_RAW=/path/to/folder python -m app.etl.ingest_sales
 """
 from __future__ import annotations
-import os, glob
+import os, glob, re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -28,8 +32,14 @@ try:
 except Exception:
     open_xlsb = None
 
+from app.core.config import settings
+# One rule for material codes across the ETLs (the formulary and spend builds use it too).
+from app.etl.formulary.classify import norm_code
+
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # backend root
-RAW = os.environ.get("SALES_RAW", "/Users/shivanshdarshan/Documents/Profession/bidezy/codebase/Bidezy 2")
+# SALES_RAW wins; otherwise the same raw-data root the rest of the ETL uses. The old
+# default was one developer's Mac path, which silently read nothing anywhere else.
+RAW = os.environ.get("SALES_RAW") or settings.RAW_DATA_DIR
 KPI = os.path.join(HERE, "app", "data", "kpi")
 LIMIT = int(os.environ.get("SALES_LIMIT", "0"))  # >0 = only first N data rows/file (prototype)
 
@@ -152,7 +162,22 @@ def hosp_of(inv, loc):
     return str(loc).strip() if loc else "UNKNOWN"
 
 
+_FLOAT_CODE = re.compile(r"\d+\.0+")
+
+
+def float_codes(codes) -> list:
+    """Material codes still written the way str() writes a float ('101313.0')."""
+    return [c for c in codes if _FLOAT_CODE.fullmatch(str(c))]
+
+
 def run():
+    missing = [sub for sub in ("IP Sales", "OP Sales") if not os.path.isdir(os.path.join(RAW, sub))]
+    if missing:
+        # Without this a wrong path reads zero files, and the zero-row guard below never
+        # fires because it only checks files that were found.
+        raise SystemExit(
+            f"[sales] ABORT — {RAW!r} has no {' / '.join(missing)} folder. Set SALES_RAW to the "
+            "folder that holds 'IP Sales' and 'OP Sales'. Nothing was written.")
     tot = defaultdict(lambda: defaultdict(float))
     month = defaultdict(lambda: defaultdict(float))
     hosp = defaultdict(lambda: defaultdict(float))
@@ -186,7 +211,11 @@ def run():
             if rev is None:
                 continue
             cost = cost or 0.0; qty = qty or 0.0
-            code = str(g("mat")).strip() if g("mat") is not None else ""
+            # pyxlsb returns every numeric cell as a float and openpyxl returns whole
+            # numbers as int, so str() keyed the four .xlsb OP months as '101313.0' and the
+            # .xlsx months as '101313'. Every material-keyed table then held each product
+            # twice, and the '.0' half never matched dim_material, so it had no group.
+            code = norm_code(g("mat"))
             if not code or code.lower() == "none":
                 continue
             ymk = f"{ym[0]:04d}-{ym[1]:02d}"
@@ -243,6 +272,14 @@ def run():
             "\n\nNothing was written. A .xlsb file reading empty usually means pyxlsb is "
             "not installed (pip install pyxlsb). Fix the reader and re-run; do NOT ship "
             "these aggregates, because they silently drop whole months.")
+
+    # Same idea for the material key: if a reader change ever brings back float-shaped
+    # codes, stop before they split every product in two again.
+    floaty = float_codes(mat)
+    if floaty:
+        raise SystemExit(
+            f"[sales] ABORT — {len(floaty):,} material codes are float-formatted, e.g. "
+            f"{floaty[:3]}. Nothing was written; normalise the codes (norm_code) and re-run.")
 
     os.makedirs(KPI, exist_ok=True)
     pd.DataFrame([{"patient": k, **v} for k, v in tot.items()]).to_parquet(os.path.join(KPI, "sales_totals.parquet"), index=False)

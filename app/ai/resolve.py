@@ -28,6 +28,8 @@ whichever engine is running.
 """
 from __future__ import annotations
 
+import calendar
+import copy
 import re
 from collections import defaultdict
 from functools import lru_cache
@@ -68,6 +70,20 @@ _NOISE_TOKENS = {
     "pharmaceuticals", "medical", "hospital", "hospitals", "hcg", "the", "and", "for", "of",
     "with", "size", "single", "double", "small", "large", "medium", "full", "half",
 }
+# Business words of HCG's reports. None is a misspelling of a product: "saving" was offered
+# back as "shaving" (shaving blades) and the model answered about razors (golden
+# fs-kr-scheme-saving-aug, 10-10-2026).
+_BUSINESS_WORDS = {
+    "saving", "savings", "saved", "save", "missed", "miss", "loss", "losses", "lost", "lose",
+    "margin", "margins", "scheme", "schemes", "attis", "healthium", "restricted", "preferred",
+    "formulary", "compliance", "compliant", "breach", "breaches", "brand", "brands", "tpa",
+    "cash", "payer", "payers", "gov", "government", "doctor", "doctors", "consultant",
+    "consultants", "onco", "oncology", "segment", "segments", "suggested", "suggestion",
+    "alternative", "alternatives", "sharing", "bifurcation", "rule", "rules", "network",
+    "pooled", "potential", "proposed", "spend", "spent", "share", "patients", "patient",
+    "inpatient", "outpatient", "consumption", "hospital", "hospitals",
+}
+
 _STOP = {
     "what", "which", "how", "why", "when", "where", "who", "show", "give", "list", "get",
     "tell", "our", "the", "and", "for", "are", "was", "were", "is", "in", "on", "at", "to",
@@ -105,8 +121,16 @@ _STOP = {
     "cover", "covers", "covered", "covering", "coverage", "record", "recorded",
     "show", "shows", "shown", "given", "gives", "spent", "spend", "hold", "holds",
     "quarter", "quarters", "annual", "yearly", "monthly", "weekly", "daily", "trend",
-    "trends", "overall", "average", "median', 'today", "yesterday", "tomorrow",
+    "trends", "overall", "average", "median", "today", "yesterday", "tomorrow",
     "line", "lines", "side", "sides", "way", "ways", "point", "points", "area", "areas",
+    # Words that say how WIDE the answer is or how to CUT it. "Show the network-wide monthly
+    # sales trend" bound "network" to four D-LINK / HPE network switches, and the brief then
+    # handed over a monthly query filtered to them as "this product". "month wise" bound
+    # "wise" to products whose names contain WISE, worth ₹75 L of sales. These words ask;
+    # they never name.
+    "network", "networks", "networkwide", "company", "companywide", "organisation",
+    "organization", "business", "whole", "entire", "wise", "split", "splits", "breakdown",
+    "against", "combined", "together", "separately", "chain",
 }
 _MAX_DF = 250          # a token in more than this many values identifies nothing
 
@@ -225,9 +249,11 @@ _MEASURE_NOTES: dict[str, str] = {
         "them at material grain with a `scope` column ('internal' or 'billed'), covering "
         f"{_count_distinct('consumption_all', 'material')} materials. Always report which "
         "scope a figure is, and never read an empty fact_consumption result as proof an "
-        "item is unused. NOTE: the billed side has no plant and no date, so consumption_all "
-        "cannot give a monthly or per-hospital trend — say that plainly rather than "
-        "implying one."),
+        "item is unused. NOTE: consumption_all has no plant and no date. For a MONTHLY "
+        "trend take the billed side from sales_by_material_month (SUM(qty), SUM(cost) by "
+        "period) and the internal side from fact_consumption / kpi_units_consumed, and "
+        "report them as two labelled series. A per-plant billed split does not exist "
+        "(sales hospital codes do not map to plants)."),
     "expiry": ("This warehouse buckets expiry as Expired / 0-30d / 31-90d / 91-180d. Stock "
                "that has ALREADY expired is not \"expiring in the next N days\" — it has "
                "expired. A 90-day question is 0-30d + 31-90d only; adding the expired "
@@ -266,14 +292,56 @@ _GRAIN_NOTES: dict[str, str] = {
 # Notes tied to a WORD in the question rather than to its grain. The formulary warning was
 # briefly attached to the material grain, which meant it appeared on "what is our biggest
 # selling product" — true, irrelevant, and one more line to read past.
+#
+# Two different things answer to the word "formulary", and the old note sent every one of
+# them to the item-master flag. Formulary COMPLIANCE, restricted/preferred brands, scheme and
+# Attis savings and cash & TPA margin loss are the Jun–Aug 2026 HCG reports, which have no
+# SQL table at all — so a compliance question answered from dim_material.formulary_status is
+# a different measure over a different window. The flag stays the answer for "is item X on
+# the formulary" and the Dec–May sales share by formulary status.
+_REPORTS_NOTE = (
+    "Formulary COMPLIANCE %, out-of-formulary spend, restricted/preferred brand use, "
+    "scheme/Attis/Healthium savings and cash & TPA margin loss are <<REPORTS>> reports "
+    "reachable ONLY through get_kpi keys formulary-compliance, brand-rules, "
+    "scheme-brand-saving, attis-saving, cash-tpa-margin-loss — there is no SQL table for "
+    "them, and they do not overlap the <<SALES>> sales window.")
+
 _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
     (r"\bformular",
-     "Use dim_material.formulary_status, NOT `formulary`. The raw column spells three "
+     _REPORTS_NOTE + " dim_material.formulary_status is only for \"is item X on the "
+     "formulary\" and the <<SALES_SHORT>> sales share by formulary status. For those: "
+     "use dim_material.formulary_status, NOT `formulary`. The raw column spells three "
      "concepts eleven ways (NON FORMULARY, NON FORMUL, NON-FORMULARY, NON FORMUALRY, "
      "NONFORMULARY, NON  FORMULARY, OUT OF FOR …), so an equality filter on it silently "
      "drops 123 items and a GROUP BY returns eleven buckets for three things. The clean "
      "values are FORMULARY (4,024), NON FORMULARY (7,090), OUT OF FORMULARY (3,504), "
      "UNSPECIFIED (10,313)."),
+    # "Restricted brands for cash and TPA patients" was answered with the cash & TPA MARGIN
+    # LOSS (₹78.08 L for KR, Aug-26) instead of the SPEND on restricted brands (₹4.52 Cr):
+    # the words "cash and TPA" pulled it to the wrong report (golden
+    # fs-kr-restricted-cash-tpa-aug, 10-10-2026).
+    (r"\b(?:restricted|preferred)\b.*\b(?:cash|tpa|scheme|gov|government)\b"
+     r"|\b(?:cash|tpa|scheme|gov|government)\b.*\b(?:restricted|preferred)\b",
+     "WHICH REPORT: spend on RESTRICTED or PREFERRED brands is get_kpi('brand-rules') with "
+     "measure = restricted_cash_tpa (cash & TPA patients), restricted_scheme or preferred_scheme "
+     "(scheme / GOV patients): their cost and share of all drug spend. It is NOT "
+     "get_kpi('cash-tpa-margin-loss'), a different figure: the margin lost when a cash or TPA "
+     "patient got a brand HCG's list suggests replacing."),
+    # The same reports asked for without the word "formulary".
+    (r"(?<!formulary )\bcompliance\b|\b(?:restricted|preferred) brands?\b|\bbrand[- ]rules?\b"
+     r"|\battis\b|\bhealthium\b|\bscheme (?:brand )?sav|\bcash\s*(?:&|and)\s*tpa\b",
+     _REPORTS_NOTE),
+    # "OP sales of keytruda" resolved nothing about IP/OP — the tokens are two letters, below
+    # every matching threshold — so the model reported the combined figure and the prose
+    # called it OP. The split exists at exactly two levels, and dim_sloc's ward class is a
+    # different thing that only looks like it.
+    (r"\b(?:ip|op|ipd|opd|in-?patients?|out[- ]?patients?)\b",
+     "IP/OP split exists ONLY company-wide for <<SALES_SHORT>> (sales_totals.patient and "
+     "sales_monthly.patient, which has the month too) and in the <<REPORTS>> report tools "
+     "(get_kpi patient_type). No <<SALES_SHORT>> item, category or hospital table has IP/OP: for "
+     "those give the combined figure and say the IP/OP split is not available at that "
+     "level. dim_sloc.ip_op_class is the STORE's ward type (mostly OTHER) — never use it as "
+     "the patient's IP/OP."),
     (r"\btax\b|\bgst\b|\bcgst\b|\bsgst\b|\bigst\b|\bduty\b",
      "Tax is SEPARATE from spend. Procurement spend is EX-TAX by definition — the ₹649.91 Cr "
      "figure is fact_po.total_value_wo_tax — and GST sits beside it in cgst_value / "
@@ -339,7 +407,23 @@ def resolve(question: str, limit: int = 8) -> dict:
 
     Returns entities TYPED and located (table + column), so downstream SQL has nowhere to
     misfile them, plus the measure and grain the question is asking for.
+
+    Cached. One fast turn asked for the same resolution five or more times — brief, the
+    impossible-grain check inside it, the spelling check, the KPI scope guard, and again
+    for every query the model ran — and a question naming a city paid a dim_plant query
+    each time. The answer depends only on the question and the warehouse snapshot. The
+    copy is deliberate: a caller that edits the result must not change what the next
+    caller (or the next turn) is handed from the cache.
     """
+    return copy.deepcopy(_resolve_cached(question or "", limit))
+
+
+@lru_cache(maxsize=256)
+def _resolve_cached(question: str, limit: int) -> dict:
+    return _resolve_uncached(question, limit)
+
+
+def _resolve_uncached(question: str, limit: int = 8) -> dict:
     q = question or ""
     postings, exact = _index()
     qtokens = [t.lower() for t in _WORD.findall(q)]
@@ -557,11 +641,11 @@ def generic_materials(generic: str, limit: int = 8) -> tuple[str, ...]:
     """
     from app.ai import warehouse
     try:
-        rows = warehouse.con().execute(
+        rows = warehouse.query(
             "SELECT DISTINCT material_desc FROM dim_material "
             "WHERE upper(CAST(generic_name AS VARCHAR)) = upper(?) "
             "   OR upper(CAST(minor_group_desc AS VARCHAR)) = upper(?) "
-            "ORDER BY 1 LIMIT ?", [generic, generic, limit]).fetchall()
+            "ORDER BY 1 LIMIT ?", [generic, generic, limit])
     except Exception:
         return ()
     return tuple(str(r[0]) for r in rows if r[0])
@@ -572,8 +656,8 @@ def _count_distinct(table: str, column: str) -> str:
     """A live COUNT(DISTINCT), formatted — so a note never quotes a stale number."""
     from app.ai import warehouse
     try:
-        n = warehouse.con().execute(
-            f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"').fetchone()[0] or 0
+        n = warehouse.query(
+            f'SELECT COUNT(DISTINCT "{column}") FROM "{table}"', one=True)[0] or 0
     except Exception:
         return "many"
     return f"{n:,}"
@@ -632,11 +716,25 @@ def brief(question: str) -> str:
     # resolves no entity, no measure and no grain, so the brief returned empty and the tax
     # guidance — the note that stops tax being added to spend — never reached the model.
     kw_hits = [n for pat, n in _KEYWORD_NOTES if re.search(pat, question or "", re.I)]
+    # The same for "what happened last month?": nothing resolves, and the one thing it needs
+    # is which month "last month" is.
+    rel_note = relative_date_note(question)
+    # "KR", "Nagpur": hospital names as HCG says them, which no dimension value spells that
+    # way (and two-letter words never reach the resolver at all).
+    from app.ai import hospitals as _hosp
+    hosp = [(a, c) for a, c in _hosp.mentioned(question) if len(c) == 1
+            and not any(e["kind"] == "hospital" for e in r["entities"])]
     if not (r["entities"] or r["families"] or r["cities"] or r["measures"] or r["grains"]
-            or asks_about_time or typos or kw_hits):
+            or asks_about_time or typos or kw_hits or rel_note or hosp):
         return ""
     lines = ["WHAT THIS QUESTION IS ABOUT (resolved against the actual dimension values — "
              "use these exact columns, do not guess where a name lives):"]
+    for alias, (code,) in hosp:
+        his = _hosp.his_code(code)
+        lines.append(f"- \"{alias}\" is the HOSPITAL {_hosp.name(code)}: SAP plant {code} (inventory, "
+                     f"purchasing, consumption, and plant= for get_kpi)"
+                     + (f", sales code {his} (the `hospital` column of the sales_* tables)" if his else "")
+                     + ". Scope every figure to it; never answer with the network total.")
     for e in r["entities"]:
         where = ", ".join(e.get("locations") or [f"{e['table']}.{e['column']}"])
         lines.append(f"- \"{e['text']}\" is a {e['kind'].upper()}, held in {where}"
@@ -730,13 +828,32 @@ def brief(question: str) -> str:
     for pat, note in _KEYWORD_NOTES:
         if re.search(pat, question or "", re.I):
             lines.append(f"- {note}")
-    # Say it BEFORE the model spends four queries discovering it. "Show me the sales trend
-    # for KEYTRUDA" ruled out both lines of enquiry and reported "I couldn't establish
-    # anything solid enough to report" — which reads as the assistant being weak, when the
-    # truth is the warehouse has no material x month sales grain at all.
+    # Say it BEFORE the model spends four queries discovering it. A question asking for a
+    # grain no table has (sales by hospital x month) used to be answered "I couldn't
+    # establish anything solid enough to report", which reads as the assistant being weak
+    # when the truth is a fact about the data.
     impossible = impossible_combination(question)
     if impossible:
         lines.append(f"- NOT AVAILABLE AT THIS GRAIN: {impossible}")
+    # And the opposite: say it when the grain DOES exist. "get me the sales trend of
+    # keytruda" was answered "there is no monthly breakdown — would you like the 6-month
+    # total instead?" while sales_by_material_month held all six months. Handing over the
+    # finished query leaves no room for that.
+    canon = item_trend_sql(question)
+    if canon:
+        lines.append("- THIS PRODUCT'S MONTHLY SALES EXIST. Run exactly this, then answer from "
+                     "it (no <<SALES_MONTHS>>-month total, no purchasing substitute): " + canon)
+    elif not impossible and site_trend_unavailable(question):
+        # The same product question at ONE hospital has no table. The prompt teaches the
+        # month view for product trends, so without this line the company-wide series is
+        # the natural thing to run — and to present as the hospital's.
+        lines.append(
+            "- NOT AVAILABLE AT THIS GRAIN: one product's MONTHLY sales exist only for the "
+            "whole company (sales_by_material_month has no hospital), and its hospital split "
+            "(sales_by_material_hospital) has no month. Say this hospital's month-by-month "
+            "figures do not exist; offer the company-wide monthly series, labelled as ALL "
+            "hospitals, or the product's whole-window total by hospital. Never present the "
+            "company-wide series as this hospital's.")
     # "biggest selling" is revenue to a CFO and units to a storekeeper, and both readings
     # have a real answer: KEYTRUDA at ₹47.48 Cr, EXAMINATION GLOVES at 1,347,643 units.
     if re.search(r"\b(best|biggest|top|highest)[- ]?(selling|seller)\b|\bmoves? the most\b",
@@ -752,6 +869,8 @@ def brief(question: str) -> str:
         win = reporting_window()
         if win:
             lines.append(f"- REPORTING PERIOD: {win}")
+    if rel_note:
+        lines.append(f"- {rel_note}")
     for qual in r["qualifiers"]:
         # Hand over the actual number. Asked to "choose a threshold at the top of the
         # distribution" the model chose the median, then Rs 1 lakh; both admit thousands of
@@ -833,8 +952,8 @@ _TABLE_EVENT: list[tuple[str, str, str]] = [
 def _schema_columns() -> tuple[tuple[str, str], ...]:
     from app.ai import warehouse
     try:
-        rows = warehouse.con().execute(
-            "SELECT table_name, column_name FROM information_schema.columns").fetchall()
+        rows = warehouse.query(
+            "SELECT table_name, column_name FROM information_schema.columns")
     except Exception:
         return ()
     return tuple((str(t), str(c)) for t, c in rows)
@@ -958,7 +1077,7 @@ def size_floor(measure: str, grain: str, cover: float = 0.70):
         try:
             # Aggregate to the grain FIRST. mart_procurement is one row per PO line, so
             # cutting it raw ranks lines, not vendors — 14,194 "big vendors" out of 2,251.
-            row = warehouse.con().execute(
+            row = warehouse.query(
                 'WITH per_entity AS ('
                 f' SELECT "{key}" AS k, SUM("{column}") AS v FROM "{table}"'
                 f' WHERE "{column}" > 0 GROUP BY 1),'
@@ -966,8 +1085,8 @@ def size_floor(measure: str, grain: str, cover: float = 0.70):
                 ' SELECT v, SUM(v) OVER (ORDER BY v DESC'
                 '  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run,'
                 ' SUM(v) OVER () AS tot FROM per_entity)'
-                f' SELECT MIN(v), COUNT(*) FROM ranked WHERE run <= tot * {cover}'
-            ).fetchone()
+                f' SELECT MIN(v), COUNT(*) FROM ranked WHERE run <= tot * {cover}',
+                one=True)
         except Exception:
             continue
         if row and row[0] is not None and row[1]:
@@ -990,7 +1109,7 @@ def city_reachability() -> tuple[tuple[str, ...], tuple[str, ...]]:
     """
     from app.ai import warehouse
     try:
-        codes = {r[0] for r in warehouse.con().execute("SELECT plant FROM dim_plant").fetchall()}
+        codes = {r[0] for r in warehouse.query("SELECT plant FROM dim_plant")}
     except Exception:
         return (), ()
     if not codes:
@@ -1001,8 +1120,8 @@ def city_reachability() -> tuple[tuple[str, ...], tuple[str, ...]]:
         if table == "dim_plant" or not site.match(column):
             continue
         try:
-            vals = {r[0] for r in warehouse.con().execute(
-                f'SELECT DISTINCT "{column}" FROM "{table}"').fetchall() if r[0]}
+            vals = {r[0] for r in warehouse.query(
+                f'SELECT DISTINCT "{column}" FROM "{table}"') if r[0]}
         except Exception:
             continue
         if not vals:
@@ -1024,16 +1143,84 @@ def reporting_window() -> str:
     for table, column in (("fact_consumption", "posting_date"), ("fact_grn", "posting_date"),
                           ("sales_monthly", "month")):
         try:
-            lo, hi = warehouse.con().execute(
-                f'SELECT MIN("{column}"), MAX("{column}") FROM "{table}"').fetchone()
+            lo, hi = warehouse.query(
+                f'SELECT MIN("{column}"), MAX("{column}") FROM "{table}"', one=True)
         except Exception:
             continue
         if lo is None or hi is None:
             continue
+        # The Jun–Aug 2026 HCG reports are NOT in this window and NOT in any table, so a
+        # bare "the window is Dec–May" told the model a "formulary compliance trend" could
+        # not exist. Name them as the one exception.
         return (f"{str(lo)[:10]} to {str(hi)[:10]} (from {table}.{column}). Expiry dates and "
                 f"forecast horizons run past this and do NOT extend the reporting period; "
-                f"neither does any earlier date sitting in a master table.")
+                f"neither does any earlier date sitting in a master table. The formulary "
+                f"compliance, brand-rule, scheme/Attis saving and cash & TPA margin-loss "
+                f"reports cover <<REPORTS_RANGE>> (a separate window, reachable only through "
+                f"get_kpi).")
     return ""
+
+
+# ── "LAST MONTH" IS THE LAST MONTH IN THE DATA ───────────────────────────────────────────
+# The data stops months before today, and nothing told the model so. "Procurement spend last
+# month" could be answered for the calendar month (empty, so "0" or "no recorded spend" —
+# which reads as zero spend), or by quietly substituting May-2026 without saying so. The
+# months are read from the data, so the note moves when the data does.
+_RELATIVE_DATE = re.compile(
+    r"\b(?:last|this|previous|current|latest|past)\s+"
+    r"(?:month|quarter|year|week|fy|financial\s+year|fiscal\s+year)\b"
+    r"|\b(?:ytd|mtd|qtd|today|yesterday)\b", re.I)
+_FY_WORDING = re.compile(r"\b(?:fy|ytd|financial\s+year|fiscal\s+year)\b", re.I)
+
+
+def _month_label(ym: str) -> str:
+    """'2026-05' -> 'May-2026', the form answers write months in."""
+    y, m = ym.split("-")
+    return f"{calendar.month_abbr[int(m)]}-{y}"
+
+
+def _sales_window_months() -> tuple[str, str] | None:
+    """(first, last) month of the sales/purchasing/consumption window as 'YYYY-MM', read
+    from reporting_window() — the same source the REPORTING PERIOD line quotes."""
+    m = re.match(r"\s*(\d{4}-\d{2})\S* to (\d{4}-\d{2})", reporting_window() or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _latest_report_month() -> str | None:
+    """Newest month of the Jun–Aug formulary/spend reports ('2026-08'), from the published
+    formulary summary; None when it is not built or cannot be read."""
+    try:
+        from app.ai.page_context import latest_report_month
+        return latest_report_month()
+    except Exception:
+        return None
+
+
+def relative_date_note(question: str) -> str:
+    """The note for 'last month', 'this year', 'YTD', 'today' and the like, or ""."""
+    if not _RELATIVE_DATE.search(question or ""):
+        return ""
+    sales, report = _sales_window_months(), _latest_report_month()
+    latest = []
+    if sales:
+        latest.append(f"{_month_label(sales[1])} ({sales[1]}) for sales, purchasing and "
+                      f"consumption")
+    if report:
+        latest.append(f"{_month_label(report)} ({report}) for the formulary/spend/brand-rule "
+                      f"reports")
+    note = ("RELATIVE DATE: The data does not run to today. 'Last/latest month' = the latest "
+            "month in the data" + (": " + "; ".join(latest) if latest else "") + ". ")
+    if sales and _FY_WORDING.search(question or ""):
+        # HCG's financial year runs April to March, so "this FY" / "YTD" in the data is a
+        # few months at most; say how many rather than let it read as a full year.
+        first, last = sales
+        y, m = (int(x) for x in last.split("-"))
+        fy_start = max(f"{y if m >= 4 else y - 1}-04", first)
+        cal_start = max(f"{y}-01", first)
+        note += (f"FY runs Apr–Mar, so FY-to-date in the data is {_month_label(fy_start)}.."
+                 f"{_month_label(last)}; calendar YTD is {_month_label(cal_start)}.."
+                 f"{_month_label(last)}. ")
+    return note + "Say which month you used. Never report an empty recent month as zero."
 
 
 # ── SPELLING ─────────────────────────────────────────────────────────────────────────────
@@ -1114,7 +1301,7 @@ def spelling_suggestions(question: str, resolved: dict) -> list[dict]:
         forms = _forms(tok)
         if (len(tok) < _MIN_FUZZY_LEN or tok in claimed
                 or any(f in bag for f in forms
-                       for bag in (_STOP, _NOISE_TOKENS, intent, _schema_vocabulary()))):
+                       for bag in (_STOP, _NOISE_TOKENS, _BUSINESS_WORDS, intent, _schema_vocabulary()))):
             continue
         postings, _ = _index()
         if postings.get(tok):
@@ -1150,10 +1337,10 @@ def family_weights(table: str, column: str, token: str) -> tuple[tuple[str, int]
     """
     from app.ai import warehouse
     try:
-        rows = warehouse.con().execute(
+        rows = warehouse.query(
             f'SELECT "{column}" AS v, COUNT(*) AS n FROM "{table}" '
             f"WHERE upper(CAST(\"{column}\" AS VARCHAR)) LIKE '%' || upper(?) || '%' "
-            f'GROUP BY 1 ORDER BY n DESC LIMIT 12', [token]).fetchall()
+            f'GROUP BY 1 ORDER BY n DESC LIMIT 12', [token])
     except Exception:
         return ()
     return tuple((str(r[0]), int(r[1])) for r in rows if r[0] is not None)
@@ -1165,10 +1352,11 @@ def grain_measure_tables(measure: str, grain: str, allow_projection: bool = Fals
     """Tables that can serve this measure AT this grain — i.e. hold both columns.
 
     Some combinations simply do not exist. `sales_monthly` has month and revenue but no
-    material; `sales_by_material` has material and revenue but no month. So a monthly sales
-    trend for one drug is not a hard question, it is an impossible one — and "Show me the
-    sales trend for KEYTRUDA" was answered "I couldn't establish anything solid enough to
-    report", which reads as a failure of the assistant rather than a fact about the data.
+    hospital; `sales_by_hospital` has hospital and revenue but no month. So a monthly sales
+    trend for one hospital is not a hard question, it is an impossible one — and saying so
+    beats "I couldn't establish anything solid enough to report", which reads as a failure
+    of the assistant rather than a fact about the data. (Material x month DOES exist:
+    sales_by_material_month.)
     """
     pat = GRAIN_COLUMNS.get(grain)
     if not pat:
@@ -1214,7 +1402,8 @@ def impossible_combination(question: str) -> str | None:
         return None
     measure = r["measures"][0]
     # every grain the question needs AT ONCE — naming a drug and asking for a trend means
-    # material AND month, and no sales table has both
+    # material AND month (sales_by_material_month); naming a hospital means hospital AND
+    # month, which no sales table has
     grains = list(dict.fromkeys(
         r["grains"] + [e["kind"] for e in r["entities"] if e["kind"] in GRAIN_COLUMNS]
         + [f["kind"] for f in r["families"] if f["kind"] in GRAIN_COLUMNS]))
@@ -1236,3 +1425,236 @@ def impossible_combination(question: str) -> str | None:
     parts.append("Say this plainly and offer the closest thing that does exist — do not "
                  "report it as a failure to find anything.")
     return " ".join(parts)
+
+
+# ── THE ONE CORRECT QUERY FOR "SALES TREND OF <PRODUCT>" ─────────────────────────────────
+# Everything needed to answer it is already resolved here: the product (a code, an exact
+# description, a molecule, or one rare token naming a handful of SKUs), the measure (revenue
+# or margin) and the grain (month). So the query is written here too, once, deterministically
+# — the brief hands it to both engines and the orchestrator refuses a clarification while it
+# applies. Built on the de-duplicated month view, where KEYTRUDA's December reads 9.68 Cr.
+#
+# Because the brief then says "Run exactly this" and the orchestrator refuses to let the
+# model ask, a WRONG query here is worse than none: it is answered with full confidence.
+# Every doubt below therefore resolves to None, and the model works the question out itself.
+_TREND_PRODUCT_MAX = 5           # more SKUs than this is a family, not "this product"
+_NOT_A_PRODUCT_SCOPE = ("hospital", "vendor", "department")
+_PROJECTION_WORDS = re.compile(r"forecast|project|predict|expect|budget|target", re.I)
+# A TOTAL that merely mentions months is not a trend. "Keytruda total revenue for the 6-month
+# period" — the very follow-up the assistant offered — resolved the month grain from
+# "6-month" and was handed the month-by-month query with "Run exactly this". The test is
+# total wording WITHOUT trend wording, so "total monthly revenue of keytruda" stays a trend.
+_TOTAL_WORDS = re.compile(
+    r"\b(?:\d+|one|two|three|four|five|six|twelve)[- ]months?\b|\btotal\b|\boverall\b", re.I)
+_TREND_WORDS = re.compile(
+    r"\btrends?\b|\bmonthly\b|\bby month\b|\bmonth[- ]on[- ]month\b|\bmonth[- ]by[- ]month\b"
+    r"|\bover time\b|\beach month\b|\bper month\b|\bmonth[- ]?wise\b", re.I)
+
+
+def _asks_for_a_total(question: str) -> bool:
+    q = question or ""
+    return bool(_TOTAL_WORDS.search(q)) and not _TREND_WORDS.search(q)
+
+# Where a product sits when it IS the thing asked about: after "of" / "for" / "about" / "in"
+# ("the sales trend of keytruda"), straight before what is measured ("keytruda sales",
+# "keytruda's monthly revenue"), or in quotes. A one-token family anywhere else is a word the
+# question happens to contain: "Show the network-wide monthly sales trend" formed a family on
+# "network" (four network switches) and was handed their sales as the company's trend.
+_OBJECT_BEFORE = r"(?:\b(?:of|for|about|in)\s+|[\"'“‘]\s*)"
+_OBJECT_AFTER = (r"(?:['’]s)?[\"'”’]?\s+(?:sales?|sold|sell(?:s|ing)?|"
+                 r"revenues?|margins?|profits?|trends?|monthly|months?)\b")
+
+# A hospital named by its short form never resolves. In "sales trend of keytruda at HCG KR",
+# HCG is a noise word and KR is two letters, below every matching threshold — so the
+# question looked company-wide and was handed the all-hospital series to present as HCG KR's.
+# No table holds one product's sales by hospital AND month, so any site wording means None.
+# Case-sensitive on purpose: "HCG KR" and "at KR" are names, "HCG network" is not.
+_SITE_WORDING = re.compile(r"\bHCG[\s-]+[A-Z]{2,}\b|\bat\s+(?!HCG\b)[A-Z]{2,}\b")
+# Upper-case words in hospital names that describe a service or a legal form, not a site.
+_SITE_NOT_A_NAME = {"llp", "pet", "pcr", "cdx"}
+
+
+@lru_cache(maxsize=1)
+def _site_short_names() -> frozenset[str]:
+    """The short forms hospitals go by — KR, DR, NMR, EKO — read from dim_plant's names.
+
+    Read, not listed: a new hospital's short form is covered the day it appears in dim_plant.
+    Lower-case typing ("hcg kr") is why the case-sensitive pattern above is not enough.
+    """
+    from app.ai import warehouse
+    try:
+        rows = warehouse.run_sql(
+            "SELECT DISTINCT plant_name FROM dim_plant WHERE plant_name IS NOT NULL",
+            row_cap=200)["rows"]
+    except Exception:
+        return frozenset()
+    out: set[str] = set()
+    for r in rows:
+        for w in _WORD.findall(str(r["plant_name"])):
+            low = w.lower()
+            if (w.isupper() and 2 <= len(w) <= 5 and low not in _NOISE_TOKENS
+                    and low not in _SITE_NOT_A_NAME):
+                out.add(low)
+    return frozenset(out)
+
+
+def _names_a_site(question: str) -> bool:
+    """True when the question points at a hospital in a way resolve() cannot see."""
+    q = question or ""
+    if _SITE_WORDING.search(q):
+        return True
+    short = _site_short_names()
+    words = [t.lower() for t in _WORD.findall(q)]
+    return any(prev in ("hcg", "at", "in") and w in short for prev, w in zip(words, words[1:]))
+
+
+def _names_as_the_object(question: str, token: str) -> bool:
+    t = re.escape(token)
+    return bool(re.search(_OBJECT_BEFORE + t + r"\b", question, re.I)
+                or re.search(r"\b" + t + _OBJECT_AFTER, question, re.I))
+
+
+def _sql_str(v) -> str:
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _norm_code(code) -> str:
+    s = str(code).strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+
+
+def _codes_where(sql: str, params: list) -> list[str]:
+    from app.ai import warehouse
+    try:
+        rows = warehouse.query(sql, params)
+    except Exception:
+        return []
+    return sorted({_norm_code(r[0]) for r in rows if r[0] is not None})
+
+
+@lru_cache(maxsize=256)
+def _sold_materials(where: str) -> int:
+    """How many distinct materials with real revenue this filter reaches in the month view.
+
+    The brief tells the model "THIS PRODUCT'S MONTHLY SALES EXIST", so that has to be checked,
+    not assumed. It also catches what the item master cannot: a family is counted in
+    dim_material by whole token, but the filter is a substring match on the sales feed, so
+    "wise" was 2 catalogue SKUs and 9 sold products.
+    """
+    from app.ai import warehouse
+    try:
+        row = warehouse.query(
+            "SELECT count(DISTINCT material), SUM(revenue) FROM sales_by_material_month "
+            f"WHERE {where}", one=True)
+    except Exception:
+        return 0
+    if not row or not row[0] or row[1] is None or row[1] <= 0:
+        return 0
+    return int(row[0])
+
+
+def _product_trend_where(q: str, r: dict, any_site: bool = False) -> str | None:
+    """The WHERE clause naming the one product a monthly revenue/margin question is about.
+
+    any_site=True skips the hospital checks, so the brief can tell "a product trend for one
+    hospital" (which does not exist) from "not a product trend at all".
+
+    A total question is not a trend at all, here or at one hospital: a product's whole-window
+    total exists both company-wide (sales_by_material) and per hospital.
+    """
+    if _asks_for_a_total(q):
+        return None
+    if ("month" not in r["grains"] or not r["measures"]
+            or r["measures"][0] not in ("revenue", "margin")
+            or any(g not in ("month", "material") for g in r["grains"])
+            or _PROJECTION_WORDS.search(q)):
+        return None
+    # Families count as scope too: "keytruda at Panda" names the hospital by a single token,
+    # which forms a hospital FAMILY, never an entity. And "network" is a vendor family as
+    # well as a material one — a word that names two kinds of thing names neither.
+    scope_kinds = tuple(k for k in _NOT_A_PRODUCT_SCOPE if not (any_site and k == "hospital"))
+    if (not any_site and r["cities"]) or any(
+            x["kind"] in scope_kinds for x in r["entities"] + r["families"]):
+        return None
+    named = ([e for e in r["entities"] if e["kind"] in ("material", "generic")]
+             + [f for f in r["families"] if f["kind"] in ("material", "generic")])
+    if len(named) != 1:
+        return None
+    thing = named[0]
+    if "token" in thing:
+        # A family: one rare token covering a few SKUs ("keytruda" -> KEYTRUDA 100MG INJ
+        # VIAL). Filter on the token itself, which is [A-Za-z0-9] only, so it is safe to
+        # inline — and it also catches a sold variant the item master has not catalogued.
+        # A single token is weak evidence, so it must also be the question's OBJECT and
+        # name nothing but products (a manufacturer or category family of the same token
+        # means it is a company or a class, not this product).
+        tok = thing["token"]
+        if (thing["kind"] != "material" or thing["column"] != "material_desc"
+                or thing["n"] > _TREND_PRODUCT_MAX
+                or any(f["token"] == tok and f["kind"] not in ("material", "generic")
+                       for f in r["families"])
+                or not _names_as_the_object(q, tok)):
+            return None
+        where = f"upper(material_desc) LIKE '%{tok.upper()}%'"
+    else:
+        # An exact entity. Filter by CODE, not description: the sales feed spells 191
+        # products differently from the item master, so an exact-description filter can
+        # quietly return nothing.
+        if thing["kind"] == "generic":
+            codes = _codes_where(
+                "SELECT DISTINCT material FROM dim_material "
+                "WHERE upper(CAST(generic_name AS VARCHAR)) = upper(?) "
+                "   OR upper(CAST(minor_group_desc AS VARCHAR)) = upper(?)",
+                [thing["text"], thing["text"]])
+        elif thing["column"] == "material":
+            codes = [_norm_code(thing["text"])]
+        else:
+            codes = _codes_where(
+                "SELECT DISTINCT material FROM dim_material WHERE upper(material_desc) = upper(?)",
+                [thing["text"]])
+        if not codes or len(codes) > _TREND_PRODUCT_MAX:
+            return None
+        where = f"material IN ({', '.join(_sql_str(c) for c in codes)})"
+    if not 1 <= _sold_materials(where) <= _TREND_PRODUCT_MAX:
+        return None
+    return where
+
+
+def _trend_sql(where: str) -> str:
+    return ("SELECT period, SUM(revenue) AS revenue, SUM(cost) AS cost, "
+            "SUM(revenue - cost) AS margin, SUM(qty) AS qty "
+            f"FROM sales_by_material_month WHERE {where} GROUP BY period ORDER BY period")
+
+
+@lru_cache(maxsize=256)
+def item_trend_sql(question: str) -> str | None:
+    """The one correct query for 'sales trend of <product>', or None when it does not apply.
+
+    None unless the question names exactly ONE product and asks for its revenue or margin by
+    month, with no hospital, city, vendor or department in it (sales_by_material_month has
+    none of those, so a query here would silently answer for the whole company) and no
+    forecast wording (projections are not history). Two products also give None: one
+    summed series would hide the comparison that was asked for. So does a total ("6-month",
+    "total", "overall" with no trend word): the month rows are not its answer.
+
+    "No hospital" includes the short forms resolve() cannot see ("at HCG KR"), and a product
+    named by one token must be the question's object, not a word it happens to contain.
+    """
+    q = question or ""
+    if _names_a_site(q):
+        return None
+    where = _product_trend_where(q, resolve(q))
+    return _trend_sql(where) if where else None
+
+
+def site_trend_unavailable(question: str) -> bool:
+    """True when the question asks for one product's monthly sales AT one hospital.
+
+    That grain does not exist: the month view has no hospital, the hospital view has no
+    month. Saying so up front stops the company-wide series being relabelled as the site's.
+    """
+    q = question or ""
+    r = resolve(q)
+    at_site = (_names_a_site(q) or r["cities"]
+               or any(x["kind"] == "hospital" for x in r["entities"] + r["families"]))
+    return bool(at_site) and _product_trend_where(q, r, any_site=True) is not None
