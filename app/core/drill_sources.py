@@ -151,7 +151,7 @@ def grn_grain() -> pd.DataFrame:
                       "year", "month"], dropna=False, observed=True)
             .agg(grn_value=("total_amount_wo_tax", "sum"),
                  grn_qty=("gr_qty", "sum"),
-                 gr_lines=("gr_no", "count"),
+                 gr_lines=("gr_qty", "size"),          # receipt lines: fact_grn has no GR number
                  po_tat_sum=("po_to_gr_tat", "sum"), po_tat_n=("po_to_gr_tat", "count"),
                  pr_tat_sum=("pr_to_gr_tat", "sum"), pr_tat_n=("pr_to_gr_tat", "count"))
             .reset_index()
@@ -498,19 +498,18 @@ PROC_REGRAIN: dict[str, Callable[[Optional[str]], pd.DataFrame]] = {
     "kpi_cycle_time": _rg_cycle_time,
 }
 
-# 2,557 fact_po lines carry a NEGATIVE open_qty. Every one of them is Unclassified and
-# 2,555 of them are doc_type "Service PO" — value-based/blanket orders whose notional
-# ordered quantity is smaller than what was received, so "open quantity" goes below
-# zero. Unfiltered they are swamped (portfolio fill rate 91.7%), but selecting
-# Unclassified makes them the majority and the raw ratio reads 168.7%. The endpoints
-# already clamp the headline to [0,100]; clamping ALONE would print a confident
-# "100% order completion" for the one bucket where the input is meaningless, so the
-# fill-rate surfaces additionally disclose this whenever a category is applied.
+# A line whose open quantity is NEGATIVE (more received than ordered: a value-based or
+# blanket service order's notional quantity) pushes a bucket's raw completion ratio past
+# 100%. Until the import fix, 2,557 such lines (2,555 "Service PO", none with a material)
+# made Unclassified read 168.7% raw; fact_po now holds only order lines with a material and
+# none has a negative open quantity, so this is the guard for a line that brings one back.
+# The endpoints clamp the headline to [0,100]; clamping ALONE would print a confident
+# "100% order completion" where the input is meaningless, so the fill-rate surfaces
+# additionally disclose it whenever a category is applied.
 FILL_RATE_SERVICE_PO_NOTE = (
-    "Open quantity is negative on 2,557 service/blanket PO lines, all of them in "
-    "Unclassified — the raw completion ratio for this bucket exceeds 100% and has been "
-    "capped. Read fill rate on the material buckets (Onco Drugs, Other Drugs, "
-    "Consumables, Lab, Non-Medical), where every line is a real goods order."
+    "Open quantity is negative on some of this bucket's order lines (more received than "
+    "ordered, as on a service or blanket order), so the raw completion ratio exceeds 100% "
+    "and has been capped. Read fill rate on the buckets whose lines are goods orders."
 )
 
 # Procurement KPIs that deliberately do NOT take a material-category cut, and why.

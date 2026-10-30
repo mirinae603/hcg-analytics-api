@@ -173,6 +173,19 @@ def _items_cached(pl: Optional[str], cc: Optional[str], version: tuple) -> pd.Da
     return g[ITEM_COLS].reset_index(drop=True)
 
 
+def _gaps(periods: list) -> list:
+    """The (year, month)s between the first and the last of `periods` the file has no row for:
+    a month whose extract was not received (Aug-26), not a month with nothing issued."""
+    if not periods:
+        return []
+    have, (y, m), out = set(periods), periods[0], []
+    while (y, m) < periods[-1]:
+        if (y, m) not in have:
+            out.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
 def _note(periods: list) -> str:
     if not periods:
         span = "no months of consumption are loaded yet"
@@ -180,6 +193,9 @@ def _note(periods: list) -> str:
         span = _label(*periods[0])
     else:
         span = f"{_label(*periods[0])} to {_label(*periods[-1])}"
+        gaps = _gaps(periods)
+        if gaps:            # the month list skips them: say so, so no trend is read through them
+            span += f" (no consumption extract for {', '.join(_label(*g) for g in gaps)})"
     return ("Consumables by HCG's series rule (material codes starting with 3) issued from store to each "
             f"department's cost centre, from SAP consumption (goods issues), {span}. Not the same set as "
             "the 'Consumables' category in the cards above, which follows the SAP material type (ZMC).")

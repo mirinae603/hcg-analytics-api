@@ -19,12 +19,8 @@ potential - actual.
 attis_consumption: every line of an Attis product (HIS manufacturer ATTIS ...), every
 payer, summed per hospital, patient type, payer and material.
 
-oof_switch: CASH and CASH(TPA) lines of a material the month's Item Master flags OUT OF
-FORMULARY (Task 3c), per hospital, patient type, payer, doctor and material, with the
-formulary brand app/etl/spend/oof.py matched to it (same molecule, strength and form, best
-margin) and HCG's cash margins: actual = bill MRP excl GST - bill cost, proposed = qty x the
-matched brand's unit margin, loss = proposed - actual. Unmatched brands keep their bill
-values and no margins.
+The out-of-formulary margin is not a sales table: it follows HCG's purchase (GRN) method in
+app/etl/purchase.
 
 Payer bucket and hospital use the formulary build's own lookups, so GOV / CASH / CASH(TPA)
 here are exactly those of the formulary tables.
@@ -41,7 +37,6 @@ from app.etl.formulary.aggregate import _hospital_lookup, _payer_lookup, _r
 from app.etl.formulary.discover import BuildError
 from app.etl.formulary.extract import cache_paths
 from app.etl.spend import config as C
-from app.etl.spend import oof as O
 
 CATEGORY_SQL = ("CASE left(coalesce(x.material, ''), 1) WHEN '1' THEN 'Onco Drugs' "
                 "WHEN '2' THEN 'Other Drugs' WHEN '3' THEN 'Consumables' ELSE 'Unclassified' END")
@@ -174,54 +169,8 @@ def _allowance(con, cash_rows: pd.DataFrame, cash_list: pd.DataFrame, bifurcatio
     return m.rename(columns={"s_desc": "material_desc"})[cols], factor
 
 
-def oof_totals(df: pd.DataFrame) -> dict:
-    """cash_totals of the matched OOF rows, plus how much of the OOF use was matched."""
-    m = df[df["matched"].astype(bool)] if len(df) else df
-    cost = float(df["actual_cost"].sum()) if len(df) else 0.0
-    mcost = float(m["actual_cost"].sum()) if len(m) else 0.0
-    return {**cash_totals(m), "brands": int(df["material"].nunique()) if len(df) else 0,
-            "matched_brands": int(m["material"].nunique()) if len(m) else 0,
-            "bill_cost": _r(cost, 2), "matched_cost": _r(mcost, 2),
-            "matched_cost_pct": _r(mcost / cost * 100, 4) if cost else None}
-
-
-def _oof_match(con, oof_master) -> pd.DataFrame:
-    """The month's OOF brands matched to a formulary brand (oof.match), with each brand's MRP per
-    unit on the month's bills (every hospital and payer, sold lines only) for the price check."""
-    if oof_master is None:
-        return None
-    items, priced = oof_master
-    unit_mrp = dict(con.execute("""
-        SELECT material, sum(mrp) / sum(qty) FROM l WHERE qty > 0
-        GROUP BY material HAVING sum(qty) > 0""").fetchall())
-    return O.match(items, priced, unit_mrp)
-
-
-def _oof_rows(con, oof: pd.DataFrame) -> pd.DataFrame:
-    cols = ["period", "plant", "hospital", "hospital_name", "patient_type", "category", "payer_bucket",
-            "doctor_id", "material", "material_desc", *O.COLUMNS[1:], "qty", "actual_cost", "bill_mrp", "lines"]
-    if oof is None or oof.empty:
-        return O.values(pd.DataFrame(columns=cols))       # same columns as a month with rows
-    con.register("oof_df", oof)
-    payers = ", ".join(f"'{p}'" for p in C.CASH_PAYERS)
-    rows = con.execute(f"""
-        SELECT l.period, l.plant, l.hospital, l.hospital_name, l.patient_type, l.category,
-               l.payer_bucket, l.doctor_id, l.material, mode(l.material_desc) AS material_desc,
-               {", ".join(f"o.{c}" for c in O.COLUMNS[1:])},
-               sum(l.qty) AS qty, round(sum(l.cost), 2) AS actual_cost,
-               round(sum(l.mrp), 2) AS bill_mrp, count(*) AS lines
-        FROM l JOIN oof_df o ON o.material = l.material
-        WHERE l.payer_bucket IN ({payers})
-        GROUP BY l.period, l.plant, l.hospital, l.hospital_name, l.patient_type, l.category,
-                 l.payer_bucket, l.doctor_id, l.material, {", ".join(f"o.{c}" for c in O.COLUMNS[1:])}
-        """).df()
-    return O.values(rows[cols])
-
-
 def aggregate_month(period: str, *, cache, scheme, cash, bifurcation: dict, payer_master,
-                    overrides: dict, hospitals: dict, con, oof_master: tuple = None) -> MonthResult:
-    """oof_master: (the month's Item Master items, the CASH&TPA price list) for the
-    out-of-formulary match, or None when the month has no Item Master."""
+                    overrides: dict, hospitals: dict, con) -> MonthResult:
     src_path, _ = cache_paths(cache, period)
     src = str(src_path).replace("'", "''")
     pay = _payer_lookup(con, period, payer_master, overrides, src)
@@ -296,8 +245,6 @@ def aggregate_month(period: str, *, cache, scheme, cash, bifurcation: dict, paye
         GROUP BY period, plant, hospital, hospital_name, patient_type, category, payer_bucket,
                  material""").df()
 
-    oof_rows = _oof_rows(con, _oof_match(con, oof_master))
-
     doctor_names = con.execute(f"""
         SELECT plant, doctor_id, doctor_name, count(*) AS n
         FROM l WHERE doctor_name IS NOT NULL AND doctor_id <> '{FC.UNKNOWN_DOCTOR_ID}'
@@ -308,7 +255,6 @@ def aggregate_month(period: str, *, cache, scheme, cash, bifurcation: dict, paye
         FROM l WHERE payer_bucket = '{C.SCHEME_PAYER}'""").fetchone()
     kr = switch[switch["plant"].astype(str) == FC.KR_PLANT]
     kr_cash = cash_rows[cash_rows["plant"].astype(str) == FC.KR_PLANT]
-    kr_oof = oof_rows[oof_rows["plant"].astype(str) == FC.KR_PLANT]
     checks = {
         "lines": int(con.execute("SELECT count(*) FROM l").fetchone()[0]),
         "gov": {"lines": int(gov[0]), "cost": _r(gov[1], 2), "qty": _r(gov[2], 3)},
@@ -320,13 +266,11 @@ def aggregate_month(period: str, *, cache, scheme, cash, bifurcation: dict, paye
                         "cash_qty": _r(allowance["cash_qty"].sum(), 3) if len(allowance) else 0.0,
                         "allowed_qty": _r(allowance["allowed_qty"].sum(), 3) if len(allowance) else 0.0,
                         "counted_qty": _r(allowance["excess_qty"].sum(), 3) if len(allowance) else 0.0},
-        "oof": oof_totals(oof_rows),
         "kr": {"scheme": totals(kr), "attis": totals(kr[kr["attis"]]),
-               "healthium": totals(healthium(kr)), "cash": cash_totals(kr_cash),
-               "oof": oof_totals(kr_oof)},
+               "healthium": totals(healthium(kr)), "cash": cash_totals(kr_cash)},
         "attis_consumption": {"lines": int(attis_use["lines"].sum()) if len(attis_use) else 0,
                               "cost": _r(attis_use["cost"].sum(), 2) if len(attis_use) else 0.0,
                               "materials": int(attis_use["material"].nunique())},
     }
     return MonthResult(period, {C.SWITCH: switch, C.ATTIS_USE: attis_use, C.CASH_SWITCH: cash_rows,
-                                C.CASH_ALLOWANCE: allowance, C.OOF_SWITCH: oof_rows}, doctor_names, checks)
+                                C.CASH_ALLOWANCE: allowance}, doctor_names, checks)

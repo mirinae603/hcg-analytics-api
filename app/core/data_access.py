@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from app.core.config import settings
+from app.etl.transforms import consumption_until
 
 KPI = Path(settings.KPI_DIR)
 CURATED = Path(settings.CURATED_DIR)
@@ -190,8 +191,27 @@ def load(table: str) -> pd.DataFrame:
     return _load_cached(table)
 
 
+@lru_cache(maxsize=1)
+def stock_snapshot_date() -> pd.Timestamp:
+    """The day the stock tables were counted: fact_inventory's latest snapshot_date (NaT when
+    there is none). Only that column is read, so the big table is not loaded."""
+    p = CURATED / "fact_inventory.parquet"
+    if not p.exists():
+        return pd.NaT
+    return pd.read_parquet(p, columns=["snapshot_date"])["snapshot_date"].max()
+
+
+def stock_consumption() -> pd.DataFrame:
+    """fact_consumption up to the stock snapshot (transforms.consumption_until): the issues the
+    counted stock is set against for days on hand, non-moving and risk, as the ETL's own A3,
+    A8, A9 and A10 do. The consumption extracts run past the snapshot (and have gaps); counting
+    those issues would set a later period's usage against an earlier stock count."""
+    return consumption_until(load("fact_consumption"), stock_snapshot_date())
+
+
 def refresh_cache() -> None:
     _load_cached.cache_clear()
+    stock_snapshot_date.cache_clear()
     _name_to_code.cache_clear()
     _hospital_map_at.cache_clear()
     _material_category_map.cache_clear()
@@ -277,7 +297,7 @@ def nonmoving_scoped(scope: str) -> pd.DataFrame:
     "non-moving" today.
     """
     a2 = load("kpi_inventory_aging")  # already carries its own last_sale_date (see transforms.py A2)
-    cons = load("fact_consumption")
+    cons = stock_consumption()        # the issues up to the stock count A9 classifies
     moving = set()
     if scope in ("billable", "both"):
         sm_path = KPI / "sales_by_material.parquet"
@@ -346,9 +366,10 @@ def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
     (avg daily VALUE of goods sold+consumed). This is a DIFFERENT metric from
     doh_scoped's doh_days (unit quantity, per-SKU MEDIAN) -- a single, portfolio-
     level, VALUE-weighted ratio: SUM(closing_stock_value) / (SUM(internal cost)/181
-    + SUM(billed cost)/182). Verified against real data: ~29.3 days at All Plants,
-    vs. the unit-median DOH's 16.57 -- both correct, answering different questions
-    (typical SKU's cover vs. rupee-weighted portfolio cover, which skews toward
+    + SUM(billed cost)/182), the internal cost being the issues up to the stock count
+    (stock_consumption: the extracts run on past it). Verified against real data: ~29.3
+    days at All Plants, vs. the unit-median DOH's 16.57 -- both correct, answering
+    different questions (typical SKU's cover vs. rupee-weighted portfolio cover, which skews toward
     high-value slow movers exactly the way the mean-vs-median doh_days gap already
     does). Ships alongside doh_days, not replacing it: bands/reorder/overstock
     still need real per-SKU quantities, which a single aggregate ratio can't give.
@@ -384,7 +405,8 @@ def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
     sv = filter_category(filter_plant(load("kpi_stock_value"), p), cat)
     closing_value = float(sv["stock_value_cost"].sum())
 
-    cons_all = load("fact_consumption")
+    # the issues up to the stock count, over the days they span (Dec-25..31-May-26: 181)
+    cons_all = stock_consumption()
     days_span = max((cons_all["posting_date"].max() - cons_all["posting_date"].min()).days, 1)
     cons_f = filter_category(filter_plant(cons_all, p), cat)
     internal_value = float(cons_f["amount_lc"].sum())
@@ -492,7 +514,7 @@ def risk_scoped(scope: str) -> pd.DataFrame:
     transforms.py's `_risk()`).
     """
     rc = load("kpi_risk_classification").copy()
-    cons = load("fact_consumption")
+    cons = stock_consumption()        # the issues up to the stock count A10 classifies
     moving = set()
     if scope in ("billable", "both"):
         sm_path = KPI / "sales_by_material.parquet"

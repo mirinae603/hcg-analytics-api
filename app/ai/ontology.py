@@ -46,6 +46,10 @@ _SHARED_MIN_TABLES = 3
 # Below this overlap two same-named columns are NOT the same thing — the trap that made
 # sales_by_hospital.hospital look joinable to dim_plant.plant when they share zero values.
 _JOIN_MIN_OVERLAP = 0.30
+# Columns that hold document numbers or patient identifiers (PO, GR and invoice numbers, bill
+# numbers, UHIDs, patient names). ontology.json is committed, so their values are never sampled
+# into it: the profile keeps their counts only.
+_PRIVATE = re.compile(r"_no$|_num(?:ber)?$|invoice|\bbill_|uhid|patient_name|reference", re.I)
 
 
 def _query(sql: str, params: list | None = None, one: bool = False):
@@ -88,6 +92,9 @@ def profile_column(table: str, column: str, sample: int = 8) -> dict:
                        all_zero=(lo == 0 and hi == 0))
         except Exception:
             pass
+    if _PRIVATE.search(column):
+        out["samples"] = []                 # a document number or patient identifier
+        return out
     try:
         vals = _query(
             f'SELECT DISTINCT {q} FROM "{table}" WHERE {q} IS NOT NULL LIMIT {sample}')
@@ -396,9 +403,37 @@ def build(save: bool = True) -> dict:
     ont["unclassified"] = still
     ont["rejected"] = rejected
     if save:
-        os.makedirs(os.path.dirname(_CACHE), exist_ok=True)
-        json.dump(ont, open(_CACHE, "w"), indent=1, default=str)
+        _save(ont)
     return ont
+
+
+def refresh(save: bool = True) -> dict:
+    """Profile and verify again, keeping the stored classification: no model call.
+
+    For a rebuilt warehouse whose columns the ontology has already classified (new rows, or
+    columns dropped): the profiles, samples and join evidence are measured afresh and every
+    stored claim goes through verify() once more, so a join that no longer holds — fact_grn's
+    po_no once the import stopped keeping order numbers — leaves `links`. A column the stored
+    ontology has never classified is listed in `unclassified`, and that takes build()."""
+    stored = load()
+    prof = profile()
+    claims = {k: {f: v for f, v in c.items() if f != "profile"}
+              for k, c in (stored.get("columns") or {}).items()}
+    tables = {t: v for t, v in (stored.get("tables") or {}).items() if t in prof["tables"]}
+    ont, rejected = verify({"columns": claims, "tables": tables}, prof)
+    live = {f"{p['table']}.{p['column']}" for cols in prof["tables"].values() for p in cols}
+    ont["unclassified"] = sorted(live - set(ont["columns"]))
+    ont["rejected"] = rejected
+    if save:
+        _save(ont)
+    return ont
+
+
+def _save(ont: dict) -> None:
+    os.makedirs(os.path.dirname(_CACHE), exist_ok=True)
+    with open(_CACHE, "w") as f:
+        json.dump(ont, f, indent=1, default=str)
+    load.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -471,6 +506,14 @@ def primary_measure(table: str, unit: str = "") -> str:
 
 # `python -m app.ai.ontology` is the rebuild command tests/test_ontology.py tells you to run
 # when the ontology goes stale, and without this block it silently did nothing. It still
-# needs the Azure OpenAI key in .env: the classify step calls the LLM.
+# needs the Azure OpenAI key in .env: the classify step calls the LLM. `--refresh` re-measures
+# a rebuilt warehouse against the stored classification and needs no key.
 if __name__ == "__main__":
-    build()
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m app.ai.ontology")
+    ap.add_argument("--refresh", action="store_true",
+                    help="profile and verify again with the stored classification (no model call)")
+    args = ap.parse_args()
+    ont = refresh() if args.refresh else build()
+    print(f"[ontology] {len(ont['columns'])} columns, {len(ont['links'])} links, "
+          f"{len(ont['disjoint'])} disjoint, {len(ont['unclassified'])} unclassified")

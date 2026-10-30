@@ -6,9 +6,9 @@
 # density measured per column, dead ones excluded.
 #
 # EXCLUDED after measuring: Selling Price and Total Sellling price (100% filled, 100% ZERO),
-# Free Qty and Customer (0% filled), Formulary on GRN (all zero — the real one is on
-# dim_material), and PR No / PR Date / PO TAT (4-6% filled; a requisition-cycle answer built
-# on 6% of rows misleads more than it informs).
+# Free Qty and Customer (0% filled), Formulary on GRN (SAP's own flag, messy — the real one is
+# on dim_material and in the Item Masters), and PR No / PR Date / PO TAT (4-6% filled; a
+# requisition-cycle answer built on 6% of rows misleads more than it informs).
 from __future__ import annotations
 
 from app.ai.resolve import brief
@@ -16,16 +16,20 @@ from app.ai.warehouse import con
 
 
 def test_the_gst_split_is_queryable():
+    # Dec-25..Sep-26 order lines after the import fix (no deleted lines, no lines without a
+    # material, no return lines): ₹42.74 Cr. It was ₹48.79 Cr over Dec-25..May-26 with the
+    # first two still counted, ₹42.76 Cr with the returns.
     c, s, i = con().execute(
         "SELECT SUM(cgst_value)/1e7, SUM(sgst_value)/1e7, SUM(igst_value)/1e7 "
         "FROM fact_po").fetchone()
-    assert abs((c + s + i) - 48.79) < 0.1, (c, s, i)
+    assert abs((c + s + i) - 42.74) < 0.05, (c, s, i)
 
 
 def test_tax_does_not_disturb_the_ex_tax_spend_figure():
-    # the number every dashboard shows must not move because tax columns arrived
+    # the number every dashboard shows must not move because tax columns arrived (₹807.24 Cr
+    # over Dec-25..Sep-26 since the import fix; see test_source_completeness.py)
     total = con().execute("SELECT SUM(total_value_wo_tax)/1e7 FROM fact_po").fetchone()[0]
-    assert abs(total - 649.91) < 0.05, total
+    assert abs(total - 807.24) < 0.05, total
 
 
 def test_receipt_side_tax_is_there_too():

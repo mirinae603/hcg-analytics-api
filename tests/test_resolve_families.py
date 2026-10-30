@@ -165,16 +165,24 @@ def test_an_unambiguous_name_gets_no_caution():
 
 
 def test_the_reporting_window_is_the_transaction_window():
+    from app.ai import windows
     from app.ai.resolve import reporting_window
     w = reporting_window()
-    assert w.startswith("2025-12") and "2026-05" in w
+    sales = windows.sales_months()
+    # sales first, each source with its own window read from the data
+    assert w.startswith(f"{sales[0]}-01 to {windows.month_end(sales[-1])} for sales")
+    for src, months in windows.transaction_windows():
+        assert f"to {windows.month_end(months[-1])} for {src.label} ({src.table}.{src.column})" in w
+        for gap in windows.missing_months(months):
+            assert gap in w
     assert "do NOT extend the reporting period" in w
 
 
 def test_a_period_question_gets_the_window_even_with_nothing_else_to_resolve():
     # answered "2020-01-31 to 2026-12-03" — a range assembled from expiry and forecast dates
     b = brief("What period does our data cover?")
-    assert "REPORTING PERIOD" in b and "2026-05" in b
+    from app.ai import windows
+    assert "REPORTING PERIOD" in b and windows.sales_months()[-1] in b
 
 
 def test_a_trend_question_gets_it_too():
@@ -207,12 +215,14 @@ def test_an_importance_qualifier_also_gets_a_computed_floor():
 def test_a_family_of_unequal_members_says_so_with_counts():
     # "What is Vardhman's average lead time?" matched five vendors and was answered 2.68
     # days — the unweighted mean of five per-vendor averages, one with 128,357 rows and
-    # another with one. The real figure is 4.77.
+    # another with one. The real figure is 4.77. (The dominant member has 189,292 receipt
+    # rows since the import fix of 2026-10-23 added Jun-Aug 26 and dropped returns and
+    # lines without a material; it is still 97% of the family.)
     from app.ai.resolve import _weight_note
     fam = next(f for f in resolve("What is Vardhman's average lead time?")["families"]
                if f["token"] == "vardhman")
     note = _weight_note(fam)
-    assert "128,357" in note and "97%" in note
+    assert "189,292" in note and "97%" in note
     assert "do NOT take a plain mean" in note
 
 

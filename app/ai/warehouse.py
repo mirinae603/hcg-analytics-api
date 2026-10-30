@@ -154,8 +154,8 @@ def _fix_material_duplicate_keys(con: duckdb.DuckDBPyConnection) -> None:
 #     8x band of the material's own median — gotcha #15's rule, computed ONCE) + the
 #     sample size backing it, so "is this price stable enough to rank?" is a column.
 #   • canonical category (dim_material.material_group), never the raw messy field.
-#   • is_capex_or_service flag (material NULL) so a construction/service line can't be
-#     surfaced as "the top item purchased".
+#     (Lines without a material — construction, service, AMC — are not in fact_grn at all:
+#     the import leaves them out, so the mart needs no flag for them.)
 #   • unit_price per line so cross-plant/vendor price comparison is per-UNIT by default.
 #   • vendor lead time pre-joined onto every line (removes the 2-hop join the model
 #     kept getting wrong).
@@ -323,12 +323,11 @@ def _build_procurement_mart(con: duckdb.DuckDBPyConnection) -> None:
         CREATE OR REPLACE VIEW mart_procurement AS
         SELECT g.plant, g.material, g.material_desc,
                dm.material_group AS category, dm.material_type, dm.manufacturer_desc, dm.generic_name,
-               g.vendor_code, g.vendor_name, g.po_no, g.gr_no,
+               g.vendor_code, g.vendor_name,
                g.gr_qty AS qty,
                g.net_price AS unit_price,
                g.unit_mrp,
                g.total_amount_wo_tax AS line_value,
-               (g.material IS NULL) AS is_capex_or_service,
                ps.clean_median_price AS material_median_price,
                ps.clean_n AS material_price_sample_n,
                (ps.clean_median_price IS NOT NULL

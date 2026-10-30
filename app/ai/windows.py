@@ -7,15 +7,24 @@ exist. The texts now carry tokens, and fill() puts in what the data says today:
   <<REPORTS>>        HCG's formulary / spend reports: "Jun–Aug 2026"   (formulary_summary.period)
   <<REPORTS_RANGE>>  the same as '2026-06..2026-08'
   <<REPORTS_LATEST>> the newest report month: "Aug-2026"
-  <<SALES>>          SAP sales / purchase / consumption: "Dec-2025…May-2026"   (sales_monthly.month)
+  <<SALES>>          SAP sales (billing): "Dec-2025…May-2026"   (sales_monthly.month)
   <<SALES_SHORT>>    "Dec–May"
   <<SALES_MONTHS>>   how many months: "6"
   <<SALES_START>>    first day of the sales window: '2025-12-01'
   <<SALES_END>>      first day after it: '2026-06-01'
   <<SALES_YEARS>>    how those months fall in calendar years: "'2025' covers Dec only (1 month),
                      '2026' covers Jan–May (5 months)"
+  <<RECEIPTS>>       goods receipts: "Dec-2025…Aug-2026"   (fact_grn.posting_date)
+  <<ORDERS>>         purchase orders: "Dec-2025…Sep-2026"   (fact_po.posting_date)
+  <<CONSUMPTION>>    internal consumption: "Dec-2025…Sep-2026 (no Aug-2026)"
+                     (fact_consumption.posting_date); a month inside the window with no data
+                     is named, so a trend is not read through it
   <<SNAPSHOT>>       the inventory snapshot date: 2026-05-31   (fact_inventory.snapshot_date)
   <<SNAPSHOT_SQL>>   the same as a SQL value: DATE '2026-05-31'
+
+The sources end in different months (billing before the receipts, the receipts before the
+orders), so each has its own window (SOURCES; transaction_windows()). The procurement totals
+the texts quote are tokens too (app/ai/figures.py), filled by the same fill().
 
 fill() runs where a text is handed over: the two model-call wrappers (orchestrator._chat and
 deep.llm.chat) fill every message and tool description, and the few texts shown to the user
@@ -30,6 +39,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from app.core.config import settings
 
@@ -45,11 +55,16 @@ def _key(path: Path):
     return str(path), st.st_mtime_ns, st.st_size
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _months_at(path: str, _mtime: int, _size: int, column: str) -> tuple[str, ...]:
     try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
-        values = pq.read_table(path, columns=[column]).column(column).to_pylist()
+        col = pq.read_table(path, columns=[column]).column(column)
+        if pa.types.is_timestamp(col.type) or pa.types.is_date(col.type):
+            col = pc.strftime(col, format="%Y-%m")       # a date column: its months, not 300k dates
+        values = pc.unique(col).to_pylist()
     except Exception:  # unreadable or wrong schema: the window is unknown
         return ()
     return tuple(sorted({str(v)[:7] for v in values if v is not None and _YM.match(str(v)[:7])}))
@@ -72,10 +87,37 @@ def report_months() -> tuple[str, ...]:
     return _months_at(*k, "period") if k else ()
 
 
+class Source(NamedTuple):
+    """One SAP transaction table and the date its months are read by."""
+    token: str          # the <<TOKEN>> of its window
+    label: str          # in words, as the texts name it
+    folder: str         # the settings attribute of its folder
+    table: str
+    column: str
+
+
+# Sales first: the window a sales figure (and the REPORTING PERIOD line) leads with.
+SOURCES = (Source("SALES", "sales", "KPI_DIR", "sales_monthly", "month"),
+           Source("RECEIPTS", "goods receipts", "CURATED_DIR", "fact_grn", "posting_date"),
+           Source("ORDERS", "purchase orders", "CURATED_DIR", "fact_po", "posting_date"),
+           Source("CONSUMPTION", "internal consumption", "CURATED_DIR", "fact_consumption", "posting_date"))
+SALES = SOURCES[0]
+
+
+def months_of(source: Source) -> tuple[str, ...]:
+    """The months ('2026-05', ...) a source has rows in; () when it cannot be read."""
+    k = _key(Path(getattr(settings, source.folder)) / f"{source.table}.parquet")
+    return _months_at(*k, source.column) if k else ()
+
+
 def sales_months() -> tuple[str, ...]:
-    """Months of the SAP sales / purchase / consumption tables, from sales_monthly."""
-    k = _key(Path(settings.KPI_DIR) / "sales_monthly.parquet")
-    return _months_at(*k, "month") if k else ()
+    """Months of the SAP sales (billing) tables, from sales_monthly."""
+    return months_of(SALES)
+
+
+def transaction_windows() -> list[tuple[Source, tuple[str, ...]]]:
+    """Every source in SOURCES order with its months; a source that cannot be read is left out."""
+    return [(s, m) for s in SOURCES if (m := months_of(s))]
 
 
 def snapshot_date() -> str | None:
@@ -112,6 +154,33 @@ def _next_month(ym: str) -> str:
     return f"{y + (m == 12)}-{m % 12 + 1:02d}"
 
 
+def month_end(ym: str) -> str:
+    """'2026-02' -> '2026-02-28': the last day of the month."""
+    return f"{ym}-{calendar.monthrange(int(ym[:4]), int(ym[5:7]))[1]:02d}"
+
+
+def missing_months(months) -> tuple[str, ...]:
+    """The months between the first and the last of `months` that are not in it: a month with
+    no data inside a source's window ('2026-08' when consumption has Jul and Sep)."""
+    if not months:
+        return ()
+    have, out, m = set(months), [], months[0]
+    while m < months[-1]:
+        if m not in have:
+            out.append(m)
+        m = _next_month(m)
+    return tuple(out)
+
+
+def window(months) -> str:
+    """('2025-12', ..., '2026-07', '2026-09') -> 'Dec-2025…Sep-2026 (no Aug-2026)'."""
+    if not months:
+        return ""
+    gaps = missing_months(months)
+    text = f"{month_label(months[0])}…{month_label(months[-1])}"
+    return text + (f" (no {', '.join(month_label(g) for g in gaps)})" if gaps else "")
+
+
 def _years(months) -> str:
     by: dict[str, list[str]] = {}
     for m in months:
@@ -124,9 +193,13 @@ def _years(months) -> str:
 
 
 def values() -> dict[str, str]:
-    """Every token's text for the data as it is now."""
+    """Every token's text for the data as it is now (the months here, and the totals of
+    app/ai/figures.py)."""
+    from app.ai import figures
     r, s, snap = report_months(), sales_months(), snapshot_date()
     return {
+        **{src.token: window(months_of(src)) or f"the {src.label} months" for src in SOURCES[1:]},
+        **figures.values(),
         "REPORTS": span(r) or "the report months",
         "REPORTS_RANGE": f"{r[0]}..{r[-1]}" if r else "the report months",
         "REPORTS_LATEST": month_label(r[-1]) if r else "the latest report month",

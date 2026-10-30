@@ -36,11 +36,28 @@ def _attach_material_meta(df: pd.DataFrame, dim_material: pd.DataFrame) -> pd.Da
     return df.merge(meta, on="material", how="left", suffixes=("", "_m"))
 
 
+def consumption_until(cons: pd.DataFrame, snapshot) -> pd.DataFrame:
+    """The issues a stock snapshot closes: those posted on or before it.
+
+    Days on hand, turnover, non-moving and risk set the stock counted on the snapshot date
+    against the consumption that led up to it. Consumption extracts keep arriving after the
+    snapshot (Jun-Sep 26 beside a 31-May-26 stock count); counting those would mix two stock
+    levels and give negative 'days since last sale'. No snapshot date: every issue counts."""
+    if pd.isna(snapshot):
+        return cons
+    return cons[cons["posting_date"] <= snapshot]
+
+
+def _months(df: pd.DataFrame) -> set:
+    return set(zip(df["year"], df["month"]))
+
+
 # --------------------------------------------------------------------------- #
 # INVENTORY
 # --------------------------------------------------------------------------- #
 def build_inventory_kpis(inv: pd.DataFrame, cons: pd.DataFrame, dim_material: pd.DataFrame):
     snapshot = inv["snapshot_date"].max()
+    cons = consumption_until(cons, snapshot)
 
     # ---- A1 Current Stock Value (per plant+material) ----
     a1 = (inv.groupby(["plant", "material", "material_desc", "material_group"], dropna=False)
@@ -153,6 +170,11 @@ def build_inventory_kpis(inv: pd.DataFrame, cons: pd.DataFrame, dim_material: pd
 # STOCK LEVEL CHANGE (A6) — GRN inflow minus consumption outflow per month
 # --------------------------------------------------------------------------- #
 def build_stock_change(grn: pd.DataFrame, cons: pd.DataFrame, dim_material: pd.DataFrame):
+    # Only months both sources cover: a month with receipts and no consumption extract
+    # (Aug-26) or the reverse (Sep-26) is a missing file, not a stock build-up or run-down.
+    both = _months(grn) & _months(cons)
+    grn = grn[[m in both for m in zip(grn["year"], grn["month"])]]
+    cons = cons[[m in both for m in zip(cons["year"], cons["month"])]]
     inflow = (grn.groupby(["plant", "material", "year", "month"], dropna=False)["gr_qty"]
                  .sum().rename("inflow").reset_index())
     outflow = (cons.groupby(["plant", "material", "year", "month"], dropna=False)["qty"]
@@ -260,10 +282,11 @@ def build_additional_kpis(grn: pd.DataFrame, po: pd.DataFrame):
         grn.loc[(grn[c] < 0) | (grn[c] > 365), c] = np.nan
 
     # ---- E2 Procurement Cycle Time ----
+    # gr_lines counts receipt LINES (fact_grn carries no GR number: see app/etl/ingest.py)
     e2 = (grn.groupby(["plant", "year", "month"], dropna=False)
              .agg(avg_po_to_gr_tat=("po_to_gr_tat", "mean"),
                   avg_pr_to_gr_tat=("pr_to_gr_tat", "mean"),
-                  gr_lines=("gr_no", "count"))
+                  gr_lines=("gr_qty", "size"))
              .reset_index())
     _save(e2, "kpi_cycle_time")
 
@@ -271,7 +294,7 @@ def build_additional_kpis(grn: pd.DataFrame, po: pd.DataFrame):
     e3 = (grn.groupby(["vendor_name"], dropna=False)
              .agg(avg_lead_time_days=("po_to_gr_tat", "mean"),
                   median_lead_time_days=("po_to_gr_tat", "median"),
-                  gr_lines=("gr_no", "count"))
+                  gr_lines=("gr_qty", "size"))
              .reset_index())
     e3 = e3[e3["gr_lines"] >= 3].sort_values("avg_lead_time_days")
     _save(e3, "kpi_vendor_lead_time")
@@ -305,10 +328,13 @@ def build_all(curated: dict):
     print("=== Building additional KPIs ===")
     build_additional_kpis(grn, po)
 
-    # Forecasting KPIs (D1-D8) — Phase 4
+    # Forecasting KPIs (D1-D8) — Phase 4. The engine models the months that lead up to the
+    # stock snapshot (its replenishment starts from that stock), so it gets the same
+    # consumption window as the stock KPIs above.
     try:
         from app.forecast import engine
         print("=== Building forecast KPIs ===")
-        engine.build_all(curated)
+        window = consumption_until(cons, inv["snapshot_date"].max())
+        engine.build_all({**curated, "consumption": window})
     except Exception as e:  # forecast module not present yet
         print(f"[kpi] forecast stage skipped: {e}")

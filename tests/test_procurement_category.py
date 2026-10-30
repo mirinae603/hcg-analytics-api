@@ -8,7 +8,7 @@
 #
 #   1. RECONCILIATION. Run with no category, every rebuild reproduces its committed
 #      parquet row for row and column for column. That is what makes the substitution
-#      safe — Rs 649.91 Cr of PO spend is Rs 649.91 Cr whichever path produced it.
+#      safe — Rs 807.24 Cr of PO spend is Rs 807.24 Cr whichever path produced it.
 #   2. ADDITIVITY. The six buckets partition the portfolio: nothing double-counted,
 #      nothing dropped, on every money measure and on the line/quantity counts too.
 #   3. VOCABULARY SEPARATION. fact_po and kpi_purchase_value ship their own `category`
@@ -30,20 +30,26 @@ from app.core import drill_sources as ds
 
 # Verified directly off fact_po.total_value_wo_tax, and equal to kpi_purchase_value's
 # own total to the rupee — which is what makes the regrain a substitution rather than a
-# re-estimate.
-TOTAL_PO_SPEND = 6499128424.0            # Rs 649.9128 Cr
-ONCO_PO_SPEND = 2367280144.63            # Rs 236.7280 Cr
+# re-estimate. Dec-25..Sep-26 since the import fix of 2026-10-23 (app/etl/ingest.py): deleted
+# PO lines, lines without a material (services, civil works, capital items without a code) and
+# return lines (a negative quantity: 421 lines, Rs -0.33 Cr, 408 of them in Sep-26 at SH01) are
+# no longer counted. Over Dec-25..May-26 with the first two counted it was Rs 649.9128 Cr, onco
+# Rs 236.7280 Cr; with the returns still in, Rs 806.9084 Cr, onco Rs 396.7939 Cr.
+TOTAL_PO_SPEND = 8072408818.34           # Rs 807.2409 Cr
+ONCO_PO_SPEND = 3967998183.05            # Rs 396.7998 Cr
 
-# The six buckets' share of PO spend. Unclassified is the LARGEST bucket here (capex,
-# services and non-catalogue spend) — the exact opposite of stock, where it is Rs 0 —
-# so it must be offered on procurement, never hidden as an empty bucket.
+# The six buckets' share of PO spend. Unclassified is the second largest bucket here
+# (Rs 182.16 Cr: capital items that carry a code, and materials the material master gives
+# no type) — the exact opposite of stock, where it is Rs 0 — so it must be offered on
+# procurement, never hidden as an empty bucket. Before the import fix it was the largest
+# (41.91%), because service and capital lines without a material were counted in it.
 EXPECTED_SPEND_SHARES = {
-    "Unclassified": 41.91,
-    "Onco Drugs": 36.42,
-    "Consumables": 9.48,
-    "Other Drugs": 9.21,
-    "Non-Medical": 2.67,
-    "Lab": 0.30,
+    "Unclassified": 22.57,
+    "Onco Drugs": 49.16,
+    "Consumables": 12.48,
+    "Other Drugs": 12.40,
+    "Non-Medical": 3.00,
+    "Lab": 0.39,
 }
 
 PROC_TABLES = sorted(ds.PROC_REGRAIN)
@@ -118,15 +124,15 @@ def test_po_spend_partitions_across_the_buckets_at_the_verified_shares():
     assert total == pytest.approx(TOTAL_PO_SPEND, rel=1e-9)
 
 
-def test_unclassified_is_the_largest_procurement_bucket_and_must_be_offered():
+def test_unclassified_is_a_large_procurement_bucket_and_must_be_offered():
     """On stock, Unclassified is Rs 0 and the selector rightly hides it. On procurement
-    it is Rs 272 Cr of capex/services/non-catalogue spend — the single largest bucket.
-    Hiding it here would drop 42% of the money out of a filter built to stop money going
+    it is Rs 182 Cr of capital and untyped-material spend — second only to Onco Drugs.
+    Hiding it here would drop 23% of the money out of a filter built to stop money going
     missing."""
     by = {c: float(ds.regrain("kpi_purchase_value", c)["purchase_value"].sum())
           for c in da.CATEGORIES}
     assert by[da.CATEGORY_UNCLASSIFIED] > 0
-    assert max(by, key=by.get) == da.CATEGORY_UNCLASSIFIED
+    assert sorted(by, key=by.get, reverse=True)[:2] == ["Onco Drugs", da.CATEGORY_UNCLASSIFIED]
 
 
 def test_a_bucket_is_a_strict_subset_never_the_whole_portfolio():
@@ -275,13 +281,11 @@ def test_cycle_time_moves_by_bucket_and_is_the_exact_mean_of_that_bucket(client)
     grn = da.load("fact_grn")
     tat = pd.to_numeric(grn["po_to_gr_tat"], errors="coerce")
     grn = grn.assign(_t=tat.mask((tat < 0) | (tat > 365)))
-    # The endpoint reports over its own six-month reporting window (legacy_kpi._PROC_WINDOW),
-    # so the ground truth has to be cut to the same window — otherwise this would be
-    # comparing two different questions and calling the difference a bug.
-    from app.api.legacy_kpi import _PROC_WINDOW
-    win = grn[[(int(y), str(m)) in _PROC_WINDOW for y, m in zip(grn["year"], grn["month"])]]
+    # The endpoint reports over every receipt month fact_grn holds (GR dates are read
+    # day-first, so there is no mis-dated tail left to window out): the ground truth is
+    # every receipt of the bucket.
     for c in ("Onco Drugs", "Lab", "Consumables"):
-        truth = float(win[win["category"] == c]["_t"].mean())
+        truth = float(grn[grn["category"] == c]["_t"].mean())
         assert per_cat[c] == pytest.approx(truth, abs=0.02), c
 
 
@@ -299,22 +303,25 @@ def test_vendor_concentration_is_recomputed_within_the_bucket(client):
 
 
 def test_fill_rate_discloses_the_service_po_cap_instead_of_printing_a_confident_100(client):
-    """2,557 fact_po lines carry a NEGATIVE open_qty; all of them are Unclassified and
-    2,555 are service/blanket POs. The raw ratio for that bucket is 168.6%. The clamp
-    already existed — printing 100% and saying nothing is what would be misleading."""
-    unc = client.get("/kpi/fill-rate/insights",
-                     params={"Category": da.CATEGORY_UNCLASSIFIED}).json()
-    assert unc["totals"]["overall"] == pytest.approx(100.0)
-    assert unc["totals"]["overall_raw"] > 100.0
-    assert unc["totals"]["capped"] is True
-    assert unc["note"] and "service" in unc["note"].lower()
+    """A bucket whose raw ratio passes 100% is clamped AND says why — printing 100% and
+    saying nothing is what would be misleading — and a bucket under 100% is neither.
 
-    # The five real material buckets are CLEANER than the unfiltered figure, not dirtier.
-    for c in ("Onco Drugs", "Other Drugs", "Consumables", "Lab", "Non-Medical"):
+    Until the import fix, 2,557 fact_po lines carried a NEGATIVE open_qty, all Unclassified
+    and 2,555 of them service/blanket POs, so that bucket read 168.6% raw. Those lines have
+    no material; fact_po no longer holds such lines, so no bucket passes 100% today and the
+    clamp is the guard for a line that brings it back."""
+    assert int((da.load("fact_po")["open_qty"] < 0).sum()) == 0
+    for c in da.CATEGORIES:
         body = client.get("/kpi/fill-rate/insights", params={"Category": c}).json()
-        assert body["totals"]["capped"] is False, c
-        assert 0.0 <= body["totals"]["overall_raw"] <= 100.0, c
-        assert body["note"] is None, c
+        raw = body["totals"]["overall_raw"]
+        assert body["totals"]["capped"] is (raw < 0.0 or raw > 100.0), c
+        assert 0.0 <= body["totals"]["overall"] <= 100.0, c
+        if body["totals"]["capped"]:
+            assert body["totals"]["overall"] in (0.0, 100.0), c
+            assert body["note"] and "service" in body["note"].lower(), c
+        else:
+            assert body["totals"]["overall"] == pytest.approx(raw), c
+            assert body["note"] is None, c
 
 
 def test_unfiltered_responses_gain_no_new_keys(client):
@@ -388,8 +395,8 @@ def test_category_support_contract_matches_what_the_endpoints_actually_do(client
 
 
 def test_the_drill_narrows_with_the_bar_it_was_launched_from(client):
-    """A drill must mirror its chart. If the card says Rs 236.7 Cr of onco spend, the
-    panel inside it cannot total Rs 649.9 Cr."""
+    """A drill must mirror its chart. If the card says Rs 396.8 Cr of onco spend, the
+    panel inside it cannot total Rs 807.2 Cr."""
     for kpi in ("purchase-value", "vendor-volume-contribution", "purchase-by-location",
                 "procurement-variance"):
         # One query string, not url + params=: httpx REPLACES an existing query when

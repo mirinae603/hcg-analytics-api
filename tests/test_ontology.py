@@ -11,6 +11,9 @@
 #
 # The test that matters is the last one: this ontology found, unaided, the trap that took a
 # full day to find by hand.
+#
+# ontology.json is committed, so it must also hold no document number or patient identifier,
+# and every join it names must still join in the warehouse it describes.
 from __future__ import annotations
 
 import pytest
@@ -19,6 +22,12 @@ from app.ai import ontology as o
 
 ONT = o.load()
 pytestmark = pytest.mark.skipif(not ONT.get("columns"), reason="ontology not built yet")
+
+
+@pytest.fixture(scope="module")
+def live() -> dict:
+    """The warehouse profiled as it is now (o.profile(): every column and the same-named joins)."""
+    return o.profile()
 
 
 def test_it_was_built_from_the_warehouse():
@@ -125,8 +134,55 @@ def test_a_plain_money_column_is_never_marked_unsummable():
         "app.ai.ontology", fromlist=["x"]).non_additive()
 
 
+# ── privacy ──────────────────────────────────────────────────────────────────
+def test_no_document_number_is_sampled_into_the_committed_ontology():
+    # a profile samples a column's values, and ontology.json ships with the code: a column that
+    # holds PO, GR, invoice or bill numbers, UHIDs or patient names keeps its counts only
+    private = [k for k in ONT["columns"] if o._PRIVATE.search(k.split(".", 1)[1])]
+    assert "fact_po.po_no" in private
+    for key in private:
+        assert not ONT["columns"][key]["profile"].get("samples"), key
+
+
+def test_a_document_number_column_is_profiled_without_its_values(monkeypatch):
+    sql = []
+
+    def warehouse(query, params=None, one=False):
+        sql.append(query)
+        if "information_schema" in query:
+            return ("VARCHAR",)
+        if "COUNT(*)" in query:
+            return (2, 2, 0)
+        return [("PO-A",), ("PO-B",)]
+
+    monkeypatch.setattr(o, "_query", warehouse)
+    p = o.profile_column("fact_po", "po_no")
+    assert (p["rows"], p["distinct"], p["samples"]) == (2, 2, [])
+    assert not any("DISTINCT" in q and "LIMIT" in q for q in sql)       # the values are never read
+    assert o.profile_column("fact_po", "plant")["samples"] == ["PO-A", "PO-B"]
+
+
 # ── staleness ────────────────────────────────────────────────────────────────
-def test_the_ontology_matches_the_warehouse_it_claims_to_describe():
+def test_every_stored_join_still_joins(live):
+    """A join the ontology names is one the model is told it may use. fact_grn's po_no stopped
+    joining fact_po when the import stopped keeping order numbers, and the stored link kept
+    saying 'joinable' while every such join returned nothing. If this fails, run
+    `python -m app.ai.ontology --refresh`."""
+    measured = {(l["column"], l["a"], l["b"]): l["overlap"] for l in live["links"]}
+    stale = []
+    for link in ONT["links"]:
+        if not link.get("joinable"):
+            continue
+        if "other" in link:              # same entity, two column names: measured here
+            ov = o.overlap(link["column"], link["a"], link["other"], link["b"])
+        else:
+            ov = measured.get((link["column"], link["a"], link["b"]), 0.0)
+        if ov < o._JOIN_MIN_OVERLAP:
+            stale.append((link["column"], link["a"], link["b"], ov))
+    assert not stale, f"{len(stale)} stored joins no longer join: {stale[:8]}"
+
+
+def test_the_ontology_matches_the_warehouse_it_claims_to_describe(live):
     """A stale ontology fails SILENTLY, which is the worst way for a guard to fail.
 
     ontology.json is a build artefact that is checked in, and everything derived from it —
@@ -135,9 +191,10 @@ def test_the_ontology_matches_the_warehouse_it_claims_to_describe():
     checks do not error: they simply stop matching anything and never fire again, while the
     test suite stays green and the answers get quietly worse.
 
-    So drift is a test failure. If this fails, run `python -m app.ai.ontology` to rebuild.
+    So drift is a test failure. If this fails, run `python -m app.ai.ontology` to rebuild
+    (`--refresh` when no column is new: it re-measures without the model).
     """
-    from app.ai import ontology, warehouse
+    from app.ai import ontology
 
     ont = ontology.load()
     if not ont.get("columns"):
@@ -147,16 +204,16 @@ def test_the_ontology_matches_the_warehouse_it_claims_to_describe():
     # profile()["tables"][t] is a LIST of column specs, not a name -> spec map. Iterating it
     # as a map builds keys out of stringified dicts, which match nothing and make every
     # column look like it vanished — which is exactly what the first draft of this reported.
-    live = {f'{t}.{c["column"]}' for t, cols in ontology.profile()["tables"].items()
-            for c in cols if c.get("column")}
+    columns = {f'{t}.{c["column"]}' for t, cols in live["tables"].items()
+               for c in cols if c.get("column")}
     known = set(ont["columns"])
 
-    vanished = sorted(known - live)
+    vanished = sorted(known - columns)
     assert not vanished, (
         f"{len(vanished)} ontology columns no longer exist in the warehouse — every check "
         f"keyed to them is now dead and silent: {vanished[:8]}")
 
-    unclassified = sorted(live - known)
+    unclassified = sorted(columns - known)
     assert not unclassified, (
         f"{len(unclassified)} warehouse columns the ontology has never seen, so nothing "
         f"knows whether they are additive, ambiguous or safe to join: {unclassified[:8]}")

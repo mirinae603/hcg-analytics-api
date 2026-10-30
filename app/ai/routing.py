@@ -45,7 +45,7 @@ _LOCKS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(overpay|over-?pay|overpaying|paying too much|price (inconsisten|leakage|dispersion|swing|variation)|inconsistent price)", re.I),
      "This is a PRICE-DISPERSION question → you MUST use mart_material_price_stats, rank by clean_price_spread (or price_ratio) among clean_n>=5, scoped by category. It is a WRONG answer to return a top-by-VALUE list, biggest purchase orders, capex lines, or a sales-margin/profit ranking."),
     (re.compile(r"\b(genuine|actual|real)\b.{0,25}\bsupply\b|\bsupply\b.{0,25}\bexcluding\b.{0,15}\b(capital|capex|service)|exclud\w*\b.{0,15}\b(capital|capex|service)", re.I),
-     "Genuine medical SUPPLY spend → classify on fact_po.doc_type: Supply = doc_type NOT IN ('Service PO','Dom Capital PO','CMC','AMC','Imp capital PO') AND material IS NOT NULL (= ₹429 Cr). Do NOT additionally filter by material_type — NULL-material_type domestic-PO lines are still genuine supply and dropping them undercounts."),
+     "Genuine medical SUPPLY spend → classify on fact_po.doc_type: Supply = doc_type NOT IN ('Service PO','Dom Capital PO','CMC','AMC','Imp capital PO') (order lines without a material are not in fact_po at all). Do NOT additionally filter by material_type — NULL-material_type domestic-PO lines are still genuine supply and dropping them undercounts."),
 ]
 
 
@@ -69,7 +69,7 @@ _CORPUS: list[tuple[str, str]] = [
     ("what is the purchase price of a named item; how much do we pay for this drug; unit cost of a product",
      "SINGLE-ITEM PRICE → mart_material_price_stats clean_median_price + raw_n; report even if clean_n<5 (never refuse), light caveat on small samples."),
     ("capital vs supply spend; biggest purchase orders; genuine medical supply spend excluding capital and service; is this a capex or a stocked item",
-     "CAPEX/SUPPLY SPLIT → classify fact_po.doc_type IN ('Service PO','Dom Capital PO','CMC','AMC','Imp capital PO') OR material IS NULL = Capex/Service; a robot/PET-CT/AMC is capex even with a material code. Never call it a 'medical supply'."),
+     "CAPEX/SUPPLY SPLIT → classify fact_po.doc_type IN ('Service PO','Dom Capital PO','CMC','AMC','Imp capital PO') = Capex/Service; a robot/PET-CT/AMC is capex even with a material code. Order lines without a material (civil works, services without a code) are not in fact_po, so say the capex figure covers coded purchases only. Never call it a 'medical supply'."),
     ("vendor lead time; how fast does a vendor deliver; delivery time for a supplier; PO to GRN turnaround for a vendor",
      "VENDOR LEAD TIME → kpi_vendor_lead_time by vendor_name (or mart_procurement's pre-joined vendor_median_lead_time_days). For a plant/portfolio cycle time use kpi_cycle_time."),
     ("total revenue; total sales; overall margin; revenue and margin; IP vs OP revenue split",
@@ -83,7 +83,7 @@ _CORPUS: list[tuple[str, str]] = [
     ("sales trend of a product; monthly sales of a drug; how has an item's revenue changed month by month; product revenue over time; category sales trend",
      "ITEM/CATEGORY SALES TREND → sales_by_material_month: SELECT period, SUM(revenue), SUM(revenue - cost) … WHERE upper(material_desc) LIKE '%<NAME>%' (or material_group = …) GROUP BY period ORDER BY period. NOT sales_by_material (<<SALES_MONTHS>>-month total), NOT sales_monthly (whole company), NOT purchasing."),
     ("total procurement spend; how much did we spend on purchasing; overall purchase value",
-     "PROCUREMENT SPEND (total) → SUM(kpi_purchase_value.purchase_value) = ₹649.91 Cr (matches the dashboard). Not fact_grn received value."),
+     "PROCUREMENT SPEND (total) → SUM(kpi_purchase_value.purchase_value) = <<PROCUREMENT_TOTAL>> over <<ORDERS>> (matches the dashboard). Not fact_grn received value."),
     ("procurement spend by category; spend on pharma or injections or a drug type; category-filtered spend",
      "CATEGORY/PHARMA SPEND → fact_po JOIN dim_material on material_type/material_group; kpi_purchase_value has NO material/type column and its 'category' is a raw messy field — never use it for a pharma/category filter."),
     ("which items are high risk; at-risk inventory items; risk classification of stock",

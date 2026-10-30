@@ -42,12 +42,15 @@ def test_within_90_days_excludes_already_expired_stock():
     # The canonical buckets are Expired / 0-30d / 31-90d / 91-180d. Asked how much expires
     # in the next 90 days the model summed all of them: 101,005 units against a true
     # 45,223, then 87,775 on the next run. The arithmetic is trivial and the judgement is
-    # not, so both live here.
+    # not, so both live here. (Since the import fix of 2026-10-23 the stock snapshot's
+    # 'dd.mm.yyyy' expiry dates are read day-first — 247 batches had day and month swapped —
+    # so the true figures are 43,560 units / Rs 39,54,181 within 90 days and 55,181 units
+    # already expired; they were 45,223 / Rs 39,97,173 and 55,782.)
     res = _kpi_rows(tools.get_kpi("near-expiry"))
     cum = shapes.derive_exposure(res).get("cumulative") or {}
-    assert cum["within_90_days"]["qty"] == 45223.0
-    assert round(cum["within_90_days"]["value"]) == 3997173
-    assert cum["already_expired"]["qty"] == 55782.0
+    assert cum["within_90_days"]["qty"] == 43560.0
+    assert round(cum["within_90_days"]["value"]) == 3954181
+    assert cum["already_expired"]["qty"] == 55181.0
     # and the two must never be silently added
     assert "not add them together" in cum["note"].lower()
 

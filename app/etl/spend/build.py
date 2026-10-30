@@ -8,9 +8,8 @@ Usage (after python -m app.etl.formulary has filled the line cache; takes second
 Every month in the line cache is rebuilt; a month published earlier but no longer cached
 keeps its published rows. Both lists (SCHEME and CASH&TPA) come from the one Spend Analysis
 Main Sheet; which cash brands HCG bifurcates comes from app/data/reference/
-cash_tpa_bifurcation.csv. The out-of-formulary margin matches each month's OUT OF FORMULARY
-brands (that month's Item Master) to a priced formulary brand of the CASH&TPA sheet by
-molecule, strength and form (app/etl/spend/oof.py). Each month's KR figures are printed so
+cash_tpa_bifurcation.csv. The out-of-formulary margin is not built here: it follows HCG's
+purchase (GRN) method in python -m app.etl.purchase. Each month's KR figures are printed so
 they can be set beside HCG's email (tests/test_spend_golden.py checks KR Aug-26 against it).
 Tables are written to temp files and os.replace'd, spend_validation.json last.
 """
@@ -31,12 +30,11 @@ from app.etl.formulary.aggregate import apply_doctor_names, connect, doctor_name
 from app.etl.formulary.build import _check_columns
 from app.etl.formulary.discover import BuildError, _excel_files, discover
 from app.etl.formulary.extract import cached_periods, read_sidecar
-from app.etl.formulary.masters import (load_hospital_map, load_item_master, load_payer_master,
-                                       load_payer_overrides)
+from app.etl.formulary.masters import load_hospital_map, load_payer_master, load_payer_overrides
 from app.etl.spend import config as C
 from app.etl.spend.aggregate import MonthResult, aggregate_month
 from app.etl.spend.masters import (BrandList, load_bifurcation, load_brand_blocks, load_cash_exclusions,
-                                   load_cash_list, load_price_list, load_scheme_list)
+                                   load_cash_list, load_scheme_list)
 
 SORT_KEYS = {
     C.SWITCH: ["period", "plant", "patient_type", "category", "doctor_id", "material"],
@@ -45,18 +43,15 @@ SORT_KEYS = {
                     "material"],
     C.CASH_ALLOWANCE: ["period", "plant", "material"],
     C.BRAND_BLOCKS: ["block_id", "p_rank", "material"],
-    C.OOF_SWITCH: ["period", "plant", "patient_type", "category", "payer_bucket", "doctor_id",
-                   "material"],
 }
-INT_COLS = ("lines", "block_id", "block_size", "p_rank", "candidates")
+INT_COLS = ("lines", "block_id", "block_size", "p_rank")
 FLOAT_COLS = ("qty", "actual_cost", "used_price", "suggested_price", "used_value",
               "suggested_value", "cost", "mrp", "cash_qty", "used_mrp", "used_gst",
               "suggested_mrp", "suggested_gst", "used_cost_value", "used_mrp_value",
               "suggested_cost_value", "suggested_mrp_value", "actual_margin", "potential_margin",
-              "margin_loss", "sharing", "group_qty", "allowed_qty", "excess_qty", "block_sharing_sum",
-              "bill_mrp")
-BOOL_COLS = ("attis", "bifurcated", "tie", "scheme_attis", "matched")
-DOCTOR_TABLES = (C.SWITCH, C.CASH_SWITCH, C.OOF_SWITCH)
+              "margin_loss", "sharing", "group_qty", "allowed_qty", "excess_qty", "block_sharing_sum")
+BOOL_COLS = ("attis", "bifurcated", "tie", "scheme_attis")
+DOCTOR_TABLES = (C.SWITCH, C.CASH_SWITCH)
 
 
 def _log(msg: str) -> None:
@@ -84,14 +79,11 @@ def _fy_label(fy: tuple) -> str:
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
-def month_report(res: MonthResult, sidecar: dict, item_master: str = None) -> dict:
+def month_report(res: MonthResult, sidecar: dict) -> dict:
     rep = {"period": res.period, "label": FC.period_label(res.period),
-           "source_file": sidecar.get("source_file"), "item_master": item_master, **res.checks,
-           "warnings": []}
+           "source_file": sidecar.get("source_file"), **res.checks, "warnings": []}
     if not res.checks["scheme"]["lines"]:
         rep["warnings"].append("no GOV line uses a brand that has a scheme suggestion")
-    if item_master is None:
-        rep["warnings"].append("no Item Master for this month: no out-of-formulary margin")
     return rep
 
 
@@ -106,9 +98,7 @@ def summary_line(rep: dict) -> str:
             f"KR Attis {kr['attis']['used_value']:,.2f} / {kr['attis']['suggested_value']:,.2f} "
             f"/ {kr['attis']['saving_missed']:,.2f}; KR Healthium {kr['healthium']['saving_missed']:,.2f}; "
             f"KR cash & TPA {kr['cash']['actual_margin']:,.2f} / {kr['cash']['potential_margin']:,.2f} "
-            f"/ {kr['cash']['margin_loss']:,.2f}; KR out of formulary {kr['oof']['actual_margin']:,.2f} / "
-            f"{kr['oof']['potential_margin']:,.2f} / {kr['oof']['margin_loss']:,.2f} "
-            f"({kr['oof']['matched_brands']} of {kr['oof']['brands']} brands matched)")
+            f"/ {kr['cash']['margin_loss']:,.2f}")
 
 
 def scheme_report(sl: BrandList) -> dict:
@@ -251,19 +241,6 @@ def full_report(month_reports: dict, sl: BrandList, cl: BrandList, bifurcation: 
                            "used and the suggested brand; actual margin = qty x used margin, "
                            "potential = qty x suggested margin, loss = potential - actual; "
                            "% = loss / potential",
-            "oof_patient": "payer bucket CASH or CASH(TPA), IP and OP, material flagged OUT OF "
-                           "FORMULARY in that month's Item Master",
-            "oof_match": "a brand of the CASH&TPA sheet with an FY price, MRP and GST, flagged "
-                         "FORMULARY in that month's Item Master, with the same Minor Group "
-                         "(molecule), strength, dosage form and kind (modified release, "
-                         "liposomal, protein-bound), and an MRP within "
-                         f"{C.OOF_PRICE_BAND:g}x of the OOF brand's MRP per unit on the bills; of "
-                         "several, the highest unit margin. Derived by the build until HCG sends "
-                         "its own list",
-            "oof_values": "actual margin = bill MRP / (1 + the matched brand's GST%) - bill cost; "
-                          "potential = qty x (matched MRP / (1 + GST%) - matched HCG Pharma "
-                          "price); loss = potential - actual; % = loss / potential; unmatched "
-                          "brands add no margin",
         },
         "scheme_list": scheme_report(sl),
         "cash_list": cash_report(cl, bifurcation, excluded, hit),
@@ -295,7 +272,6 @@ def build(*, raw=None, cache=None, data=None, reference=None, dry_run: bool = Fa
                              f"cover {', '.join(outside)}")
     bifurcation = load_bifurcation(reference)
     blocks = load_brand_blocks(main_sheet, sl, cl)          # before the exclusions: master data
-    priced = load_price_list(main_sheet)
     excluded = load_cash_exclusions(reference)
     hit = exclude(cl, excluded)
     hospitals = load_hospital_map(reference)
@@ -311,12 +287,9 @@ def build(*, raw=None, cache=None, data=None, reference=None, dry_run: bool = Fa
     con = connect()
     try:
         for p in periods:
-            im_path = manifest.item_masters.get(p)
             res = aggregate_month(p, cache=cache, scheme=sl, cash=cl, bifurcation=bifurcation,
-                                  payer_master=pm, overrides=overrides, hospitals=hospitals,
-                                  con=con, oof_master=(load_item_master(im_path).items, priced)
-                                  if im_path else None)
-            rep = month_report(res, sidecars[p], im_path.name if im_path else None)
+                                  payer_master=pm, overrides=overrides, hospitals=hospitals, con=con)
+            rep = month_report(res, sidecars[p])
             reports[p] = rep
             results.append(res)
             log(summary_line(rep))

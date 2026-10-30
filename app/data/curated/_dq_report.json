@@ -1,19 +1,1046 @@
 {
-  "consumption_rows": 128369,
+  "consumption_rows": 190360,
   "inventory_rows": 97590,
-  "grn_rows": 255803,
-  "po_rows": 249884,
+  "grn_rows": 383763,
+  "po_rows": 394540,
   "plants": 53,
-  "materials": 24931,
-  "vendors": 3576,
-  "cost_centers": 730,
+  "materials": 26076,
+  "vendors": 2635,
+  "cost_centers": 776,
   "months_consumption": [
     1,
     2,
     3,
     4,
     5,
+    6,
+    7,
+    9,
     12
   ],
-  "elapsed_sec": 319.9
+  "periods": {
+    "consumption": [
+      "2025-12",
+      "2026-01",
+      "2026-02",
+      "2026-03",
+      "2026-04",
+      "2026-05",
+      "2026-06",
+      "2026-07",
+      "2026-09"
+    ],
+    "grn": [
+      "2025-12",
+      "2026-01",
+      "2026-02",
+      "2026-03",
+      "2026-04",
+      "2026-05",
+      "2026-06",
+      "2026-07",
+      "2026-08"
+    ],
+    "po": [
+      "2025-12",
+      "2026-01",
+      "2026-02",
+      "2026-03",
+      "2026-04",
+      "2026-05",
+      "2026-06",
+      "2026-07",
+      "2026-08",
+      "2026-09"
+    ]
+  },
+  "sources": {
+    "consumption": {
+      "folder": "Consumption Dec 25 to May 26",
+      "months": [
+        {
+          "period": "2025-12",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 21634,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 21634,
+          "qty": 3677596.81,
+          "amount": 109103524.67,
+          "plants": 46
+        },
+        {
+          "period": "2026-01",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 22406,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 22406,
+          "qty": 4054300.776,
+          "amount": 124646121.87,
+          "plants": 47
+        },
+        {
+          "period": "2026-02",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 20857,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 20857,
+          "qty": 3319183.63,
+          "amount": 110351111.68,
+          "plants": 47
+        },
+        {
+          "period": "2026-03",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 24314,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 24314,
+          "qty": 4218128.368,
+          "amount": 135155900.27,
+          "plants": 49
+        },
+        {
+          "period": "2026-04",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 21168,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 21168,
+          "qty": 4089294.166,
+          "amount": 113026650.3,
+          "plants": 49
+        },
+        {
+          "period": "2026-05",
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "source": "consolidated",
+          "issues_booked": "positive",
+          "lines_read": 17990,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 17990,
+          "qty": 3198352.0,
+          "amount": 78732721.24,
+          "plants": 29
+        },
+        {
+          "period": "2026-06",
+          "file": "03.Consumption Report June 2026.xlsx",
+          "source": "monthly",
+          "issues_booked": "negative (signs flipped)",
+          "lines_read": 19379,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 19379,
+          "qty": 2594018.0,
+          "amount": 88544604.73,
+          "plants": 28
+        },
+        {
+          "period": "2026-07",
+          "file": "04.Consumption Report-1 July 2026.xlsx",
+          "source": "monthly",
+          "issues_booked": "positive",
+          "lines_read": 20215,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 20215,
+          "qty": 3099680.0,
+          "amount": 94827922.21,
+          "plants": 26
+        },
+        {
+          "period": "2026-09",
+          "file": "06.Consumption Report Sept 2026.xlsx",
+          "source": "monthly",
+          "issues_booked": "positive",
+          "lines_read": 22397,
+          "other_movements": 0,
+          "no_quantity": 0,
+          "lines": 22397,
+          "qty": 4040942.252,
+          "amount": 116321091.36,
+          "plants": 43
+        }
+      ],
+      "superseded": [
+        {
+          "file": "01.Consumption Report April 2026.xlsx",
+          "periods": [
+            "2026-04"
+          ]
+        },
+        {
+          "file": "02.Consumption Report May 2026.xlsx",
+          "periods": [
+            "2026-05"
+          ]
+        },
+        {
+          "file": "09.Consumption Report Dec 2025.xlsx",
+          "periods": [
+            "2025-12"
+          ]
+        },
+        {
+          "file": "10.Consumption Report Jan 2026.xlsx",
+          "periods": [
+            "2026-01"
+          ]
+        },
+        {
+          "file": "11.Consumption Report Feb 2026.xlsx",
+          "periods": [
+            "2026-02"
+          ]
+        },
+        {
+          "file": "12.Consumption Report Mar 2026.xlsx",
+          "periods": [
+            "2026-03"
+          ]
+        }
+      ],
+      "files": [
+        {
+          "file": "01.Consumption Report April 2026.xlsx",
+          "sheet": "01.Consumption Report April 202",
+          "periods": {
+            "2026-04": 17642
+          },
+          "undated": 1,
+          "dates": {
+            "date": 17642,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "02.Consumption Report May 2026.xlsx",
+          "sheet": "01.Consumption Report May 2026",
+          "periods": {
+            "2026-05": 17906
+          },
+          "undated": 1,
+          "dates": {
+            "text": 17906,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "03.Consumption Report June 2026.xlsx",
+          "sheet": "03.Consumption Report June 2026",
+          "periods": {
+            "2026-06": 19379
+          },
+          "undated": 1,
+          "dates": {
+            "text": 19379,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "04.Consumption Report-1 July 2026.xlsx",
+          "sheet": "04.Consumption Report-1 July 20",
+          "periods": {
+            "2026-07": 20215
+          },
+          "undated": 1,
+          "dates": {
+            "date": 20215,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "06.Consumption Report Sept 2026.xlsx",
+          "sheet": "03.Consumption Report Sept 2026",
+          "periods": {
+            "2026-09": 22397
+          },
+          "undated": 1,
+          "dates": {
+            "date": 22397,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "09.Consumption Report Dec 2025.xlsx",
+          "sheet": "09.Consumption Report Dec 2025",
+          "periods": {
+            "2025-12": 19088
+          },
+          "undated": 1,
+          "dates": {
+            "date": 19088,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "10.Consumption Report Jan 2026.xlsx",
+          "sheet": "10.Consumption Report Jan 2026",
+          "periods": {
+            "2026-01": 18973
+          },
+          "undated": 1,
+          "dates": {
+            "date": 18973,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "11.Consumption Report Feb 2026.xlsx",
+          "sheet": "11.Consumption Report Feb 2026",
+          "periods": {
+            "2026-02": 20856
+          },
+          "undated": 3,
+          "dates": {
+            "date": 20856,
+            "serial": 1,
+            "blank": 2,
+            "unparseable": 1
+          }
+        },
+        {
+          "file": "12.Consumption Report Mar 2026.xlsx",
+          "sheet": "12.Consumption Report Mar 2026",
+          "periods": {
+            "2026-03": 21273
+          },
+          "undated": 1,
+          "dates": {
+            "date": 21273,
+            "blank": 1,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "Consumption report Dec 25 to May 26.xlsx",
+          "sheet": "Consumption report Dec 25 to Ma",
+          "periods": {
+            "2025-12": 21634,
+            "2026-01": 22406,
+            "2026-02": 20857,
+            "2026-03": 24314,
+            "2026-04": 21168,
+            "2026-05": 17990
+          },
+          "undated": 1,
+          "dates": {
+            "date": 128369,
+            "blank": 1,
+            "unparseable": 0
+          }
+        }
+      ],
+      "skipped": []
+    },
+    "inventory": {
+      "folder": "Inventory report as on 31 May 2026",
+      "file": "Consolidated Inventory report 02.06.2026.xlsx",
+      "rows": 97590,
+      "snapshot": "2026-05-31",
+      "dates": {
+        "expiry_date": {
+          "date": 50689,
+          "text": 40921,
+          "blank": 5980,
+          "unparseable": 0
+        },
+        "grn_date": {
+          "date": 53827,
+          "text": 43763,
+          "blank": 0,
+          "unparseable": 0
+        },
+        "snapshot_date": {
+          "date": 53827,
+          "text": 43763,
+          "blank": 0,
+          "unparseable": 0
+        }
+      }
+    },
+    "grn": {
+      "folder": "GRN Dec 25 to May 2026",
+      "files": [
+        {
+          "file": "01.GRN Dec 2025.xlsx",
+          "sheet": "GRN report Dec 2025 (2)",
+          "period": "2025-12",
+          "lines_read": 41933,
+          "no_material": {
+            "lines": 67,
+            "value": 42825949.65
+          },
+          "not_receipts": {},
+          "lines": 41866,
+          "qty": 8047455.0,
+          "value": 661427233.77,
+          "gr_dates": {
+            "date": 41933,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "02.GRN Jan 2026.xlsx",
+          "sheet": "GRN Jan 2026",
+          "period": "2026-01",
+          "lines_read": 41766,
+          "no_material": {
+            "lines": 35,
+            "value": 6188478.6
+          },
+          "not_receipts": {},
+          "lines": 41731,
+          "qty": 8442369.677,
+          "value": 722083409.78,
+          "gr_dates": {
+            "date": 41766,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "03.GRN Feb 2026.xlsx",
+          "sheet": "GRN Report Feb 2026",
+          "period": "2026-02",
+          "lines_read": 41990,
+          "no_material": {
+            "lines": 74,
+            "value": 150842752.64
+          },
+          "not_receipts": {},
+          "lines": 41916,
+          "qty": 8058641.0,
+          "value": 664330853.38,
+          "gr_dates": {
+            "date": 41990,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "04.GRN March 2026.xlsx",
+          "sheet": "GRN Report March 2026",
+          "period": "2026-03",
+          "lines_read": 42920,
+          "no_material": {
+            "lines": 146,
+            "value": 204221959.1
+          },
+          "not_receipts": {},
+          "lines": 42774,
+          "qty": 8729652.3,
+          "value": 734558929.32,
+          "gr_dates": {
+            "text": 42920,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "05.GRN April 2026.xlsx",
+          "sheet": "GRN report April 2026",
+          "period": "2026-04",
+          "lines_read": 45229,
+          "no_material": {
+            "lines": 62,
+            "value": 98146926.87
+          },
+          "not_receipts": {},
+          "lines": 45167,
+          "qty": 9298814.0,
+          "value": 725236661.13,
+          "gr_dates": {
+            "date": 45229,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "06.GRN May 2026.xlsx",
+          "sheet": "Sheet1",
+          "period": "2026-05",
+          "lines_read": 41965,
+          "no_material": {
+            "lines": 31,
+            "value": 12669938.05
+          },
+          "not_receipts": {},
+          "lines": 41934,
+          "qty": 8926944.9,
+          "value": 760157581.62,
+          "gr_dates": {
+            "date": 41965,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "03.Consolidated GRN June 2026.xlsx",
+          "sheet": "consolidated",
+          "period": "2026-06",
+          "lines_read": 43142,
+          "no_material": {
+            "lines": 84,
+            "value": 527759320.04
+          },
+          "not_receipts": {
+            "122": {
+              "lines": 778,
+              "value": 14021695.13
+            },
+            "161": {
+              "lines": 19,
+              "value": 955157.29
+            }
+          },
+          "lines": 42261,
+          "qty": 8939069.2,
+          "value": 840950985.87,
+          "gr_dates": {
+            "text": 43142,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "04.Consolidated GRN July 2026.xlsx",
+          "sheet": "GRN July 2026",
+          "period": "2026-07",
+          "lines_read": 44621,
+          "no_material": {
+            "lines": 57,
+            "value": 142570727.93
+          },
+          "not_receipts": {
+            "122": {
+              "lines": 858,
+              "value": 15085294.08
+            },
+            "161": {
+              "lines": 14,
+              "value": 97820.24
+            }
+          },
+          "lines": 43692,
+          "qty": 8697258.95,
+          "value": 711018965.71,
+          "gr_dates": {
+            "date": 44621,
+            "blank": 0,
+            "unparseable": 0
+          }
+        },
+        {
+          "file": "05.Consolidated GRN Aug 2026.xlsx",
+          "sheet": "Consolidated",
+          "period": "2026-08",
+          "lines_read": 43211,
+          "no_material": {
+            "lines": 33,
+            "value": 28084156.67
+          },
+          "not_receipts": {
+            "122": {
+              "lines": 756,
+              "value": 19086161.24
+            }
+          },
+          "lines": 42422,
+          "qty": 8947443.016,
+          "value": 761518605.52,
+          "gr_dates": {
+            "date": 15175,
+            "text": 28036,
+            "blank": 0,
+            "unparseable": 0
+          }
+        }
+      ],
+      "warnings": []
+    },
+    "po": {
+      "folder": "PO details Dec 25 to May 26",
+      "files": [
+        {
+          "file": "01.PO details for Dec 2025 extr 02.01.2026.xlsx",
+          "sheet": "PO details for Dec 2025 (2)",
+          "periods": {
+            "2025-12": 38288
+          },
+          "lines_read": 40672,
+          "deleted": {
+            "lines": 588,
+            "value": 22113498.74
+          },
+          "no_material": {
+            "lines": 1796,
+            "value": 326882624.7,
+            "by_doc_type": {
+              "AMC": 958182.08,
+              "CMC": 5832178.31,
+              "Dom Capital PO": 217317937.8,
+              "Domestic PO": 197580.0,
+              "Service PO": 102576746.51
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1758,
+          "qty_equals_material_code": 0,
+          "lines": 38288,
+          "value": 774774126.85,
+          "dates": {
+            "po_date": {
+              "date": 40672,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "date": 40670,
+              "serial": 2,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Capex"
+          ]
+        },
+        {
+          "file": "02.PO details for Jan 2026 extr 01.02.2026.xlsx",
+          "sheet": "PO details Jan 2026",
+          "periods": {
+            "2026-01": 39145
+          },
+          "lines_read": 41316,
+          "deleted": {
+            "lines": 505,
+            "value": 14829807.5
+          },
+          "no_material": {
+            "lines": 1666,
+            "value": 126584993.85,
+            "by_doc_type": {
+              "AMC": 906661.49,
+              "CMC": 4397241.61,
+              "Dom Capital PO": 22195545.13,
+              "Imp capital PO": 860000.0,
+              "Service PO": 98225545.62
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1848,
+          "qty_equals_material_code": 0,
+          "lines": 39145,
+          "value": 801814799.95,
+          "dates": {
+            "po_date": {
+              "text": 41316,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 41316,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Capex PO"
+          ]
+        },
+        {
+          "file": "03.PO details for Feb 2026 extr 03.03.2026.xlsx",
+          "sheet": "PO Report Feb 2026",
+          "periods": {
+            "2026-02": 36949
+          },
+          "lines_read": 39019,
+          "deleted": {
+            "lines": 427,
+            "value": 14616152.29
+          },
+          "no_material": {
+            "lines": 1643,
+            "value": 376040204.77,
+            "by_doc_type": {
+              "AMC": 1571549.61,
+              "CMC": 7243019.01,
+              "Dom Capital PO": 297764937.35,
+              "Domestic PO": 10000.0,
+              "Service PO": 69450698.8
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1654,
+          "qty_equals_material_code": 0,
+          "lines": 36949,
+          "value": 696008598.64,
+          "dates": {
+            "po_date": {
+              "date": 39019,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "date": 39019,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Dom Capital PO"
+          ]
+        },
+        {
+          "file": "04.PO details for March 2026 extr 01.04.2026.xlsx",
+          "sheet": "PO Report March 2026",
+          "periods": {
+            "2026-03": 39602
+          },
+          "lines_read": 42051,
+          "deleted": {
+            "lines": 465,
+            "value": 17838333.99
+          },
+          "no_material": {
+            "lines": 1984,
+            "value": 187452144.97,
+            "by_doc_type": {
+              "AMC": 2119446.08,
+              "CMC": 9651259.08,
+              "Dom Capital PO": 52786575.02,
+              "Domestic PO": 85422.0,
+              "Service PO": 122809442.79
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1681,
+          "qty_equals_material_code": 0,
+          "lines": 39602,
+          "value": 852675936.95,
+          "dates": {
+            "po_date": {
+              "text": 42051,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 42051,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": []
+        },
+        {
+          "file": "05.PO details for April 2026 extr 05.05.2026.xlsx",
+          "sheet": "PO details April 2026",
+          "periods": {
+            "2026-04": 41792
+          },
+          "lines_read": 44349,
+          "deleted": {
+            "lines": 568,
+            "value": 12263888.6
+          },
+          "no_material": {
+            "lines": 1989,
+            "value": 409553847.84,
+            "by_doc_type": {
+              "AMC": 3942270.35,
+              "CMC": 197229713.23,
+              "Dom Capital PO": 7021523.5,
+              "Service PO": 201360340.76
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1986,
+          "qty_equals_material_code": 0,
+          "lines": 41792,
+          "value": 750430273.53,
+          "dates": {
+            "po_date": {
+              "text": 44349,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 44349,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": []
+        },
+        {
+          "file": "06. PO details for May 2026 extr 01.06.2026.xlsx",
+          "sheet": "02. PO details May 2026 ext (2)",
+          "periods": {
+            "2026-05": 39978
+          },
+          "lines_read": 42477,
+          "deleted": {
+            "lines": 749,
+            "value": 10109257.39
+          },
+          "no_material": {
+            "lines": 1750,
+            "value": 287382344.26,
+            "by_doc_type": {
+              "AMC": 5423528.44,
+              "CMC": 40543102.57,
+              "Dom Capital PO": 137421378.0,
+              "Imp capital PO": 179065.0,
+              "Service PO": 103815270.25
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1903,
+          "qty_equals_material_code": 0,
+          "lines": 39978,
+          "value": 817757589.18,
+          "dates": {
+            "po_date": {
+              "text": 42477,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 42477,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": []
+        },
+        {
+          "file": "03. PO details June 2026 extr 01.07.26.xlsx",
+          "sheet": "03. PO details June 2026 extr 0",
+          "periods": {
+            "2026-06": 40526
+          },
+          "lines_read": 43052,
+          "deleted": {
+            "lines": 735,
+            "value": 16248467.24
+          },
+          "no_material": {
+            "lines": 1791,
+            "value": 207059118.78,
+            "by_doc_type": {
+              "AMC": 1186695.67,
+              "CMC": 4880059.92,
+              "Dom Capital PO": 78703857.19,
+              "Service PO": 122288506.0
+            }
+          },
+          "returns": {
+            "lines": 0,
+            "value": 0.0
+          },
+          "price_unit_scaled": 1863,
+          "qty_equals_material_code": 0,
+          "lines": 40526,
+          "value": 966554970.26,
+          "dates": {
+            "po_date": {
+              "date": 43052,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "date": 43052,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": []
+        },
+        {
+          "file": "04. PO details July 2026 extr 03.08.26.xlsx",
+          "sheet": "PO detailed report July 2026",
+          "periods": {
+            "2026-07": 41213
+          },
+          "lines_read": 44039,
+          "deleted": {
+            "lines": 583,
+            "value": 72107603.99
+          },
+          "no_material": {
+            "lines": 2231,
+            "value": 255545211.03,
+            "by_doc_type": {
+              "AMC": 3798494.13,
+              "CMC": 16768225.61,
+              "Dom Capital PO": 88510335.67,
+              "Service PO": 146468155.62
+            }
+          },
+          "returns": {
+            "lines": 12,
+            "value": -97820.04
+          },
+          "price_unit_scaled": 1731,
+          "qty_equals_material_code": 0,
+          "lines": 41213,
+          "value": 823227302.34,
+          "dates": {
+            "po_date": {
+              "text": 44039,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 44039,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Capex deatils",
+            "GL details"
+          ]
+        },
+        {
+          "file": "05. PO details Aug 2026 extr 01.09.26.xlsx",
+          "sheet": "PO Aug 2026",
+          "periods": {
+            "2026-08": 39762
+          },
+          "lines_read": 42026,
+          "deleted": {
+            "lines": 513,
+            "value": 345999204.89
+          },
+          "no_material": {
+            "lines": 1750,
+            "value": 442220897.72,
+            "by_doc_type": {
+              "AMC": 1021229.42,
+              "CMC": 9404517.3,
+              "Dom Capital PO": 309622479.34,
+              "Service PO": 122172671.66
+            }
+          },
+          "returns": {
+            "lines": 1,
+            "value": -2400.0
+          },
+          "price_unit_scaled": 1763,
+          "qty_equals_material_code": 0,
+          "lines": 39762,
+          "value": 811783509.75,
+          "dates": {
+            "po_date": {
+              "date": 42026,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "date": 42026,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Capital PO"
+          ]
+        },
+        {
+          "file": "06. PO details Sept 2026 extr 01.10.26.xlsx",
+          "sheet": "06. PO details Sept 2026 extr 0",
+          "periods": {
+            "2026-09": 37285
+          },
+          "lines_read": 39848,
+          "deleted": {
+            "lines": 379,
+            "value": 9862334.48
+          },
+          "no_material": {
+            "lines": 1776,
+            "value": 393320638.92,
+            "by_doc_type": {
+              "AMC": 2036347.1,
+              "CMC": 56810530.55,
+              "Dom Capital PO": 191391328.25,
+              "Service PO": 143082433.02
+            }
+          },
+          "returns": {
+            "lines": 408,
+            "value": -3225024.22
+          },
+          "price_unit_scaled": 1819,
+          "qty_equals_material_code": 0,
+          "lines": 37285,
+          "value": 777381710.89,
+          "dates": {
+            "po_date": {
+              "text": 39848,
+              "blank": 0,
+              "unparseable": 0
+            },
+            "delivery_date": {
+              "text": 39848,
+              "blank": 0,
+              "unparseable": 0
+            }
+          },
+          "sheets_not_read": [
+            "Capex"
+          ]
+        }
+      ],
+      "skipped": [
+        {
+          "file": "Book.xlsx",
+          "reason": "empty workbook"
+        }
+      ]
+    }
+  },
+  "elapsed_sec": 91.4
 }

@@ -9,6 +9,8 @@ CASH&TPA   for a cash or insurance patient, use the suggested brand: both brands
            price, MRP (incl GST) and GST %, so each has a unit margin = MRP excl GST - price.
            SHARING is the share of the molecule's volume a brand may keep when HCG bifurcates
            it (cash_tpa_bifurcation.csv says which brands, and their molecule group).
+           Every priced row, with or without a suggestion, is also read as a price list
+           (load_price_list) for the purchase build.
 
 A row whose suggested-brand columns are empty is not a switch and is dropped. HCG fills the
 quantity and value columns by hand each month for one hospital; the build computes them for
@@ -61,6 +63,21 @@ class CashSwitch:
     @property
     def suggested_margin(self) -> float:
         return self.suggested_mrp / (1 + self.suggested_gst / 100) - self.suggested_price
+
+
+@dataclass(frozen=True)
+class PricedBrand:
+    """One brand row of the CASH&TPA sheet with its FY prices, whether or not it has a suggestion."""
+    material: str
+    material_desc: str | None
+    price: float                  # HCG Pharma selling price, excl GST
+    mrp: float                    # MRP incl GST
+    gst: float                    # %
+    category: str | None          # the sheet's FY category (P, R, P-SCH, ...)
+
+    @property
+    def unit_margin(self) -> float:
+        return self.mrp / (1 + self.gst / 100) - self.price
 
 
 @dataclass
@@ -291,9 +308,9 @@ def load_brand_blocks(path, scheme: BrandList = None, cash: BrandList = None):
 
 def load_price_list(path) -> dict:
     """Every brand row of the CASH&TPA sheet that carries its FY price, MRP and GST %, with
-    or without a suggestion: {material: PricedBrand}. The out-of-formulary match picks its
-    formulary brand from these. A code listed twice keeps its first row (as the blocks do)."""
-    from app.etl.spend.oof import PricedBrand
+    or without a suggestion: {material: PricedBrand}. The purchase build's out-of-formulary
+    fallback rule (app/etl/purchase) picks and prices its formulary brands from these. A code
+    listed twice keeps its first row (as the blocks do)."""
     path = Path(path)
     out: dict = {}
     with X.Workbook(path) as wb:

@@ -349,13 +349,19 @@ def test_a_hospital_total_is_not_called_unavailable():
 
 # ── "last month" is the last month in the data ──────────────────────────────────────────
 def test_relative_note_wording(monkeypatch):
+    # each source ends in its own month: billing first, then the receipts, then the orders
     monkeypatch.setattr(resolve, "_sales_window_months", lambda: ("2025-12", "2026-05"))
+    monkeypatch.setattr(resolve, "_source_latest", lambda: [
+        ("2026-05", ["sales"], []), ("2026-08", ["goods receipts"], []),
+        ("2026-09", ["purchase orders", "internal consumption"], ["internal consumption has no Aug-2026"])])
     monkeypatch.setattr(resolve, "_latest_report_month", lambda: "2026-08")
     assert resolve.relative_date_note("procurement spend last month") == (
-        "RELATIVE DATE: The data does not run to today. 'Last/latest month' = the latest "
-        "month in the data: May-2026 (2026-05) for sales, purchasing and consumption; "
-        "Aug-2026 (2026-08) for the formulary/spend/brand-rule reports. Say which month you "
-        "used. Never report an empty recent month as zero.")
+        "RELATIVE DATE: The data does not run to today, and each source ends in its own month. "
+        "'Last/latest month' = the latest month that source has: May-2026 (2026-05) for sales; "
+        "Aug-2026 (2026-08) for goods receipts; Sep-2026 (2026-09) for purchase orders and "
+        "internal consumption (internal consumption has no Aug-2026); Aug-2026 (2026-08) for "
+        "the formulary/spend/brand-rule reports. Say which month you used. Never report an "
+        "empty recent month as zero.")
     for q in ("revenue this quarter", "sales YTD", "what did we buy yesterday",
               "previous month's consumption", "current FY spend", "MTD revenue"):
         assert resolve.relative_date_note(q), q
@@ -368,12 +374,12 @@ def test_fy_to_date_is_counted_in_the_data(monkeypatch):
     monkeypatch.setattr(resolve, "_latest_report_month", lambda: None)
     monkeypatch.setattr(resolve, "_sales_window_months", lambda: ("2025-12", "2026-05"))
     n = resolve.relative_date_note("what is our revenue this FY?")
-    assert "FY-to-date in the data is Apr-2026..May-2026" in n
+    assert "FY-to-date in the sales data is Apr-2026..May-2026" in n
     assert "calendar YTD is Jan-2026..May-2026" in n
     assert "formulary" not in n                    # no report month, no report clause
     # an FY that began before the data did starts where the data starts
     monkeypatch.setattr(resolve, "_sales_window_months", lambda: ("2025-12", "2026-02"))
-    assert "FY-to-date in the data is Dec-2025..Feb-2026" in resolve.relative_date_note(
+    assert "FY-to-date in the sales data is Dec-2025..Feb-2026" in resolve.relative_date_note(
         "revenue YTD")
 
 
@@ -383,6 +389,9 @@ def test_the_relative_note_reads_its_months_from_the_data():
     assert resolve._month_label("2026-05") == "May-2026"
     b = brief("what was procurement spend last month?")
     assert f"{resolve._month_label(last)} ({last}) for sales" in b
+    # the receipts run on past the billing months, and the note says so from fact_grn itself
+    grn = str(warehouse.query("SELECT MAX(posting_date) FROM fact_grn", one=True)[0])[:7]
+    assert grn > last and f"{resolve._month_label(grn)} ({grn}) for " in b and "goods receipts" in b
     assert "Never report an empty recent month as zero" in b
     rep = resolve._latest_report_month()
     if rep:
