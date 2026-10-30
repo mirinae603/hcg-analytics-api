@@ -7,10 +7,11 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "HCG Supply Chain Analytics Backend"
 
     # --- Data layout ---------------------------------------------------------
-    # Root of the raw HCG SAP excel extracts (Bidezy-2). Override via env RAW_DATA_DIR.
-    RAW_DATA_DIR: str = str(
-        Path(__file__).resolve().parents[3] / "Bidezy-2"
-    )
+    # Root of HCG's raw SAP extracts for the curated import (python -m app.etl.run_etl): the
+    # repo's master/ folder, the same root as FORMULARY_RAW_DIR below. app/etl/ingest.py finds
+    # the Consumption, Inventory, GRN and PO folders anywhere under it (HCG's files sit one
+    # hashed folder down). Override via env RAW_DATA_DIR.
+    RAW_DATA_DIR: str = str(Path(__file__).resolve().parents[2] / "master")
     # Curated parquet (fact + dim tables) produced by the ETL.
     CURATED_DIR: str = str(Path(__file__).resolve().parents[2] / "app" / "data" / "curated")
     # Pre-computed per-KPI aggregate parquet tables.
@@ -32,6 +33,14 @@ class Settings(BaseSettings):
     # Aggregated scheme-brand tables the API serves (committed), built from the formulary
     # line cache above and HCG's Spend Analysis Main Sheet. Not app/data/kpi, same reason.
     SPEND_DATA_DIR: str = str(Path(__file__).resolve().parents[2] / "app" / "data" / "spend")
+
+    # --- Purchase analysis (python -m app.etl.purchase) -------------------------
+    # Aggregated tables built from HCG's GRN (goods receipt) extracts and out-of-formulary
+    # workbooks under FORMULARY_RAW_DIR (committed). Not app/data/kpi, same reason.
+    PURCHASE_DATA_DIR: str = str(Path(__file__).resolve().parents[2] / "app" / "data" / "purchase")
+    # One parquet per GRN workbook (line level, no GR/PO/invoice numbers), keyed on the file's
+    # path, size and mtime so each workbook is read once — outside the repo on purpose.
+    PURCHASE_CACHE_DIR: str = os.path.expanduser("~/.cache/hcg-analytics/purchase")
 
     # --- CORS ------------------------------------------------------------------
     # Comma-separated exact origins, plus a regex for the Static Web Apps hosts (the

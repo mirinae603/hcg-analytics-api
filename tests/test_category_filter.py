@@ -61,8 +61,10 @@ def test_every_material_gets_exactly_one_category():
     assert "category" in dm.columns
     assert dm["category"].notna().all()
     assert set(dm["category"].unique()) <= set(da.CATEGORIES)
-    # the ~6,851 materials with a null material_type land in Unclassified
-    assert int((dm["category"] == da.CATEGORY_UNCLASSIFIED).sum()) == 6851
+    # the 7,996 materials with a null material_type land in Unclassified (6,851 until the
+    # import fix of 2026-10-23 added the Jun, Jul and Sep-26 consumption extracts: materials
+    # issued only in those months are not in the 31-May-26 stock snapshot that carries the type)
+    assert int((dm["category"] == da.CATEGORY_UNCLASSIFIED).sum()) == 7996
 
 
 # ---------- the buckets sum back to the portfolio total ----------
@@ -183,7 +185,9 @@ def test_offered_buckets_sum_back_to_all_on_reorder_and_consumption(client):
     all_lines = client.get("/forecast/reorder-priority").json()["totals"]["reorder_lines"]
     summed = sum(client.get(f"/forecast/reorder-priority?Category={c}")
                  .json()["totals"]["reorder_lines"] for c in offered)
-    assert summed == all_lines == 19014, (
+    # 19,013 lines since the import fix (19,014 before): the forecast's lead times come from
+    # fact_grn's PO-to-GR days, which now read the GR dates day-first and add Jun-Aug 26
+    assert summed == all_lines == 19013, (
         f"{all_lines - summed} reorder lines are unreachable from the selector")
 
     all_cost = client.get("/kpi/unit-sold-per-sku/insights").json()["totals"]["cost"]

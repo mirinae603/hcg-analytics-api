@@ -1,0 +1,8 @@
+kind,value,reason
+mvt_keep,101,"goods receipts only: returns to the vendor (122, 161) are left out, as in HCG's OOF workings"
+series_keep,1,"onco drugs (material codes starting 1)"
+series_keep,2,"other drugs (material codes starting 2); consumables (3) and non-drug series are left out"
+sloc,S125,"storage location left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"
+plant_prefix,BH,"Milann units (plants BH*) are outside HCG's OOF report"
+plant,HM03,"left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"
+plant,HM04,"left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"

@@ -51,6 +51,9 @@ def _add_switch_rows(folder: Path) -> None:
 def data(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "SPEND_DATA_DIR", str(tmp_path / "spend"))
     monkeypatch.setattr(settings, "FORMULARY_DATA_DIR", str(tmp_path / "formulary-not-built"))
+    # the cash overview's with_oof reads the purchase build: none here, so no real purchase row
+    # is added to these hand-made cash figures
+    monkeypatch.setattr(settings, "PURCHASE_DATA_DIR", str(tmp_path / "purchase-not-built"))
     monkeypatch.setattr(settings, "REFERENCE_DIR", str(tmp_path / "reference"))
     base.write_tables(tmp_path / "spend")
     _add_switch_rows(tmp_path / "spend")
@@ -137,6 +140,7 @@ def test_healthium_splits_into_sutures_and_endo(client, data):
 
 def test_cash_margin_percentages_beside_the_mrp_values(client, data):
     d = get(client, "/spend/cash/overview", Plant=KR, Month=AUG)
+    assert d["with_oof"] is None                                            # no purchase build here
     h = d["headline"]
     assert (h["used_mrp_value"], h["suggested_mrp_value"]) == pytest.approx((8880.0, 11250.0))
     assert h["used_margin_pct"] == pytest.approx(18.9189, abs=1e-4)           # 1680 / 8880

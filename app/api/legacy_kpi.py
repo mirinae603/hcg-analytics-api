@@ -87,6 +87,23 @@ def _pc(df, plant, category=None):
     return da.filter_category(da.filter_plant(df, _plant(plant)), category)
 
 
+def _year_month(df: pd.DataFrame) -> pd.Series:
+    """fact_consumption's year + month_num as the 'YYYY-MM' key sales_monthly uses."""
+    return df["year"].astype(int).astype(str) + "-" + df["month_num"].astype(int).astype(str).str.zfill(2)
+
+
+def _in_billing_months(cons: pd.DataFrame) -> pd.DataFrame:
+    """The internal issues of the months the billing extract covers (sales_monthly). The
+    consumption extracts run on past the billing months (Jun-Sep 26 beside Dec-May billing), so
+    a side-by-side of billed and internal usage keeps to the months both have. Without the
+    billing extract every issue counts."""
+    fp = os.path.join(_KPI_DIR, "sales_monthly.parquet")
+    if not os.path.exists(fp):
+        return cons
+    months = set(pd.read_parquet(fp, columns=["month"])["month"].astype(str))
+    return cons[_year_month(cons).isin(months)]
+
+
 def _proc(table: str, pl, cat=None):
     """A procurement aggregate, cut to a material category when one is asked for.
 
@@ -301,8 +318,9 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
         {"key": "moderate", "label": "Moderate (1–4×)", **band(1, 4)},
         {"key": "fast", "label": "Fast (>4×)", **band(4, 1e12)},
     ]
-    # monthly consumption-cost flow (the turnover engine) — smooth trend line
-    fc = _pc(da.load("fact_consumption"), Plant, Category)
+    # monthly consumption-cost flow (the turnover engine) — smooth trend line: the issues
+    # up to the stock count the turnover is taken on (the extracts run on past it)
+    fc = _pc(da.stock_consumption(), Plant, Category)
     tl = fc.groupby(["year", "month_num", "month"], observed=True)["amount_lc"].sum().reset_index().sort_values(["year", "month_num"])
     timeline = [{"label": str(r["month"])[:3], "month": str(r["month"]), "value": float(r["amount_lc"])} for _, r in tl.iterrows()]
 
@@ -1245,9 +1263,6 @@ def purchase_value_insights(Plant: str = Query(None), Category: str = Query(None
             "timeline": timeline, "categories": categories, "vendors": vendors, "plants": plants}
 
 
-_PROC_WINDOW = {(2025, "December"), (2026, "January"), (2026, "February"), (2026, "March"), (2026, "April"), (2026, "May")}
-
-
 # ---------------- PROCUREMENT VARIANCE insights (B3) ----------------
 @router.get("/kpi/procurement-variance/insights")
 def variance_insights(Plant: str = Query(None), Category: str = Query(None)):
@@ -1331,8 +1346,9 @@ def cycle_insights(Plant: str = Query(None), Category: str = Query(None)):
     # averaging averages — so the cut is the exact mean of that bucket's own receipts.
     # It is also the metric that genuinely differs by bucket: 2.5 days on Onco Drugs
     # against 12.4 on Lab, against a 5.4-day portfolio mean that describes neither.
+    # Every month kpi_cycle_time holds is a real receipt month (GR dates are read day-first),
+    # so the window is the data's own.
     ct = _proc("kpi_cycle_time", _plant(Plant), da.resolve_category(Category)).copy()
-    ct = ct[ct.apply(lambda r: (int(r["year"]), str(r["month"])) in _PROC_WINDOW, axis=1)]
     ct["po_w"] = ct["avg_po_to_gr_tat"] * ct["gr_lines"]; ct["pr_w"] = ct["avg_pr_to_gr_tat"] * ct["gr_lines"]
     cm = ct.groupby(["year", "month"], observed=True).agg(po_w=("po_w", "sum"), pr_w=("pr_w", "sum"), gl=("gr_lines", "sum")).reset_index()
     cm["_k"] = cm["month"].map({x: i for i, x in enumerate(MONTH_ORDER)}); cm = cm.sort_values(["year", "_k"])
@@ -1421,12 +1437,12 @@ def fill_insights(Plant: str = Query(None), Category: str = Query(None)):
     out = {"totals": {"overall": overall, "plants": int(fr["plant"].nunique()), "open_qty": openq, "ordered_qty": ordered,
                       "perfect": perfect, "best_plant": best[0]["plant"] if best else "-", "worst_plant": worst[0]["plant"] if worst else "-"},
            "worst": worst, "best": best, "plants": plants, "dist": dist}
-    # The clamp above already existed and already fired per plant. Under Unclassified it
-    # fires on the HEADLINE — the raw ratio is 168.7% because 2,557 service/blanket PO
-    # lines carry a negative open_qty, all of them in that bucket. Printing a confident
-    # "100% order completion" and saying nothing would be the misleading outcome, so the
-    # raw figure and the reason travel with it. Added only when a category is applied, so
-    # the unfiltered response keeps its exact existing shape.
+    # The clamp above already existed and already fired per plant. Under a category it can
+    # fire on the HEADLINE — lines with a negative open_qty (service/blanket orders: 2,557
+    # of them made Unclassified read 168.7% before the import fix; none today) push the raw
+    # ratio past 100%. Printing a confident "100% order completion" and saying nothing would
+    # be the misleading outcome, so the raw figure and the reason travel with it. Added only
+    # when a category is applied, so the unfiltered response keeps its exact existing shape.
     if cat:
         out["category"] = cat
         out["totals"]["overall_raw"] = raw_overall
@@ -2553,16 +2569,16 @@ def revenue_insights():
 
     # Non-billable (internal goods-issue) cost per month, so the timeline can carry the
     # billable-vs-non-billable comparison instead of it only existing as a grand total.
-    # fact_consumption's year+month_num rebuild the same "YYYY-MM" key sales_monthly uses,
-    # and the two extracts cover exactly the same six months, so this is a straight 1:1
-    # month join — no mapping, no coverage gap. (Deliberately NOT offered per category or
-    # per hospital: only ~49% of billed revenue maps onto the consumption category
-    # taxonomy, so a category-level split of this would be misleading.)
+    # fact_consumption's year+month_num rebuild the same "YYYY-MM" key sales_monthly uses;
+    # only the billing months count (_in_billing_months: the consumption extracts run on
+    # past them), so this is a straight 1:1 month join — no mapping, no coverage gap.
+    # (Deliberately NOT offered per category or per hospital: only ~49% of billed revenue
+    # maps onto the consumption category taxonomy, so a category-level split of this would
+    # be misleading.)
     internal_by_month = {}
     try:
-        _fc = da.load("fact_consumption")
-        _k = _fc["year"].astype(int).astype(str) + "-" + _fc["month_num"].astype(int).astype(str).str.zfill(2)
-        internal_by_month = _fc.groupby(_k)["amount_lc"].sum().to_dict()
+        _fc = _in_billing_months(da.load("fact_consumption"))
+        internal_by_month = _fc.groupby(_year_month(_fc))["amount_lc"].sum().to_dict()
     except Exception:
         internal_by_month = {}
 
@@ -2654,10 +2670,12 @@ def billable_split_insights(Category: str = Query(None, alias="Category")):
     "Onco Drugs" etc. means, rather than a second, possibly-drifting definition. Sales
     materials absent from dim_material entirely (about 10% of billed revenue) fold
     into "Unclassified", same convention as everywhere else -- never silently dropped.
+    Both sides cover the billing extract's months (the consumption extracts run on past them).
     """
     cat = da.resolve_category(Category)
 
-    cons = da.filter_category(da.load("fact_consumption"), Category)
+    # the same months on both sides: the internal issues of the billing months only
+    cons = da.filter_category(_in_billing_months(da.load("fact_consumption")), Category)
     nb_cost = float(cons["amount_lc"].sum())
     nb_materials = int(cons["material"].nunique())
 

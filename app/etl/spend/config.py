@@ -58,13 +58,9 @@ ATTIS_USE = "attis_consumption"
 CASH_SWITCH = "cash_switch"
 CASH_ALLOWANCE = "cash_allowance"
 BRAND_BLOCKS = "brand_blocks"          # Task 4: the CASH&TPA sheet's groups of interchangeable brands
-OOF_SWITCH = "oof_switch"              # Task 3c: out-of-formulary brands -> a formulary brand (app/etl/spend/oof.py)
-# A formulary brand stands in for an out-of-formulary one only if its MRP is within this factor
-# of the OOF brand's MRP per unit on the bills (10 = from a tenth to ten times). Wide on purpose:
-# a biosimilar at a third of the formulary brand's MRP is a real switch (that gap IS the margin);
-# liposomal vs plain doxorubicin (~15x) or a per-strip vs per-unit price is not.
-OOF_PRICE_BAND = 10.0
-TABLES = (SWITCH, ATTIS_USE, CASH_SWITCH, CASH_ALLOWANCE, BRAND_BLOCKS, OOF_SWITCH)
+# The out-of-formulary margin is not built here: it follows HCG's purchase (GRN) method in
+# app/etl/purchase (python -m app.etl.purchase).
+TABLES = (SWITCH, ATTIS_USE, CASH_SWITCH, CASH_ALLOWANCE, BRAND_BLOCKS)
 UNDATED = (BRAND_BLOCKS,)              # FY master data: replaced whole, not per month
 VALIDATION_FILE = "spend_validation.json"
 SCHEME_PAYER = "GOV"

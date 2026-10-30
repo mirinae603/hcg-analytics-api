@@ -3,10 +3,10 @@
 # The bug: `status` in legacy_kpi._replen_frame is a first-match-wins if-chain, so
 # every row gets exactly ONE of Stock-out / Dead stock / Reorder now / Overstocked /
 # Healthy. "Needs replenishing" is an independent PROPERTY, not one of those five
-# states — so pairing it with the label buried 17,907 of the 19,014 lines that
+# states — so pairing it with the label buried 17,906 of the 19,013 lines that
 # genuinely need ordering, including all 15,878 that are ALREADY AT ZERO STOCK.
 #
-# These tests pin the fix from both ends: the queue must be COMPLETE (all 19,014),
+# These tests pin the fix from both ends: the queue must be COMPLETE (all 19,013),
 # correctly PRIORITISED (zero-stock first), and the old display status must still be
 # there for context — while every pre-existing field keeps its original meaning.
 from __future__ import annotations
@@ -16,17 +16,21 @@ import pytest
 from app.api import legacy_kpi as lk
 from app.core import data_access as da
 
-# Verified directly off stock_replenishment_and_aging_risk.parquet (67,167 rows).
+# Verified directly off stock_replenishment_and_aging_risk.parquet (67,167 rows). Rebuilt by
+# the import fix of 2026-10-23: the safety stock's lead times are fact_grn's PO-to-GR days,
+# now read with day-first GR dates and Jun-Aug 26 receipts, which moved one line out of the
+# queue (19,014 -> 19,013; Healthy 1,700 -> 1,699, Dead stock 165 -> 164, Overstocked
+# 164 -> 165; priced lines 3,129 -> 3,128, priced value Rs 7.2056 Cr -> Rs 7.2062 Cr).
 TOTAL_LINES = 67167
-NEEDS_REORDER = 19014
+NEEDS_REORDER = 19013
 LABELLED_REORDER_NOW = 1107          # what the old view called "the reorder list"
 STOCKOUT_LINES = 15878               # the most urgent lines, previously excluded
-PRICED_LINES = 3129                  # only ~16% carry a unit cost
-PRICED_VALUE = 72056217.71           # Rs 7.2056 Cr over the priced subset
+PRICED_LINES = 3128                  # only ~16% carry a unit cost
+PRICED_VALUE = 72061927.57           # Rs 7.2062 Cr over the priced subset
 STATUS_TOTALS = {"Overstocked": 38561, "Stock-out": 15878, "Dead stock": 8388,
                  "Healthy": 3233, "Reorder now": 1107}
-HIDDEN_UNDER = {"Stock-out": 15878, "Healthy": 1700, "Reorder now": 1107,
-                "Dead stock": 165, "Overstocked": 164}
+HIDDEN_UNDER = {"Stock-out": 15878, "Healthy": 1699, "Reorder now": 1107,
+                "Overstocked": 165, "Dead stock": 164}
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +121,7 @@ def test_pricing_gap_is_disclosed_not_hidden(rp):
     assert t["priced_share_pct"] == pytest.approx(16.5, abs=0.1)
     assert t["out_of_stock_lines"] == STOCKOUT_LINES
     # Thousands-separated: the disclosure is one long sentence carrying several 5-digit
-    # counts, so "19,014" reads where "19014" does not. Intent is unchanged — the caveat
+    # counts, so "19,013" reads where "19013" does not. Intent is unchanged — the caveat
     # must still state the real priced share and the real total.
     assert "16.5%" in t["value_disclosure"] and f"{NEEDS_REORDER:,}" in t["value_disclosure"]
 

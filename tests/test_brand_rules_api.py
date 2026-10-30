@@ -52,6 +52,9 @@ def rules_data(tmp_path, monkeypatch):
     f, s = tmp_path / "formulary", tmp_path / "spend"
     monkeypatch.setattr(settings, "FORMULARY_DATA_DIR", str(f))
     monkeypatch.setattr(settings, "SPEND_DATA_DIR", str(s))
+    # no purchase build: the spend views these tables feed (here and in test_hcg_reports) stay
+    # on the hand-made rows, without the committed out-of-formulary purchases
+    monkeypatch.setattr(settings, "PURCHASE_DATA_DIR", str(tmp_path / "purchase-not-built"))
     monkeypatch.setattr(settings, "REFERENCE_DIR", str(tmp_path / "reference"))
     write_tables(f)
     write_hospital_map(tmp_path / "reference")

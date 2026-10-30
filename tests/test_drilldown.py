@@ -154,11 +154,14 @@ def test_doh_band_drill_reproduces_the_coverage_histogram(client):
 
 
 def test_stock_change_drill_needs_the_year_in_the_slice(client):
-    """dim=month would merge December 2025 into December 2026 under one bar."""
-    months = client.get("/kpi/stock-change/insights").json()["monthly"]
-    decembers = [m for m in months if m["month"] == "December"]
-    assert len(decembers) == 2, "fixture no longer spans two Decembers — the trap is untested"
+    """dim=month would merge December 2025 into December 2026 under one bar.
 
+    Every bar drills by year AND month. Whether the merge can bite depends on the data: the
+    chart once held a 'December 2026' — March-26 receipts whose 'dd.mm.yyyy' GR dates were
+    read month-first, fixed in app/etl/ingest.py — and holds two Decembers again once its
+    window passes twelve months. While no month name repeats, a month slice must equal its
+    one year-month bar."""
+    months = client.get("/kpi/stock-change/insights").json()["monthly"]
     for m in months:
         for meas in ("inflow", "outflow"):
             d = client.get(f"/drill/top-items?kpi=stock-change&dim=year_month&by=material"
@@ -166,11 +169,16 @@ def test_stock_change_drill_needs_the_year_in_the_slice(client):
             assert d["slice_total"] == pytest.approx(m[meas], abs=0.01), \
                 f"{m['label']} {meas} drills to a different total than its bar"
 
-    # and the dimension that would have been the obvious choice really does over-report
-    merged = client.get("/drill/top-items?kpi=stock-change&dim=month&by=material"
-                        "&slice=December&measure=inflow&n=1").json()["slice_total"]
-    assert merged == pytest.approx(sum(m["inflow"] for m in decembers), abs=0.01)
-    assert merged > max(m["inflow"] for m in decembers)
+    by_name: dict = {}
+    for m in months:
+        by_name.setdefault(m["month"], []).append(m)
+    for name, same in by_name.items():
+        merged = client.get(f"/drill/top-items?kpi=stock-change&dim=month&by=material"
+                            f"&slice={name}&measure=inflow&n=1").json()["slice_total"]
+        # the dimension that would have been the obvious choice adds up every year's bar
+        assert merged == pytest.approx(sum(m["inflow"] for m in same), abs=0.01), name
+        if len(same) > 1:
+            assert merged > max(m["inflow"] for m in same), name
 
 
 def test_wastage_drill_ranks_the_numerator_not_the_ratio(client):

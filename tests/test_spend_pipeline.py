@@ -399,6 +399,17 @@ def test_the_build_publishes_without_a_fixed_reference(env):
     assert (env["data"] / C.VALIDATION_FILE).exists()
 
 
+def test_the_out_of_formulary_margin_is_not_built_from_sales(env):
+    # HCG's purchase (GRN) method builds it (python -m app.etl.purchase); the spend build
+    # publishes no sales-based estimate and its report says nothing of one.
+    rep = run(env)
+    assert sorted(p.stem for p in env["data"].glob("*.parquet")) == sorted(C.TABLES)
+    assert not (env["data"] / "oof_switch.parquet").exists()
+    m = rep["months"]["2026-08"]
+    assert not {"oof", "item_master"} & set(m) and "oof" not in m["kr"]
+    assert not [k for k in rep["rules"] if k.startswith("oof")]
+
+
 def test_list_outside_the_financial_year_aborts(env):
     write_scheme_list(next(env["dash"].glob("*Spend Analysis*")), fy="2025-26")
     with pytest.raises(BuildError, match="FY 2025-26; it does not cover 2026-08"):

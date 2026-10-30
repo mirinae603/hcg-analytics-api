@@ -97,6 +97,17 @@ def test_months_come_from_the_data_oldest_first(client, data):
     assert [m["label"] for m in o["months"]] == ["Nov-25", "Dec-25", "Jan-26"]
     assert [m["cost"] for m in o["months"]] == [1000.0, 1200.0, 900.0]
     assert "Nov-25 to Jan-26" in o["note"] and "starting with 3" in o["note"]
+    assert "no consumption extract" not in o["note"]
+
+
+def test_a_month_without_an_extract_is_named_not_drawn(client, tmp_path, monkeypatch, plants):
+    # no December rows at all (the extract was not received): the months skip it, the note says so
+    _write(tmp_path, [_row("300001", plants["A"], "CC1", 1, 100, 2025, 11),
+                      _row("300001", plants["A"], "CC1", 2, 200, 2026, 1)], names={"CC1": "CC1"})
+    monkeypatch.setattr(settings, "CURATED_DIR", str(tmp_path))
+    o = client.get(f"{BASE}/overview").json()
+    assert [m["key"] for m in o["months"]] == ["2025-11", "2026-01"]
+    assert "Nov-25 to Jan-26 (no consumption extract for Dec-25)" in o["note"]
 
 
 # ── departments ───────────────────────────────────────────────────────────────

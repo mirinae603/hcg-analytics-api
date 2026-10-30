@@ -1,0 +1,5208 @@
+{
+ "built_at": "2026-10-23T06:19:14+00:00",
+ "generator": "python -m app.etl.purchase",
+ "periods": [
+  "2025-12",
+  "2026-01",
+  "2026-02",
+  "2026-03",
+  "2026-04",
+  "2026-05",
+  "2026-06",
+  "2026-07",
+  "2026-08"
+ ],
+ "latest": "2026-08",
+ "scope": {
+  "file": "purchase_scope_exclusions.csv",
+  "rows": [
+   {
+    "kind": "mvt_keep",
+    "value": "101",
+    "reason": "goods receipts only: returns to the vendor (122, 161) are left out, as in HCG's OOF workings"
+   },
+   {
+    "kind": "series_keep",
+    "value": "1",
+    "reason": "onco drugs (material codes starting 1)"
+   },
+   {
+    "kind": "series_keep",
+    "value": "2",
+    "reason": "other drugs (material codes starting 2); consumables (3) and non-drug series are left out"
+   },
+   {
+    "kind": "sloc",
+    "value": "S125",
+    "reason": "storage location left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"
+   },
+   {
+    "kind": "plant_prefix",
+    "value": "BH",
+    "reason": "Milann units (plants BH*) are outside HCG's OOF report"
+   },
+   {
+    "kind": "plant",
+    "value": "HM03",
+    "reason": "left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"
+   },
+   {
+    "kind": "plant",
+    "value": "HM04",
+    "reason": "left out of HCG's OOF workings (verified Jun/Jul/Aug-26); HCG to confirm why"
+   }
+  ],
+  "order": "movement type -> material series -> storage location -> plant prefix -> plant (HCG's order)"
+ },
+ "grn_folder": "GRN Dec 25 to May 2026",
+ "warnings": [],
+ "oof": {
+  "months": [
+   "2026-06",
+   "2026-07",
+   "2026-08"
+  ],
+  "rules": {
+   "lines": "purchase scope lines whose material the month's own Item Master flags OUT OF FORMULARY (not the GRN's Formulary column)",
+   "actual": "abb_mrp = Unit MRP / (100 + Tax %) x 100; total_pp = Base Price x GR Qty; total_mrp = GR Qty x abb_mrp; actual margin = total_mrp - total_pp",
+   "suggested": "sug_abb = MRP / (100 + GST %) x 100; sug_total_pp = price x GR Qty; sug_total_mrp = sug_abb x GR Qty; suggested margin = sug_total_mrp - sug_total_pp",
+   "loss": "margin_loss = suggested margin - actual margin, netted (HCG); gain_loss = the lines' positive losses, better_loss = the negative ones",
+   "sources": {
+    "hcg_sheet": "HCG's worksheet of the same month, HCG's typed price/MRP/GST",
+    "hcg_sheet_pair": "HCG's pair for the material from its nearest worksheet month (earlier first), priced by rule PC",
+    "hcg_list": "HCG's OOF master, the row's own price/MRP/GST",
+    "formulary_rule": "our rule (Estimated): A same molecule, strength, dosage form and kind; B same molecule, strength and kind; tablet for capsule (or oral liquid for drops); C same molecule, dose, form group and kind; another pack size; D the OOF brand names no dose: same molecule and form group, pack within 4x; F the molecule inside a combination (or the reverse); same strength, form group, kind; within a level: same kind, HCG's P1, most shared descriptor words, nearest pack, sheet order",
+    "none": "no alternative: shown, adds nothing to the margins or the loss"
+   },
+   "prices_pc": "master row price for a hcg_list brand; else the lowest master price of the brand; else its CASH&TPA FY price, MRP and GST",
+   "statuses": {
+    "counted": "in the margins and the loss",
+    "parked": "HCG doubts the flag ('Need To check flaging later'): shown, not counted",
+    "no_alternative": "no suggested brand",
+    "unpriced": "a suggested brand no price list prices: shown, not counted"
+   },
+   "guard": "with HCG's worksheet of the month, every centre within Rs 1 of HCG's Summary and KR within Rs 1 of HCG's email, else nothing is published; a month HCG's email has figures for but whose workbook was not read is not published either, unless the build is run with --without-hcg-sheet"
+  },
+  "oof_master": {
+   "file": "Copy of Out of formualry vs suggested formualry brand master-2026-27.xlsb",
+   "sheet": "Sheet1",
+   "financial_year": "2026-27",
+   "rows": 511,
+   "materials": 511,
+   "suggested_brands": 330,
+   "skipped": []
+  },
+  "main_sheet": {
+   "file": "Copy of Onco Formulary ,Non Onco Formulary and Consumbales Complaince  2026-27 -Spend Analysis Main Sheet_11.08.26.xlsx",
+   "cash_fy": "2026-27",
+   "priced_brands": 3772,
+   "block_rows": 3774
+  },
+  "hcg_workbooks": {
+   "2026-06": {
+    "file": "Out of Formulary Spend Analysis June 26 WS.xlsb",
+    "ws_sheet": "WS Final Sheet",
+    "warnings": []
+   },
+   "2026-07": {
+    "file": "Out of Formulary Spend Analysis July 26 WS.xlsb",
+    "ws_sheet": "Out of formulary July 26 WS",
+    "warnings": []
+   },
+   "2026-08": {
+    "file": "Out of Formulary Brand Margin loss Spend anlayiss August 26.xlsx",
+    "ws_sheet": "Out of formulary August 26 WS",
+    "warnings": [
+     "Out of Formulary Brand Margin loss Spend anlayiss August 26.xlsx: titles / file name say ['2026-07', '2026-08'], the worksheet's GR dates 2026-08; 2026-08 used"
+    ]
+   }
+  },
+  "email": {
+   "file": "oof_email_figures.csv",
+   "rows": [
+    "2026-06 HC05",
+    "2026-07 HC05",
+    "2026-08 HC05"
+   ]
+  }
+ },
+ "prices": {
+  "rules": {
+   "lines": "every purchase-scope line of every GRN month, all formulary classes",
+   "unit_price": "Total Amount without tax / GR Qty (the price after discount, decision D5)",
+   "product": "molecule_key = molecule (Item Master minor group, salts and synonyms made one) | strength | dosage form | kind; no key when the molecule, strength or form is not written",
+   "price_status": {
+    "ok": "a comparable unit price",
+    "no_price": "no positive amount or quantity (free or bonus stock, a credit)",
+    "token": "a unit price under 0.1% of the line's MRP without GST: a placeholder (Rs 0.01)",
+    "other_unit": "priced per strip or pack while the brand is bought per unit (or the reverse)"
+   },
+   "other_unit": "with HCG's CASH&TPA MRP for the brand: the line's MRP more than 4x away from it; else the line's price and MRP both more than 4x away from the brand's month median (lower median)",
+   "per_product": "over rows with price_status ok and a molecule_key: cheapest = the usual cheapest, the lowest row price (value / qty) at which at least 10% of the product's quantity was bought, counting up from the cheapest; lowest = min unit_price_min; dearest = max unit_price_max; value-weighted price = sum value / sum qty; extra paid = sum over rows of max(0, value - cheapest x qty)",
+   "unusually_low": "a row priced under 0.5 x its product's usual cheapest: still compared, listed for HCG to check",
+   "report": "a product varies when its dearest is at least 1% above its cheapest; extra paid per month over all centres"
+  }
+ },
+ "generic": {
+  "definition": "Branded = a product of an originator (innovator) company; generic = every other product (Indian brands, biosimilars, Attis own label, Jan Aushadhi, MNC generic and hospital makers). Estimated definition until HCG confirms it.",
+  "estimated": true,
+  "files": {
+   "originators": "originator_manufacturers.csv",
+   "overrides": "generic_overrides.csv"
+  },
+  "originator_patterns": 57,
+  "originator_companies": 43,
+  "overrides": [
+   {
+    "material": "100714",
+    "class": "branded",
+    "reason": "VECTIBIX 100MG (panitumumab): Amgen's originator brand, sold in India by Dr. Reddy's"
+   },
+   {
+    "material": "102724",
+    "class": "branded",
+    "reason": "ZYTORVI 240MG (toripalimab): the originator's brand (Junshi), licensed to Dr. Reddy's in India"
+   },
+   {
+    "material": "102881",
+    "class": "branded",
+    "reason": "HETRONIFLY (serplulimab): the originator's brand (Henlius), licensed to Intas in India"
+   }
+  ],
+  "manufacturers_counted_as_originators": {
+   "ABBIVE": "AbbVie",
+   "ALCON": "Alcon",
+   "ALLERGAN": "AbbVie",
+   "ASTELLAS": "Astellas",
+   "ASTRAZENECA": "AstraZeneca",
+   "AVENTIS": "Sanofi",
+   "BAYER": "Bayer",
+   "BEICENE PVT LTD": "BeiGene",
+   "BMS": "Bristol Myers Squibb",
+   "BOEHRINGER": "Boehringer Ingelheim",
+   "BRISTOL MYERS SQUIBB": "Bristol Myers Squibb",
+   "EISAI": "Eisai",
+   "ELI LILLY": "Eli Lilly",
+   "FERRING": "Ferring",
+   "GENZYME": "Sanofi",
+   "GSK": "GSK",
+   "J&J": "Johnson & Johnson",
+   "JANSSEN": "Johnson & Johnson",
+   "LILLY": "Eli Lilly",
+   "MENARINI": "Menarini",
+   "MENARINI INDIA PVT LTD": "Menarini",
+   "MERCK": "Merck",
+   "MSD": "MSD",
+   "NOVARTIS": "Novartis",
+   "NOVO NORDISK": "Novo Nordisk",
+   "ORGANON": "Organon",
+   "PFIZER": "Pfizer",
+   "ROCHE": "Roche",
+   "SANOFI": "Sanofi",
+   "SERVIER INDIA PRIVATE LIMITED": "Servier",
+   "TAKEDA": "Takeda",
+   "UCB": "UCB"
+  },
+  "rules": {
+   "class_source": {
+    "override": "generic_overrides.csv names the material",
+    "originator_list": "the GRN manufacturer is an originator company (originator_manufacturers.csv)",
+    "default": "no originator pattern matches the manufacturer: generic"
+   },
+   "formulary": "the month's own Item Master: FORMULARY (tier groups P preferred, P-SCH preferred, P-OPD preferred, SCH scheme_only, SCH-OPD scheme_only, R restricted, R-OPD restricted, OPD other, CONSUMABLE other), NON FORMULARY, OUT OF FORMULARY, NOT IN MASTER; empty for a month without an Item Master",
+   "cost_impact": "a branded line with a comparable unit price (prices ok) whose product (molecule_key) was bought as a generic that month: (unit price - the usual cheapest generic price, the lowest at which at least 10% of the generic quantity was bought) x GR Qty, when positive"
+  }
+ },
+ "months": {
+  "2025-12": {
+   "period": "2025-12",
+   "label": "Dec-25",
+   "grn": {
+    "file": "01.GRN Dec 2025.xlsx",
+    "sheet": "GRN report Dec 2025 (2)",
+    "rows": 41933,
+    "lines": 41866,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 67,
+      "value": 42825949.65
+     }
+    },
+    "mvt": {
+     "101": 41933
+    },
+    "returns": 0,
+    "dates": {
+     "date": 41933,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 661427233.77,
+    "qty": 8047455.0
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 67,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 41933,
+     "value": 704253183.42
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 41933,
+     "value": 704253183.42
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24664,
+     "value": 458075506.4
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20954,
+     "value": 442341521.63
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 20201,
+     "value": 437820703.71
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17852,
+     "value": 417261176.2
+    }
+   ],
+   "prices": {
+    "lines": 17852,
+    "value": 417261176.2,
+    "by_status": {
+     "ok": {
+      "lines": 17592,
+      "value": 417113144.52
+     },
+     "no_price": {
+      "lines": 212,
+      "value": 0.0
+     },
+     "other_unit": {
+      "lines": 48,
+      "value": 148031.68
+     }
+    },
+    "compared": {
+     "lines": 15773,
+     "value": 407712827.9,
+     "materials": 2696
+    },
+    "products": 1807,
+    "products_with_spread": 724,
+    "extra_paid_vs_cheapest": 27216317.64,
+    "unusually_low": {
+     "rows": 29,
+     "value": 99931.18,
+     "products": 22
+    },
+    "top_products": [
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 8100.0,
+      "max_price": 15811.01,
+      "brands": 3,
+      "vendors": 1,
+      "value": 11138617.01,
+      "extra_paid": 4634317.01
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 35000.0,
+      "min_price": 35000.0,
+      "max_price": 207075.01,
+      "brands": 3,
+      "vendors": 1,
+      "value": 6646975.13,
+      "extra_paid": 2236975.13
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 82.45,
+      "max_price": 700.0,
+      "brands": 4,
+      "vendors": 2,
+      "value": 2836694.0,
+      "extra_paid": 1594880.0
+     },
+     {
+      "molecule_key": "PACLITAXEL|100MG|INJ|",
+      "minor_group": "PACLITAXEL",
+      "cheapest_price": 921.77,
+      "min_price": 921.77,
+      "max_price": 8112.14,
+      "brands": 5,
+      "vendors": 1,
+      "value": 2493194.17,
+      "extra_paid": 1222073.34
+     },
+     {
+      "molecule_key": "IOHEXOL|350MG|INJ|",
+      "minor_group": "IOHEXOL",
+      "cheapest_price": 708.02,
+      "min_price": 708.02,
+      "max_price": 2832.06,
+      "brands": 3,
+      "vendors": 1,
+      "value": 1911641.9,
+      "extra_paid": 941654.5
+     },
+     {
+      "molecule_key": "MEROPENEM|1000MG|INJ|",
+      "minor_group": "MEROPENEM (SCH H1)",
+      "cheapest_price": 350.0,
+      "min_price": 350.0,
+      "max_price": 850.0,
+      "brands": 3,
+      "vendors": 3,
+      "value": 3054400.0,
+      "extra_paid": 941100.0
+     },
+     {
+      "molecule_key": "ALBUMINBOUNDPACLITAXEL|100MG|INJ|NAB",
+      "minor_group": "ALBUMIN BOUND PACLITAXEL",
+      "cheapest_price": 2280.5,
+      "min_price": 2280.5,
+      "max_price": 3700.0,
+      "brands": 3,
+      "vendors": 1,
+      "value": 2406100.0,
+      "extra_paid": 739054.5
+     },
+     {
+      "molecule_key": "OXALIPLATIN|50MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 674.79,
+      "min_price": 308.0,
+      "max_price": 1800.0,
+      "brands": 4,
+      "vendors": 2,
+      "value": 1183120.98,
+      "extra_paid": 697610.87
+     },
+     {
+      "molecule_key": "HUMANALBUMIN|100ML|20%|INJ|",
+      "minor_group": "HUMAN ALBUMIN",
+      "cheapest_price": 5248.29,
+      "min_price": 4700.0,
+      "max_price": 6000.0,
+      "brands": 5,
+      "vendors": 4,
+      "value": 7594546.52,
+      "extra_paid": 688724.65
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1790.0,
+      "min_price": 1790.0,
+      "max_price": 4900.0,
+      "brands": 3,
+      "vendors": 2,
+      "value": 2290260.0,
+      "extra_paid": 672100.0
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17852,
+    "value": 417261176.2,
+    "by_class": {
+     "branded": {
+      "lines": 1685,
+      "value": 248525994.61,
+      "materials": 267,
+      "value_pct": 59.56
+     },
+     "generic": {
+      "lines": 16167,
+      "value": 168735181.59,
+      "materials": 2951,
+      "value_pct": 40.44
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 67,
+      "value": 8914582.44
+     },
+     "originator_list": {
+      "lines": 1618,
+      "value": 239611412.17
+     },
+     "default": {
+      "lines": 16167,
+      "value": 168735181.59
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 1186029.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 4671428.64
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 3057124.8
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 11882621.83,
+     "compared_value": 20155745.37,
+     "branded_value_not_compared": 228370249.24,
+     "top": [
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 4634317.01
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "SIGRIMA 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 2236975.13
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1582880.0
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 763000.0
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 559800.0
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 516585.57
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 169032.52
+      },
+      {
+       "material": "100313",
+       "material_desc": "HERCLON 440MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "TRASTUREL 440MG INJ VIAL",
+       "extra_vs_generic": 160000.0
+      },
+      {
+       "material": "202292",
+       "material_desc": "CLEXANE 40MG INJ 0.4ML PFS",
+       "manufacturer": "SANOFI",
+       "cheapest_generic": "LOWCAP 40MG INJ 0.4ML PFS",
+       "extra_vs_generic": 154088.34
+      },
+      {
+       "material": "100303",
+       "material_desc": "HALAVEN 0.88MG INJ VIAL",
+       "manufacturer": "EISAI",
+       "cheapest_generic": "EMBREMMA 0.88MG INJ 2ML VIAL",
+       "extra_vs_generic": 112800.0
+      }
+     ]
+    }
+   }
+  },
+  "2026-01": {
+   "period": "2026-01",
+   "label": "Jan-26",
+   "grn": {
+    "file": "02.GRN Jan 2026.xlsx",
+    "sheet": "GRN Jan 2026",
+    "rows": 41766,
+    "lines": 41731,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 35,
+      "value": 6188478.6
+     }
+    },
+    "mvt": {
+     "101": 41766
+    },
+    "returns": 0,
+    "dates": {
+     "date": 41766,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 722083409.78,
+    "qty": 8442369.677
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 35,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 41766,
+     "value": 728271888.38
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 41766,
+     "value": 728271888.38
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24644,
+     "value": 492346360.01
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 21121,
+     "value": 474903253.83
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 20368,
+     "value": 469652101.18
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 18199,
+     "value": 447785502.47
+    }
+   ],
+   "prices": {
+    "lines": 18199,
+    "value": 447785502.47,
+    "by_status": {
+     "ok": {
+      "lines": 17882,
+      "value": 447665334.5
+     },
+     "no_price": {
+      "lines": 269,
+      "value": 0.0
+     },
+     "other_unit": {
+      "lines": 48,
+      "value": 120167.97
+     }
+    },
+    "compared": {
+     "lines": 16067,
+     "value": 428811946.31,
+     "materials": 2781
+    },
+    "products": 1826,
+    "products_with_spread": 761,
+    "extra_paid_vs_cheapest": 45373628.85,
+    "unusually_low": {
+     "rows": 31,
+     "value": 146570.6,
+     "products": 27
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 92735.96,
+      "brands": 2,
+      "vendors": 2,
+      "value": 20808631.16,
+      "extra_paid": 14332084.16
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 37094.38,
+      "brands": 2,
+      "vendors": 2,
+      "value": 11883640.58,
+      "extra_paid": 7521489.58
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 8100.0,
+      "max_price": 15811.01,
+      "brands": 3,
+      "vendors": 1,
+      "value": 8814993.9,
+      "extra_paid": 3007293.9
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 35000.0,
+      "min_price": 35000.0,
+      "max_price": 207075.01,
+      "brands": 3,
+      "vendors": 1,
+      "value": 6547825.11,
+      "extra_paid": 1892825.11
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 82.45,
+      "max_price": 700.0,
+      "brands": 4,
+      "vendors": 3,
+      "value": 2648320.0,
+      "extra_paid": 1387426.0
+     },
+     {
+      "molecule_key": "PACLITAXEL|100MG|INJ|",
+      "minor_group": "PACLITAXEL",
+      "cheapest_price": 921.77,
+      "min_price": 921.77,
+      "max_price": 8112.14,
+      "brands": 5,
+      "vendors": 1,
+      "value": 2141197.67,
+      "extra_paid": 810161.79
+     },
+     {
+      "molecule_key": "MEROPENEM|1000MG|INJ|",
+      "minor_group": "MEROPENEM (SCH H1)",
+      "cheapest_price": 350.0,
+      "min_price": 170.0,
+      "max_price": 850.0,
+      "brands": 4,
+      "vendors": 5,
+      "value": 2466410.0,
+      "extra_paid": 783850.0
+     },
+     {
+      "molecule_key": "HUMANALBUMIN|100ML|20%|INJ|",
+      "minor_group": "HUMAN ALBUMIN",
+      "cheapest_price": 5248.29,
+      "min_price": 4150.0,
+      "max_price": 6000.0,
+      "brands": 4,
+      "vendors": 6,
+      "value": 8958565.05,
+      "extra_paid": 714203.58
+     },
+     {
+      "molecule_key": "ALBUMINBOUNDPACLITAXEL|100MG|INJ|NAB",
+      "minor_group": "ALBUMIN BOUND PACLITAXEL",
+      "cheapest_price": 2280.5,
+      "min_price": 2280.5,
+      "max_price": 3700.0,
+      "brands": 3,
+      "vendors": 1,
+      "value": 2539479.5,
+      "extra_paid": 680872.0
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1790.0,
+      "min_price": 1790.0,
+      "max_price": 4900.0,
+      "brands": 4,
+      "vendors": 2,
+      "value": 1780390.0,
+      "extra_paid": 561400.0
+     }
+    ]
+   },
+   "generic": {
+    "lines": 18199,
+    "value": 447785502.47,
+    "by_class": {
+     "branded": {
+      "lines": 1662,
+      "value": 257767879.42,
+      "materials": 258,
+      "value_pct": 57.57
+     },
+     "generic": {
+      "lines": 16537,
+      "value": 190017623.05,
+      "materials": 3051,
+      "value_pct": 42.43
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 53,
+      "value": 7536977.85
+     },
+     "originator_list": {
+      "lines": 1609,
+      "value": 250230901.57
+     },
+     "default": {
+      "lines": 16537,
+      "value": 190017623.05
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 821097.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 4671428.64
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2044452.21
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 31757333.71,
+     "compared_value": 47539674.82,
+     "branded_value_not_compared": 210228204.6,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 14332084.16
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 7521489.58
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 3007293.9
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "SIGRIMA 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 1892825.11
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1365000.0
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 692000.0
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 466500.0
+      },
+      {
+       "material": "219473",
+       "material_desc": "FEIBA 500U INJ 20ML VIAL",
+       "manufacturer": "TAKEDA",
+       "cheapest_generic": "KOATE 500IU 5ML INJ VIAL",
+       "extra_vs_generic": 259276.5
+      },
+      {
+       "material": "101629",
+       "material_desc": "LYNPARZA 150MG TAB",
+       "manufacturer": "ASTRAZENECA",
+       "cheapest_generic": "CANRIB 150MG TAB 60'S CONTAINER",
+       "extra_vs_generic": 232971.76
+      },
+      {
+       "material": "100303",
+       "material_desc": "HALAVEN 0.88MG INJ VIAL",
+       "manufacturer": "EISAI",
+       "cheapest_generic": "EMBREMMA 0.88MG INJ 2ML VIAL",
+       "extra_vs_generic": 223200.0
+      }
+     ]
+    }
+   }
+  },
+  "2026-02": {
+   "period": "2026-02",
+   "label": "Feb-26",
+   "grn": {
+    "file": "03.GRN Feb 2026.xlsx",
+    "sheet": "GRN Report Feb 2026",
+    "rows": 41990,
+    "lines": 41916,
+    "blank_rows": 1,
+    "blank_material": {
+     "101": {
+      "lines": 74,
+      "value": 150842752.64
+     }
+    },
+    "mvt": {
+     "101": 41990
+    },
+    "returns": 0,
+    "dates": {
+     "date": 41990,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 664330853.38,
+    "qty": 8058641.0
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 74,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 41990,
+     "value": 815173606.02
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 41990,
+     "value": 815173606.02
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24375,
+     "value": 445326637.97
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20869,
+     "value": 430158350.43
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19972,
+     "value": 423794244.92
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 18164,
+     "value": 405916142.84
+    }
+   ],
+   "prices": {
+    "lines": 18164,
+    "value": 405916142.84,
+    "by_status": {
+     "ok": {
+      "lines": 17896,
+      "value": 405828951.17
+     },
+     "no_price": {
+      "lines": 239,
+      "value": 0.0
+     },
+     "token": {
+      "lines": 1,
+      "value": 694.5
+     },
+     "other_unit": {
+      "lines": 28,
+      "value": 86497.17
+     }
+    },
+    "compared": {
+     "lines": 16092,
+     "value": 396298304.49,
+     "materials": 2798
+    },
+    "products": 1813,
+    "products_with_spread": 789,
+    "extra_paid_vs_cheapest": 37629520.57,
+    "unusually_low": {
+     "rows": 33,
+     "value": 124799.25,
+     "products": 28
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 92735.96,
+      "brands": 2,
+      "vendors": 1,
+      "value": 14431552.84,
+      "extra_paid": 6982243.84
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 37094.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 8927193.24,
+      "extra_paid": 3640116.24
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 7600.0,
+      "max_price": 15811.01,
+      "brands": 3,
+      "vendors": 2,
+      "value": 9493854.5,
+      "extra_paid": 3469954.5
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 35000.0,
+      "min_price": 35000.0,
+      "max_price": 207075.01,
+      "brands": 3,
+      "vendors": 1,
+      "value": 6897825.11,
+      "extra_paid": 1892825.11
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 82.45,
+      "max_price": 700.0,
+      "brands": 3,
+      "vendors": 2,
+      "value": 2565437.0,
+      "extra_paid": 1528800.0
+     },
+     {
+      "molecule_key": "MEROPENEM|1000MG|INJ|",
+      "minor_group": "MEROPENEM (SCH H1)",
+      "cheapest_price": 350.0,
+      "min_price": 170.0,
+      "max_price": 850.0,
+      "brands": 4,
+      "vendors": 6,
+      "value": 3512290.97,
+      "extra_paid": 1097300.97
+     },
+     {
+      "molecule_key": "PACLITAXEL|100MG|INJ|",
+      "minor_group": "PACLITAXEL",
+      "cheapest_price": 921.77,
+      "min_price": 921.77,
+      "max_price": 8112.14,
+      "brands": 5,
+      "vendors": 1,
+      "value": 2357669.83,
+      "extra_paid": 920630.4
+     },
+     {
+      "molecule_key": "TRASTUZUMABEMTANSINE|100MG|INJ|",
+      "minor_group": "TRASTUZUMAB EMTANSINE",
+      "cheapest_price": 26484.23,
+      "min_price": 26484.23,
+      "max_price": 130931.68,
+      "brands": 2,
+      "vendors": 1,
+      "value": 1578627.51,
+      "extra_paid": 731132.15
+     },
+     {
+      "molecule_key": "ALBUMINBOUNDPACLITAXEL|100MG|INJ|NAB",
+      "minor_group": "ALBUMIN BOUND PACLITAXEL",
+      "cheapest_price": 2280.5,
+      "min_price": 2280.5,
+      "max_price": 3700.0,
+      "brands": 3,
+      "vendors": 1,
+      "value": 2444454.5,
+      "extra_paid": 686189.0
+     },
+     {
+      "molecule_key": "IOHEXOL|350MG|INJ|",
+      "minor_group": "IOHEXOL",
+      "cheapest_price": 708.02,
+      "min_price": 708.02,
+      "max_price": 2832.06,
+      "brands": 3,
+      "vendors": 1,
+      "value": 1239026.9,
+      "extra_paid": 630129.7
+     }
+    ]
+   },
+   "generic": {
+    "lines": 18164,
+    "value": 405916142.84,
+    "by_class": {
+     "branded": {
+      "lines": 1547,
+      "value": 217776632.03,
+      "materials": 250,
+      "value_pct": 53.65
+     },
+     "generic": {
+      "lines": 16617,
+      "value": 188139510.81,
+      "materials": 3081,
+      "value_pct": 46.35
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 60,
+      "value": 8149861.99
+     },
+     "originator_list": {
+      "lines": 1487,
+      "value": 209626770.04
+     },
+     "default": {
+      "lines": 16617,
+      "value": 188139510.81
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 638631.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 4282142.92
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 3229088.07
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 21741176.52,
+     "compared_value": 33363968.15,
+     "branded_value_not_compared": 184412663.88,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 6982243.84
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 3640116.24
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 3469954.5
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "SIGRIMA 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 1892825.11
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1528800.0
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 924100.97
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 731132.15
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 338065.04
+      },
+      {
+       "material": "203758",
+       "material_desc": "ERAXIS 100MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "CANIDULA 100MG INJ VIAL",
+       "extra_vs_generic": 275150.0
+      },
+      {
+       "material": "101629",
+       "material_desc": "LYNPARZA 150MG TAB",
+       "manufacturer": "ASTRAZENECA",
+       "cheapest_generic": "CANRIB 150MG TAB 60'S CONTAINER",
+       "extra_vs_generic": 232971.76
+      }
+     ]
+    }
+   }
+  },
+  "2026-03": {
+   "period": "2026-03",
+   "label": "Mar-26",
+   "grn": {
+    "file": "04.GRN March 2026.xlsx",
+    "sheet": "GRN Report March 2026",
+    "rows": 42920,
+    "lines": 42774,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 146,
+      "value": 204221959.1
+     }
+    },
+    "mvt": {
+     "101": 42920
+    },
+    "returns": 0,
+    "dates": {
+     "text": 42920,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 734558929.32,
+    "qty": 8729652.3
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 146,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 42920,
+     "value": 938780888.42
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 42920,
+     "value": 938780888.42
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24267,
+     "value": 475235897.3
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20185,
+     "value": 457747801.83
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19444,
+     "value": 453540987.31
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17372,
+     "value": 431731630.9
+    }
+   ],
+   "prices": {
+    "lines": 17372,
+    "value": 431731630.9,
+    "by_status": {
+     "ok": {
+      "lines": 17110,
+      "value": 431253787.32
+     },
+     "no_price": {
+      "lines": 240,
+      "value": 0.0
+     },
+     "other_unit": {
+      "lines": 22,
+      "value": 477843.58
+     }
+    },
+    "compared": {
+     "lines": 15389,
+     "value": 422616127.0,
+     "materials": 2652
+    },
+    "products": 1741,
+    "products_with_spread": 729,
+    "extra_paid_vs_cheapest": 50087767.67,
+    "unusually_low": {
+     "rows": 15,
+     "value": 95568.6,
+     "products": 13
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 1,
+      "value": 13599351.04,
+      "extra_paid": 6175641.04
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 11976833.22,
+      "extra_paid": 4652419.22
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 8100.0,
+      "max_price": 18404.02,
+      "brands": 3,
+      "vendors": 1,
+      "value": 9080002.21,
+      "extra_paid": 3183202.21
+     },
+     {
+      "molecule_key": "PEMBROLIZUMAB|100MG|INJ|",
+      "minor_group": "PEMBROLIZUMAB",
+      "cheapest_price": 179798.1,
+      "min_price": 179798.1,
+      "max_price": 192688.19,
+      "brands": 1,
+      "vendors": 1,
+      "value": 68038742.81,
+      "extra_paid": 2951830.61
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 35000.0,
+      "min_price": 35000.0,
+      "max_price": 232686.54,
+      "brands": 3,
+      "vendors": 1,
+      "value": 9671015.42,
+      "extra_paid": 2321015.42
+     },
+     {
+      "molecule_key": "OXALIPLATIN|100MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 600.0,
+      "min_price": 600.0,
+      "max_price": 3841.52,
+      "brands": 7,
+      "vendors": 6,
+      "value": 2714816.38,
+      "extra_paid": 2053616.38
+     },
+     {
+      "molecule_key": "FAMTRASTUZUMABDERUXTECAN|100MG|INJ|",
+      "minor_group": "FAM-TRASTUZUMAB DERUXTECAN",
+      "cheapest_price": 138746.97,
+      "min_price": 135259.0,
+      "max_price": 154340.09,
+      "brands": 1,
+      "vendors": 1,
+      "value": 15023203.05,
+      "extra_paid": 1294228.96
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 82.45,
+      "max_price": 700.0,
+      "brands": 5,
+      "vendors": 5,
+      "value": 2396400.34,
+      "extra_paid": 1220814.84
+     },
+     {
+      "molecule_key": "ALBUMINBOUNDPACLITAXEL|100MG|INJ|NAB",
+      "minor_group": "ALBUMIN BOUND PACLITAXEL",
+      "cheapest_price": 2280.5,
+      "min_price": 2280.5,
+      "max_price": 3700.0,
+      "brands": 3,
+      "vendors": 1,
+      "value": 4095678.0,
+      "extra_paid": 1199443.0
+     },
+     {
+      "molecule_key": "OXALIPLATIN|50MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 350.0,
+      "min_price": 300.0,
+      "max_price": 1800.0,
+      "brands": 6,
+      "vendors": 6,
+      "value": 1446624.37,
+      "extra_paid": 1072974.37
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17372,
+    "value": 431731630.9,
+    "by_class": {
+     "branded": {
+      "lines": 1452,
+      "value": 235191974.08,
+      "materials": 231,
+      "value_pct": 54.48
+     },
+     "generic": {
+      "lines": 15920,
+      "value": 196539656.82,
+      "materials": 2918,
+      "value_pct": 45.52
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 65,
+      "value": 9315539.73
+     },
+     "originator_list": {
+      "lines": 1387,
+      "value": 225876434.35
+     },
+     "default": {
+      "lines": 15920,
+      "value": 196539656.82
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 1824660.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 5255357.22
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2235522.51
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 22016011.36,
+     "compared_value": 32653915.04,
+     "branded_value_not_compared": 202538059.04,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 6175641.04
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 4652419.22
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 3183202.21
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "SIGRIMA 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 2321015.42
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1190512.84
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 808600.0
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 618643.4
+      },
+      {
+       "material": "101258",
+       "material_desc": "IMBRUVICA 140MG CAP 90'S CONTAINER",
+       "manufacturer": "J&J",
+       "cheapest_generic": "IBRUZEE 140MG CAP 30'S CONTAINER",
+       "extra_vs_generic": 454451.4
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 417789.8
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 338065.04
+      }
+     ]
+    }
+   }
+  },
+  "2026-04": {
+   "period": "2026-04",
+   "label": "Apr-26",
+   "grn": {
+    "file": "05.GRN April 2026.xlsx",
+    "sheet": "GRN report April 2026",
+    "rows": 45229,
+    "lines": 45167,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 62,
+      "value": 98146926.87
+     }
+    },
+    "mvt": {
+     "101": 45229
+    },
+    "returns": 0,
+    "dates": {
+     "date": 45229,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 725236661.13,
+    "qty": 9298814.0
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 62,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 45229,
+     "value": 823383588.0
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 45229,
+     "value": 823383588.0
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 25983,
+     "value": 470169244.48
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20845,
+     "value": 443174203.89
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19832,
+     "value": 435505876.59
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17908,
+     "value": 414995016.27
+    }
+   ],
+   "prices": {
+    "lines": 17908,
+    "value": 414995016.27,
+    "by_status": {
+     "ok": {
+      "lines": 17638,
+      "value": 414916169.49
+     },
+     "no_price": {
+      "lines": 243,
+      "value": -616.2
+     },
+     "other_unit": {
+      "lines": 27,
+      "value": 79462.98
+     }
+    },
+    "compared": {
+     "lines": 15766,
+     "value": 400004769.03,
+     "materials": 2735
+    },
+    "products": 1759,
+    "products_with_spread": 765,
+    "extra_paid_vs_cheapest": 51759204.31,
+    "unusually_low": {
+     "rows": 41,
+     "value": 296000.2,
+     "products": 34
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 1,
+      "value": 17922995.39,
+      "extra_paid": 8835350.39
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 5800.0,
+      "max_price": 18938.1,
+      "brands": 3,
+      "vendors": 2,
+      "value": 12317936.16,
+      "extra_paid": 4790636.16
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 11257838.69,
+      "extra_paid": 4733360.69
+     },
+     {
+      "molecule_key": "PEMBROLIZUMAB|100MG|INJ|",
+      "minor_group": "PEMBROLIZUMAB",
+      "cheapest_price": 180038.1,
+      "min_price": 179798.1,
+      "max_price": 200004.76,
+      "brands": 1,
+      "vendors": 1,
+      "value": 51511396.3,
+      "extra_paid": 4523132.2
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 35000.0,
+      "min_price": 32000.0,
+      "max_price": 232686.54,
+      "brands": 4,
+      "vendors": 1,
+      "value": 8332059.62,
+      "extra_paid": 2083059.62
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 81.48,
+      "max_price": 700.0,
+      "brands": 4,
+      "vendors": 3,
+      "value": 3042553.5,
+      "extra_paid": 1692910.0
+     },
+     {
+      "molecule_key": "DURVALUMAB|500MG|INJ|",
+      "minor_group": "DURVALUMAB",
+      "cheapest_price": 142280.72,
+      "min_price": 142280.67,
+      "max_price": 158270.99,
+      "brands": 1,
+      "vendors": 1,
+      "value": 15571253.03,
+      "extra_paid": 1343181.03
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1790.0,
+      "min_price": 454.0,
+      "max_price": 4900.0,
+      "brands": 4,
+      "vendors": 4,
+      "value": 3165060.0,
+      "extra_paid": 1279970.0
+     },
+     {
+      "molecule_key": "PARACETAMOL|1000MG|INJ|",
+      "minor_group": "PARACETAMOL",
+      "cheapest_price": 156.0,
+      "min_price": 66.0,
+      "max_price": 400.0,
+      "brands": 6,
+      "vendors": 3,
+      "value": 3450041.1,
+      "extra_paid": 875057.1
+     },
+     {
+      "molecule_key": "TISLELIZUMAB|100MG|INJ|",
+      "minor_group": "TISLELIZUMAB",
+      "cheapest_price": 48937.39,
+      "min_price": 48937.39,
+      "max_price": 56511.17,
+      "brands": 1,
+      "vendors": 1,
+      "value": 6554711.36,
+      "extra_paid": 780099.34
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17908,
+    "value": 414995016.27,
+    "by_class": {
+     "branded": {
+      "lines": 1443,
+      "value": 208148714.19,
+      "materials": 238,
+      "value_pct": 50.16
+     },
+     "generic": {
+      "lines": 16465,
+      "value": 206846302.08,
+      "materials": 3017,
+      "value_pct": 49.84
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 57,
+      "value": 7934514.59
+     },
+     "originator_list": {
+      "lines": 1386,
+      "value": 200214199.6
+     },
+     "default": {
+      "lines": 16465,
+      "value": 206846302.08
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 851508.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 4476785.78
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2606220.81
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 24682373.54,
+     "compared_value": 36814935.0,
+     "branded_value_not_compared": 171333779.19,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 8835350.39
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 4786636.16
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 4733360.69
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1691410.0
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 1181570.0
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "SIGRIMA 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 593059.62
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 492500.0
+      },
+      {
+       "material": "100303",
+       "material_desc": "HALAVEN 0.88MG INJ VIAL",
+       "manufacturer": "EISAI",
+       "cheapest_generic": "EMBREMMA 0.88MG INJ 2ML VIAL",
+       "extra_vs_generic": 362638.0
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 312753.96
+      },
+      {
+       "material": "101629",
+       "material_desc": "LYNPARZA 150MG TAB",
+       "manufacturer": "ASTRAZENECA",
+       "cheapest_generic": "RIBAXA 150MG TAB",
+       "extra_vs_generic": 232126.72
+      }
+     ]
+    }
+   }
+  },
+  "2026-05": {
+   "period": "2026-05",
+   "label": "May-26",
+   "grn": {
+    "file": "06.GRN May 2026.xlsx",
+    "sheet": "Sheet1",
+    "rows": 41965,
+    "lines": 41934,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 31,
+      "value": 12669938.05
+     }
+    },
+    "mvt": {
+     "101": 41965
+    },
+    "returns": 0,
+    "dates": {
+     "date": 41965,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 760157581.62,
+    "qty": 8926944.9
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 31,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 41965,
+     "value": 772827519.67
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 41965,
+     "value": 772827519.67
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 22376,
+     "value": 441866819.95
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 18806,
+     "value": 425922383.28
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 18087,
+     "value": 421318384.25
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 15917,
+     "value": 398155026.96
+    }
+   ],
+   "prices": {
+    "lines": 15917,
+    "value": 398155026.96,
+    "by_status": {
+     "ok": {
+      "lines": 15670,
+      "value": 398026227.89
+     },
+     "no_price": {
+      "lines": 223,
+      "value": 0.0
+     },
+     "token": {
+      "lines": 2,
+      "value": 0.38
+     },
+     "other_unit": {
+      "lines": 22,
+      "value": 128798.69
+     }
+    },
+    "compared": {
+     "lines": 14092,
+     "value": 389743627.42,
+     "materials": 2784
+    },
+    "products": 1794,
+    "products_with_spread": 838,
+    "extra_paid_vs_cheapest": 54335178.17,
+    "unusually_low": {
+     "rows": 28,
+     "value": 131557.05,
+     "products": 20
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 1,
+      "value": 16974321.22,
+      "extra_paid": 8910636.22
+     },
+     {
+      "molecule_key": "PEMBROLIZUMAB|100MG|INJ|",
+      "minor_group": "PEMBROLIZUMAB",
+      "cheapest_price": 180038.1,
+      "min_price": 180038.1,
+      "max_price": 200004.76,
+      "brands": 1,
+      "vendors": 1,
+      "value": 69442937.68,
+      "extra_paid": 6249564.58
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 8100.0,
+      "max_price": 18938.1,
+      "brands": 2,
+      "vendors": 2,
+      "value": 9873849.82,
+      "extra_paid": 4697949.82
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 10766103.3,
+      "extra_paid": 4391613.3
+     },
+     {
+      "molecule_key": "OXALIPLATIN|100MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 980.0,
+      "min_price": 940.0,
+      "max_price": 4000.0,
+      "brands": 5,
+      "vendors": 3,
+      "value": 4162510.0,
+      "extra_paid": 2938530.0
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 45000.0,
+      "min_price": 32000.0,
+      "max_price": 232686.54,
+      "brands": 4,
+      "vendors": 1,
+      "value": 9915178.86,
+      "extra_paid": 1689178.86
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1707.09,
+      "min_price": 396.0,
+      "max_price": 4950.0,
+      "brands": 3,
+      "vendors": 6,
+      "value": 2832487.85,
+      "extra_paid": 1450240.45
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 55.0,
+      "max_price": 800.0,
+      "brands": 6,
+      "vendors": 5,
+      "value": 2559700.0,
+      "extra_paid": 1269110.0
+     },
+     {
+      "molecule_key": "MEROPENEM|1000MG|INJ|",
+      "minor_group": "MEROPENEM (SCH H1)",
+      "cheapest_price": 350.0,
+      "min_price": 126.0,
+      "max_price": 870.0,
+      "brands": 5,
+      "vendors": 8,
+      "value": 2723405.0,
+      "extra_paid": 1193365.0
+     },
+     {
+      "molecule_key": "DURVALUMAB|500MG|INJ|",
+      "minor_group": "DURVALUMAB",
+      "cheapest_price": 142280.72,
+      "min_price": 137059.41,
+      "max_price": 158270.99,
+      "brands": 1,
+      "vendors": 2,
+      "value": 13227865.0,
+      "extra_paid": 1007387.01
+     }
+    ]
+   },
+   "generic": {
+    "lines": 15917,
+    "value": 398155026.96,
+    "by_class": {
+     "branded": {
+      "lines": 1396,
+      "value": 215485991.2,
+      "materials": 256,
+      "value_pct": 54.12
+     },
+     "generic": {
+      "lines": 14521,
+      "value": 182669035.76,
+      "materials": 3037,
+      "value_pct": 45.88
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 72,
+      "value": 7817515.47
+     },
+     "originator_list": {
+      "lines": 1324,
+      "value": 207668475.73
+     },
+     "default": {
+      "lines": 14521,
+      "value": 182669035.76
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 1338084.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 3503571.48
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2975859.99
+     }
+    ],
+    "formulary": null,
+    "tiers": null,
+    "cost_impact": {
+     "extra_vs_generic": 26151008.23,
+     "compared_value": 38633123.72,
+     "branded_value_not_compared": 176852867.48,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 8910636.22
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 4697949.82
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 4391613.3
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "HERTUMAB 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 1806178.86
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 1459012.75
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1201200.0
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "MEROCRIT KIT 1GM INJ VIAL",
+       "extra_vs_generic": 1014015.0
+      },
+      {
+       "material": "212488",
+       "material_desc": "TYGACIL 50MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TIGEFIC 50MG INJ VIAL",
+       "extra_vs_generic": 391125.0
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 338033.38
+      },
+      {
+       "material": "202292",
+       "material_desc": "CLEXANE 40MG INJ 0.4ML PFS",
+       "manufacturer": "SANOFI",
+       "cheapest_generic": "LOWCAP 40MG INJ 0.4ML PFS",
+       "extra_vs_generic": 240058.3
+      }
+     ]
+    }
+   }
+  },
+  "2026-06": {
+   "period": "2026-06",
+   "label": "Jun-26",
+   "grn": {
+    "file": "03.Consolidated GRN June 2026.xlsx",
+    "sheet": "consolidated",
+    "rows": 43142,
+    "lines": 43058,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 84,
+      "value": 527759320.04
+     }
+    },
+    "mvt": {
+     "101": 42345,
+     "122": 778,
+     "161": 19
+    },
+    "returns": 797,
+    "dates": {
+     "text": 43142,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 855927838.29,
+    "qty": 9233950.2
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 84,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 43142,
+     "value": 1383687158.33
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 42345,
+     "value": 1368710305.91
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24941,
+     "value": 585985541.15
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20776,
+     "value": 563012850.84
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19712,
+     "value": 554552397.49
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17657,
+     "value": 529731719.42
+    }
+   ],
+   "oof": {
+    "item_master": {
+     "file": "ITEM MASTER FOR FORMULARY COMPLIENCE JUne-26.xlsx",
+     "out_of_formulary_lines": 765,
+     "total_wo_tax": 5605458.04,
+     "total_pp": 5615236.5
+    },
+    "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "pair_months": [],
+    "formulary_pool_brands": 2515,
+    "by_status": {
+     "counted": {
+      "lines": 761,
+      "total_pp": 5610593.0
+     },
+     "no_alternative": {
+      "lines": 4,
+      "total_pp": 4643.5
+     }
+    },
+    "by_source": {
+     "hcg_sheet": {
+      "lines": 761,
+      "total_pp": 5610593.0,
+      "margin_loss": 2837256.29
+     },
+     "none": {
+      "lines": 4,
+      "total_pp": 4643.5,
+      "margin_loss": 0.0
+     }
+    },
+    "rule_levels": {},
+    "price_sources": {
+     "hcg_sheet": {
+      "lines": 761
+     }
+    },
+    "actual_margin": 4475872.45,
+    "suggested_margin": 7313128.73,
+    "margin_loss": 2837256.29,
+    "gain_loss": 3301961.07,
+    "better_loss": -464704.78,
+    "loss_pct": 38.8,
+    "hcg": {
+     "file": "Out of Formulary Spend Analysis June 26 WS.xlsb",
+     "period": "2026-06",
+     "ws_sheet": "WS Final Sheet",
+     "ws_lines": 761,
+     "ws_unpriced": 0,
+     "pairs": 507,
+     "parked_sheet": null,
+     "parked_lines": 0,
+     "summary_sheet": "Summary",
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 244922.82,
+       "hcg": 244922.82,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 775370.83,
+       "hcg": 775370.83,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 74423.21,
+       "hcg": 74423.21,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 382659.82,
+       "hcg": 382659.82,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": 498905.13,
+       "hcg": 498905.13,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": -1910.13,
+       "hcg": -1910.13,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 386543.87,
+       "hcg": 386543.87,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": -7530.91,
+       "hcg": -7530.91,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": 5115.14,
+       "hcg": 5115.14,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 49537.61,
+       "hcg": 49537.61,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": -72803.16,
+       "hcg": -72803.16,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 45293.45,
+       "hcg": 45293.45,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 19392.78,
+       "hcg": 19392.78,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 57222.28,
+       "hcg": 57222.28,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 95276.4,
+       "hcg": 95276.4,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": 205176.53,
+       "hcg": 205176.53,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 15953.62,
+       "hcg": 15953.62,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 36492.95,
+       "hcg": 36492.95,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 4815.95,
+       "hcg": 4815.95,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 22398.07,
+       "hcg": 22398.07,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "loss": 2837256.29,
+     "summary_computed": 0,
+     "warnings": [],
+     "loss_ours": 2837256.29,
+     "loss_hcg": 2837256.29,
+     "diff": 0.0,
+     "diff_pct": 0.0,
+     "sum_abs_centre_diff": 0.0,
+     "max_centre_diff": 0.0,
+     "centres_within_5pct": 20,
+     "pair_check": {
+      "hcg_keys": 507,
+      "keys_lines_or_qty_differ": 0,
+      "hcg_lines_not_found": 0,
+      "our_keys_not_on_hcg_sheet": 3,
+      "our_lines_not_on_hcg_sheet": 4
+     }
+    },
+    "kr": {
+     "plant": "HC05",
+     "ours": {
+      "actual_margin": 173894.86,
+      "suggested_margin": 949265.69,
+      "margin_loss": 775370.83,
+      "loss_pct": 81.68
+     },
+     "hcg_summary": {
+      "actual_margin": 173894.86,
+      "suggested_margin": 949265.69,
+      "margin_loss": 775370.83
+     },
+     "email": {
+      "actual_margin": 173895.0,
+      "suggested_margin": 949266.0,
+      "margin_loss": 775371.0,
+      "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+     },
+     "diff_vs_email": {
+      "actual_margin": -0.14,
+      "suggested_margin": -0.31,
+      "margin_loss": -0.17
+     },
+     "diff_vs_email_pct": -0.0
+    },
+    "warnings": [],
+    "no_pair": {
+     "lines": 4,
+     "total_pp": 4643.5,
+     "sources_2_4_could_price": {
+      "pair_months": [
+       "2026-07",
+       "2026-08"
+      ],
+      "lines": 0,
+      "total_pp": 0.0,
+      "margin_loss": 0.0,
+      "by_source": {}
+     }
+    },
+    "simulation": {
+     "rule": "sources 2-5 (HCG's pairs from earlier worksheets, HCG's master, our rule), every OOF line counted as if HCG had no worksheet this month",
+     "pair_months": [],
+     "by_source": {
+      "formulary_rule": {
+       "lines": 265,
+       "total_pp": 1809183.46,
+       "margin_loss": 1186690.94
+      },
+      "hcg_list": {
+       "lines": 491,
+       "total_pp": 3796317.94,
+       "margin_loss": 1861723.82
+      },
+      "none": {
+       "lines": 9,
+       "total_pp": 9735.1,
+       "margin_loss": 0.0
+      }
+     },
+     "by_status": {
+      "counted": {
+       "lines": 756,
+       "total_pp": 5605501.4
+      },
+      "no_alternative": {
+       "lines": 9,
+       "total_pp": 9735.1
+      }
+     },
+     "rule_levels": {
+      "A": {
+       "lines": 240
+      },
+      "B": {
+       "lines": 4
+      },
+      "C": {
+       "lines": 5
+      },
+      "D": {
+       "lines": 9
+      },
+      "F": {
+       "lines": 7
+      }
+     },
+     "actual_margin": 4473533.47,
+     "suggested_margin": 7521948.24,
+     "margin_loss": 3048414.76,
+     "gain_loss": 3463137.37,
+     "better_loss": -414722.61,
+     "loss_pct": 40.53,
+     "loss_ours": 3048414.76,
+     "loss_hcg": 2837256.29,
+     "diff": 211158.48,
+     "diff_pct": 7.44,
+     "sum_abs_centre_diff": 559390.82,
+     "max_centre_diff": 193380.88,
+     "centres_within_5pct": 8,
+     "brands": {
+      "hcg_lines": 761,
+      "same_brand_lines": 656,
+      "same_brand_pct": 86.2
+     },
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 231565.68,
+       "hcg": 244922.82,
+       "diff": -13357.14,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 854436.91,
+       "hcg": 775370.83,
+       "diff": 79066.08,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 72350.44,
+       "hcg": 74423.21,
+       "diff": -2072.77,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 378003.5,
+       "hcg": 382659.82,
+       "diff": -4656.33,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": 401878.21,
+       "hcg": 498905.13,
+       "diff": -97026.92,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": -3435.88,
+       "hcg": -1910.13,
+       "diff": -1525.75,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 579924.75,
+       "hcg": 386543.87,
+       "diff": 193380.88,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": -10525.19,
+       "hcg": -7530.91,
+       "diff": -2994.29,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": 5077.49,
+       "hcg": 5115.14,
+       "diff": -37.65,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 27276.03,
+       "hcg": 49537.61,
+       "diff": -22261.59,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": -38993.47,
+       "hcg": -72803.16,
+       "diff": 33809.69,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 15109.71,
+       "hcg": 45293.45,
+       "diff": -30183.74,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 19603.56,
+       "hcg": 19392.78,
+       "diff": 210.79,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 88149.28,
+       "hcg": 57222.28,
+       "diff": 30926.99,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 99647.76,
+       "hcg": 95276.4,
+       "diff": 4371.35,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": 216455.46,
+       "hcg": 205176.53,
+       "diff": 11278.93,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 15953.62,
+       "hcg": 15953.62,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 36492.95,
+       "hcg": 36492.95,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 37045.88,
+       "hcg": 4815.95,
+       "diff": 32229.93,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 22398.07,
+       "hcg": 22398.07,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "kr": {
+      "plant": "HC05",
+      "ours": {
+       "actual_margin": 173894.86,
+       "suggested_margin": 1028331.77,
+       "margin_loss": 854436.91,
+       "loss_pct": 83.09
+      },
+      "hcg_summary": {
+       "actual_margin": 173894.86,
+       "suggested_margin": 949265.69,
+       "margin_loss": 775370.83
+      },
+      "email": {
+       "actual_margin": 173895.0,
+       "suggested_margin": 949266.0,
+       "margin_loss": 775371.0,
+       "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+      },
+      "diff_vs_email": {
+       "actual_margin": -0.14,
+       "suggested_margin": 79065.77,
+       "margin_loss": 79065.91
+      },
+      "diff_vs_email_pct": 10.2
+     }
+    }
+   },
+   "prices": {
+    "lines": 17657,
+    "value": 529731719.42,
+    "by_status": {
+     "ok": {
+      "lines": 17356,
+      "value": 529662394.55
+     },
+     "no_price": {
+      "lines": 273,
+      "value": 0.0
+     },
+     "token": {
+      "lines": 2,
+      "value": 0.54
+     },
+     "other_unit": {
+      "lines": 26,
+      "value": 69324.33
+     }
+    },
+    "compared": {
+     "lines": 15413,
+     "value": 512271393.48,
+     "materials": 2908
+    },
+    "products": 1893,
+    "products_with_spread": 811,
+    "extra_paid_vs_cheapest": 51799120.18,
+    "unusually_low": {
+     "rows": 32,
+     "value": 98969.75,
+     "products": 26
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 1,
+      "value": 21116003.96,
+      "extra_paid": 10722809.96
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 7135.0,
+      "max_price": 18938.1,
+      "brands": 2,
+      "vendors": 2,
+      "value": 12138454.3,
+      "extra_paid": 5651904.3
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 11784243.57,
+      "extra_paid": 5047282.57
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 32000.0,
+      "min_price": 32000.0,
+      "max_price": 232686.54,
+      "brands": 4,
+      "vendors": 1,
+      "value": 9251746.16,
+      "extra_paid": 2947746.16
+     },
+     {
+      "molecule_key": "OXALIPLATIN|100MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 1045.0,
+      "min_price": 991.0,
+      "max_price": 4000.0,
+      "brands": 5,
+      "vendors": 3,
+      "value": 3384493.04,
+      "extra_paid": 2344213.04
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 86.0,
+      "max_price": 800.0,
+      "brands": 4,
+      "vendors": 2,
+      "value": 2960240.0,
+      "extra_paid": 1647830.0
+     },
+     {
+      "molecule_key": "DURVALUMAB|500MG|INJ|",
+      "minor_group": "DURVALUMAB",
+      "cheapest_price": 142280.72,
+      "min_price": 142280.72,
+      "max_price": 158270.99,
+      "brands": 1,
+      "vendors": 1,
+      "value": 16394590.17,
+      "extra_paid": 1455114.57
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1707.09,
+      "min_price": 1707.09,
+      "max_price": 4950.0,
+      "brands": 3,
+      "vendors": 2,
+      "value": 2639487.0,
+      "extra_paid": 1379654.58
+     },
+     {
+      "molecule_key": "OXALIPLATIN|50MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 605.0,
+      "min_price": 510.0,
+      "max_price": 1900.0,
+      "brands": 5,
+      "vendors": 3,
+      "value": 1662500.0,
+      "extra_paid": 1068455.0
+     },
+     {
+      "molecule_key": "PACLITAXEL|100MG|INJ|",
+      "minor_group": "PACLITAXEL",
+      "cheapest_price": 921.77,
+      "min_price": 921.77,
+      "max_price": 8112.14,
+      "brands": 5,
+      "vendors": 1,
+      "value": 2551319.07,
+      "extra_paid": 873697.67
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17657,
+    "value": 529731719.42,
+    "by_class": {
+     "branded": {
+      "lines": 1492,
+      "value": 315159114.62,
+      "materials": 252,
+      "value_pct": 59.49
+     },
+     "generic": {
+      "lines": 16165,
+      "value": 214572604.8,
+      "materials": 3207,
+      "value_pct": 40.51
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 63,
+      "value": 8707318.96
+     },
+     "originator_list": {
+      "lines": 1429,
+      "value": 306451795.66
+     },
+     "default": {
+      "lines": 16165,
+      "value": 214572604.8
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 1125207.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 4866071.5
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2716040.46
+     }
+    ],
+    "formulary": {
+     "branded": {
+      "FORMULARY": 312770902.57,
+      "NON FORMULARY": 1615134.82,
+      "OUT OF FORMULARY": 773077.23
+     },
+     "generic": {
+      "FORMULARY": 190200341.89,
+      "NON FORMULARY": 19539882.1,
+      "OUT OF FORMULARY": 4832380.81
+     }
+    },
+    "tiers": {
+     "branded": {
+      "preferred": 198100025.1,
+      "restricted": 114670877.47
+     },
+     "generic": {
+      "other": 2425382.33,
+      "preferred": 140489224.1,
+      "restricted": 28445341.42,
+      "scheme_only": 18840394.04
+     }
+    },
+    "cost_impact": {
+     "extra_vs_generic": 28824471.96,
+     "compared_value": 42420063.11,
+     "branded_value_not_compared": 272739051.51,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 10722809.96
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 5651904.3
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 5047282.57
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 1624400.0
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 1240009.08
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "HERTUMAB 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 802746.16
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "FYTOPENEM 1GM INJ VIAL",
+       "extra_vs_generic": 665600.0
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 417005.28
+      },
+      {
+       "material": "211376",
+       "material_desc": "SUPACEF 1.5GM INJ VIAL",
+       "manufacturer": "GSK",
+       "cheapest_generic": "BACTILEM 1.5GM INJ VIAL",
+       "extra_vs_generic": 371317.91
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 338033.38
+      }
+     ]
+    }
+   }
+  },
+  "2026-07": {
+   "period": "2026-07",
+   "label": "Jul-26",
+   "grn": {
+    "file": "04.Consolidated GRN July 2026.xlsx",
+    "sheet": "GRN July 2026",
+    "rows": 44621,
+    "lines": 44564,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 56,
+      "value": 142514327.93
+     },
+     "122": {
+      "lines": 1,
+      "value": 56400.0
+     }
+    },
+    "mvt": {
+     "101": 43748,
+     "122": 859,
+     "161": 14
+    },
+    "returns": 873,
+    "dates": {
+     "date": 44621,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 726202080.03,
+    "qty": 8739919.3
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 57,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 44621,
+     "value": 868772807.96
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 43748,
+     "value": 853533293.64
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 24719,
+     "value": 471381661.41
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20604,
+     "value": 449818274.13
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19460,
+     "value": 441067326.49
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17160,
+     "value": 422592233.19
+    }
+   ],
+   "oof": {
+    "item_master": {
+     "file": "Copy of item master for formulary complience July 2026.xlsb",
+     "out_of_formulary_lines": 815,
+     "total_wo_tax": 5269563.53,
+     "total_pp": 5278293.58
+    },
+    "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "pair_months": [],
+    "formulary_pool_brands": 2514,
+    "by_status": {
+     "counted": {
+      "lines": 803,
+      "total_pp": 5245655.86
+     },
+     "parked": {
+      "lines": 12,
+      "total_pp": 32637.72
+     }
+    },
+    "by_source": {
+     "hcg_sheet": {
+      "lines": 815,
+      "total_pp": 5278293.58,
+      "margin_loss": 2661388.3
+     }
+    },
+    "rule_levels": {},
+    "price_sources": {
+     "hcg_sheet": {
+      "lines": 803
+     }
+    },
+    "actual_margin": 5705498.82,
+    "suggested_margin": 8366887.12,
+    "margin_loss": 2661388.3,
+    "gain_loss": 3147643.07,
+    "better_loss": -486254.77,
+    "loss_pct": 31.81,
+    "hcg": {
+     "file": "Out of Formulary Spend Analysis July 26 WS.xlsb",
+     "period": "2026-07",
+     "ws_sheet": "Out of formulary July 26 WS",
+     "ws_lines": 803,
+     "ws_unpriced": 0,
+     "pairs": 531,
+     "parked_sheet": "Need To check flaging later",
+     "parked_lines": 12,
+     "summary_sheet": "Summary ",
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 265861.12,
+       "hcg": 265861.12,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 798094.5,
+       "hcg": 798094.5,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 53348.33,
+       "hcg": 53348.33,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 81302.39,
+       "hcg": 81302.39,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": 146747.07,
+       "hcg": 146747.07,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": 4228.68,
+       "hcg": 4228.68,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 499078.27,
+       "hcg": 499078.27,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": 3605.14,
+       "hcg": 3605.14,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": 6983.12,
+       "hcg": 6983.12,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC26",
+       "centre_name": "Ongole",
+       "ours": 10626.12,
+       "hcg": 10626.12,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 24728.71,
+       "hcg": 24728.71,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": -215.34,
+       "hcg": -215.34,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 44032.28,
+       "hcg": 44032.28,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 3710.36,
+       "hcg": 3710.36,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 43365.71,
+       "hcg": 43365.71,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 119858.06,
+       "hcg": 119858.06,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": -71379.97,
+       "hcg": -71379.97,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 213812.32,
+       "hcg": 213812.32,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 2842.32,
+       "hcg": 2842.32,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 211419.66,
+       "hcg": 211419.66,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 199339.47,
+       "hcg": 199339.47,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "loss": 2661388.3,
+     "summary_computed": 0,
+     "warnings": [],
+     "loss_ours": 2661388.3,
+     "loss_hcg": 2661388.3,
+     "diff": 0.0,
+     "diff_pct": 0.0,
+     "sum_abs_centre_diff": 0.0,
+     "max_centre_diff": 0.0,
+     "centres_within_5pct": 21,
+     "pair_check": {
+      "hcg_keys": 541,
+      "keys_lines_or_qty_differ": 0,
+      "hcg_lines_not_found": 0,
+      "our_keys_not_on_hcg_sheet": 0,
+      "our_lines_not_on_hcg_sheet": 0
+     }
+    },
+    "kr": {
+     "plant": "HC05",
+     "ours": {
+      "actual_margin": 113340.62,
+      "suggested_margin": 911435.12,
+      "margin_loss": 798094.5,
+      "loss_pct": 87.56
+     },
+     "hcg_summary": {
+      "actual_margin": 113340.62,
+      "suggested_margin": 911435.12,
+      "margin_loss": 798094.5
+     },
+     "email": {
+      "actual_margin": 113341.0,
+      "suggested_margin": 911435.0,
+      "margin_loss": 798094.0,
+      "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+     },
+     "diff_vs_email": {
+      "actual_margin": -0.38,
+      "suggested_margin": 0.12,
+      "margin_loss": 0.5
+     },
+     "diff_vs_email_pct": 0.0
+    },
+    "warnings": [],
+    "no_pair": {
+     "lines": 0,
+     "total_pp": 0.0
+    },
+    "simulation": {
+     "rule": "sources 2-5 (HCG's pairs from earlier worksheets, HCG's master, our rule), every OOF line counted as if HCG had no worksheet this month",
+     "pair_months": [
+      "2026-06"
+     ],
+     "by_source": {
+      "formulary_rule": {
+       "lines": 171,
+       "total_pp": 801878.37,
+       "margin_loss": 391673.77
+      },
+      "hcg_list": {
+       "lines": 99,
+       "total_pp": 490195.97,
+       "margin_loss": 393454.07
+      },
+      "hcg_sheet_pair": {
+       "lines": 526,
+       "total_pp": 3936132.26,
+       "margin_loss": 1832147.88
+      },
+      "none": {
+       "lines": 19,
+       "total_pp": 50086.98,
+       "margin_loss": 0.0
+      }
+     },
+     "by_status": {
+      "counted": {
+       "lines": 794,
+       "total_pp": 5226413.8
+      },
+      "no_alternative": {
+       "lines": 19,
+       "total_pp": 50086.98
+      },
+      "unpriced": {
+       "lines": 2,
+       "total_pp": 1792.8
+      }
+     },
+     "rule_levels": {
+      "A": {
+       "lines": 162
+      },
+      "B": {
+       "lines": 3
+      },
+      "D": {
+       "lines": 4
+      },
+      "F": {
+       "lines": 2
+      }
+     },
+     "actual_margin": 5678865.94,
+     "suggested_margin": 8296141.66,
+     "margin_loss": 2617275.71,
+     "gain_loss": 3122192.89,
+     "better_loss": -504917.18,
+     "loss_pct": 31.55,
+     "loss_ours": 2617275.71,
+     "loss_hcg": 2661388.3,
+     "diff": -44112.59,
+     "diff_pct": -1.66,
+     "sum_abs_centre_diff": 106021.37,
+     "max_centre_diff": 47006.47,
+     "centres_within_5pct": 12,
+     "brands": {
+      "hcg_lines": 803,
+      "same_brand_lines": 757,
+      "same_brand_pct": 94.27
+     },
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 256956.35,
+       "hcg": 265861.12,
+       "diff": -8904.76,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 798631.82,
+       "hcg": 798094.5,
+       "diff": 537.32,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 53348.33,
+       "hcg": 53348.33,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 90462.82,
+       "hcg": 81302.39,
+       "diff": 9160.42,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": 144944.64,
+       "hcg": 146747.07,
+       "diff": -1802.43,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": 4945.22,
+       "hcg": 4228.68,
+       "diff": 716.53,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 495546.2,
+       "hcg": 499078.27,
+       "diff": -3532.07,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": 3605.14,
+       "hcg": 3605.14,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": 6918.97,
+       "hcg": 6983.12,
+       "diff": -64.15,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC26",
+       "centre_name": "Ongole",
+       "ours": 6094.4,
+       "hcg": 10626.12,
+       "diff": -4531.71,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 29203.13,
+       "hcg": 24728.71,
+       "diff": 4474.42,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": -47221.81,
+       "hcg": -215.34,
+       "diff": -47006.47,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 41542.13,
+       "hcg": 44032.28,
+       "diff": -2490.15,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 3508.44,
+       "hcg": 3710.36,
+       "diff": -201.93,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 39425.45,
+       "hcg": 43365.71,
+       "diff": -3940.26,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 134312.23,
+       "hcg": 119858.06,
+       "diff": 14454.17,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": -70706.11,
+       "hcg": -71379.97,
+       "diff": 673.87,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 213169.15,
+       "hcg": 213812.32,
+       "diff": -643.17,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 2842.32,
+       "hcg": 2842.32,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 209469.78,
+       "hcg": 211419.66,
+       "diff": -1949.88,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 200277.12,
+       "hcg": 199339.47,
+       "diff": 937.66,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "kr": {
+      "plant": "HC05",
+      "ours": {
+       "actual_margin": 113340.62,
+       "suggested_margin": 911972.44,
+       "margin_loss": 798631.82,
+       "loss_pct": 87.57
+      },
+      "hcg_summary": {
+       "actual_margin": 113340.62,
+       "suggested_margin": 911435.12,
+       "margin_loss": 798094.5
+      },
+      "email": {
+       "actual_margin": 113341.0,
+       "suggested_margin": 911435.0,
+       "margin_loss": 798094.0,
+       "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+      },
+      "diff_vs_email": {
+       "actual_margin": -0.38,
+       "suggested_margin": 537.44,
+       "margin_loss": 537.82
+      },
+      "diff_vs_email_pct": 0.07
+     }
+    }
+   },
+   "prices": {
+    "lines": 17160,
+    "value": 422592233.19,
+    "by_status": {
+     "ok": {
+      "lines": 16874,
+      "value": 422482210.94
+     },
+     "no_price": {
+      "lines": 262,
+      "value": -16.55
+     },
+     "other_unit": {
+      "lines": 24,
+      "value": 110038.8
+     }
+    },
+    "compared": {
+     "lines": 15018,
+     "value": 410403535.0,
+     "materials": 2891
+    },
+    "products": 1854,
+    "products_with_spread": 807,
+    "extra_paid_vs_cheapest": 51094474.06,
+    "unusually_low": {
+     "rows": 44,
+     "value": 174714.76,
+     "products": 33
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 25599.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 2,
+      "value": 23341881.55,
+      "extra_paid": 10414386.55
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 5100.0,
+      "max_price": 18938.1,
+      "brands": 2,
+      "vendors": 5,
+      "value": 11988178.6,
+      "extra_paid": 5090058.6
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 11957.14,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 2,
+      "value": 11644483.21,
+      "extra_paid": 4471140.93
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 32000.0,
+      "min_price": 32000.0,
+      "max_price": 232686.54,
+      "brands": 4,
+      "vendors": 1,
+      "value": 11889492.32,
+      "extra_paid": 4049492.32
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 110.0,
+      "min_price": 84.0,
+      "max_price": 800.0,
+      "brands": 5,
+      "vendors": 5,
+      "value": 3227640.0,
+      "extra_paid": 2420650.0
+     },
+     {
+      "molecule_key": "DURVALUMAB|500MG|INJ|",
+      "minor_group": "DURVALUMAB",
+      "cheapest_price": 142280.72,
+      "min_price": 142280.72,
+      "max_price": 158270.99,
+      "brands": 1,
+      "vendors": 1,
+      "value": 20539984.74,
+      "extra_paid": 1758929.7
+     },
+     {
+      "molecule_key": "PACLITAXEL|100MG|INJ|",
+      "minor_group": "PACLITAXEL",
+      "cheapest_price": 921.77,
+      "min_price": 285.0,
+      "max_price": 8112.14,
+      "brands": 5,
+      "vendors": 4,
+      "value": 2594844.68,
+      "extra_paid": 964058.64
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1707.09,
+      "min_price": 1707.09,
+      "max_price": 4950.0,
+      "brands": 3,
+      "vendors": 2,
+      "value": 2558439.45,
+      "extra_paid": 960603.21
+     },
+     {
+      "molecule_key": "PARACETAMOL|100ML|INJ|",
+      "minor_group": "PARACETAMOL",
+      "cheapest_price": 22.0,
+      "min_price": 20.0,
+      "max_price": 221.27,
+      "brands": 2,
+      "vendors": 3,
+      "value": 1019346.12,
+      "extra_paid": 907874.12
+     },
+     {
+      "molecule_key": "TISLELIZUMAB|100MG|INJ|",
+      "minor_group": "TISLELIZUMAB",
+      "cheapest_price": 47667.43,
+      "min_price": 47667.43,
+      "max_price": 55044.53,
+      "brands": 1,
+      "vendors": 1,
+      "value": 7140467.26,
+      "extra_paid": 848366.5
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17160,
+    "value": 422592233.19,
+    "by_class": {
+     "branded": {
+      "lines": 1438,
+      "value": 210835701.14,
+      "materials": 250,
+      "value_pct": 49.89
+     },
+     "generic": {
+      "lines": 15722,
+      "value": 211756532.05,
+      "materials": 3177,
+      "value_pct": 50.11
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 69,
+      "value": 9715970.16
+     },
+     "originator_list": {
+      "lines": 1369,
+      "value": 201119730.98
+     },
+     "default": {
+      "lines": 15722,
+      "value": 211756532.05
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 973152.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 5255357.22
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 3487460.94
+     }
+    ],
+    "formulary": {
+     "branded": {
+      "FORMULARY": 205565922.84,
+      "NON FORMULARY": 4542856.58,
+      "OUT OF FORMULARY": 726921.72
+     },
+     "generic": {
+      "FORMULARY": 189594023.83,
+      "NON FORMULARY": 17619866.41,
+      "OUT OF FORMULARY": 4542641.81
+     }
+    },
+    "tiers": {
+     "branded": {
+      "preferred": 70916292.98,
+      "restricted": 134649629.86
+     },
+     "generic": {
+      "other": 2252587.18,
+      "preferred": 141661165.42,
+      "restricted": 26511719.79,
+      "scheme_only": 19168551.44
+     }
+    },
+    "cost_impact": {
+     "extra_vs_generic": 27804660.82,
+     "compared_value": 40230431.38,
+     "branded_value_not_compared": 170605269.76,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 10414386.55
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 5090058.6
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 4471140.93
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "TODAYCEF 1.5GM INJ VIAL",
+       "extra_vs_generic": 2125200.0
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "HERTUMAB 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 1605492.32
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 737170.41
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 625507.92
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "MEROCRIT KIT 1GM INJ VIAL",
+       "extra_vs_generic": 530460.0
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 507050.07
+      },
+      {
+       "material": "102749",
+       "material_desc": "VENCLEXTA 100MG TAB 28S CONTAINER",
+       "manufacturer": "ABBIVE",
+       "cheapest_generic": "IKRA 100MG TAB",
+       "extra_vs_generic": 267231.6
+      }
+     ]
+    }
+   }
+  },
+  "2026-08": {
+   "period": "2026-08",
+   "label": "Aug-26",
+   "grn": {
+    "file": "05.Consolidated GRN Aug 2026.xlsx",
+    "sheet": "Consolidated",
+    "rows": 43211,
+    "lines": 43178,
+    "blank_rows": 0,
+    "blank_material": {
+     "101": {
+      "lines": 33,
+      "value": 28084156.67
+     }
+    },
+    "mvt": {
+     "101": 42455,
+     "122": 756
+    },
+    "returns": 756,
+    "dates": {
+     "date": 15175,
+     "text": 28036,
+     "blank": 0,
+     "unparseable": 0
+    },
+    "value": 780604766.76,
+    "qty": 8981371.016
+   },
+   "unparseable_dates": 0,
+   "blank_material_lines": 33,
+   "funnel": [
+    {
+     "step": 0,
+     "kind": "lines",
+     "label": "lines in the GRN",
+     "lines": 43211,
+     "value": 808688923.43
+    },
+    {
+     "step": 1,
+     "kind": "mvt_keep",
+     "label": "movement type 101",
+     "lines": 42455,
+     "value": 789602762.19
+    },
+    {
+     "step": 2,
+     "kind": "series_keep",
+     "label": "material series 1, 2",
+     "lines": 23989,
+     "value": 505248480.1
+    },
+    {
+     "step": 3,
+     "kind": "sloc",
+     "label": "not storage location S125",
+     "lines": 20082,
+     "value": 483067703.92
+    },
+    {
+     "step": 4,
+     "kind": "plant_prefix",
+     "label": "not plants BH*",
+     "lines": 19197,
+     "value": 474765117.54
+    },
+    {
+     "step": 5,
+     "kind": "plant",
+     "label": "not plants HM03, HM04",
+     "lines": 17012,
+     "value": 455760310.08
+    }
+   ],
+   "oof": {
+    "item_master": {
+     "file": "Copy of Item master for formulary complience August -26_Updated.xlsx",
+     "out_of_formulary_lines": 860,
+     "total_wo_tax": 6386153.33,
+     "total_pp": 6394871.95
+    },
+    "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "pair_months": [],
+    "formulary_pool_brands": 2509,
+    "by_status": {
+     "counted": {
+      "lines": 841,
+      "total_pp": 6325368.58
+     },
+     "no_alternative": {
+      "lines": 19,
+      "total_pp": 69503.37
+     }
+    },
+    "by_source": {
+     "hcg_sheet": {
+      "lines": 841,
+      "total_pp": 6325368.58,
+      "margin_loss": 3243199.13
+     },
+     "none": {
+      "lines": 19,
+      "total_pp": 69503.37,
+      "margin_loss": 0.0
+     }
+    },
+    "rule_levels": {},
+    "price_sources": {
+     "hcg_sheet": {
+      "lines": 841
+     }
+    },
+    "actual_margin": 7059476.4,
+    "suggested_margin": 10302675.53,
+    "margin_loss": 3243199.13,
+    "gain_loss": 4167242.37,
+    "better_loss": -924043.24,
+    "loss_pct": 31.48,
+    "hcg": {
+     "file": "Out of Formulary Brand Margin loss Spend anlayiss August 26.xlsx",
+     "period": "2026-08",
+     "ws_sheet": "Out of formulary August 26 WS",
+     "ws_lines": 841,
+     "ws_unpriced": 0,
+     "pairs": 595,
+     "parked_sheet": null,
+     "parked_lines": 0,
+     "summary_sheet": "Summary",
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 214143.62,
+       "hcg": 214143.62,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 1323582.58,
+       "hcg": 1323582.58,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 61985.75,
+       "hcg": 61985.75,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 136552.1,
+       "hcg": 136552.1,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": -200094.07,
+       "hcg": -200094.07,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": -6211.2,
+       "hcg": -6211.2,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 571716.07,
+       "hcg": 571716.07,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": 57838.5,
+       "hcg": 57838.5,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": -4906.79,
+       "hcg": -4906.79,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 239125.94,
+       "hcg": 239125.94,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": 6439.01,
+       "hcg": 6439.01,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 15447.96,
+       "hcg": 15447.96,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 593.05,
+       "hcg": 593.05,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 36202.42,
+       "hcg": 36202.42,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 6063.79,
+       "hcg": 6063.79,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": 17592.58,
+       "hcg": 17592.58,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 84550.87,
+       "hcg": 84550.87,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 117794.92,
+       "hcg": 117794.92,
+       "diff": -0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 140025.09,
+       "hcg": 140025.09,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 424756.93,
+       "hcg": 424756.93,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "loss": 3243199.13,
+     "summary_computed": 0,
+     "warnings": [
+      "Out of Formulary Brand Margin loss Spend anlayiss August 26.xlsx: titles / file name say ['2026-07', '2026-08'], the worksheet's GR dates 2026-08; 2026-08 used"
+     ],
+     "loss_ours": 3243199.13,
+     "loss_hcg": 3243199.13,
+     "diff": 0.0,
+     "diff_pct": 0.0,
+     "sum_abs_centre_diff": 0.0,
+     "max_centre_diff": 0.0,
+     "centres_within_5pct": 20,
+     "pair_check": {
+      "hcg_keys": 595,
+      "keys_lines_or_qty_differ": 0,
+      "hcg_lines_not_found": 0,
+      "our_keys_not_on_hcg_sheet": 13,
+      "our_lines_not_on_hcg_sheet": 19
+     }
+    },
+    "kr": {
+     "plant": "HC05",
+     "ours": {
+      "actual_margin": 492781.81,
+      "suggested_margin": 1816364.39,
+      "margin_loss": 1323582.58,
+      "loss_pct": 72.87
+     },
+     "hcg_summary": {
+      "actual_margin": 492781.81,
+      "suggested_margin": 1816364.39,
+      "margin_loss": 1323582.58
+     },
+     "email": {
+      "actual_margin": 492782.0,
+      "suggested_margin": 1816364.0,
+      "margin_loss": 1323583.0,
+      "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+     },
+     "diff_vs_email": {
+      "actual_margin": -0.19,
+      "suggested_margin": 0.39,
+      "margin_loss": -0.42
+     },
+     "diff_vs_email_pct": -0.0
+    },
+    "warnings": [],
+    "no_pair": {
+     "lines": 19,
+     "total_pp": 69503.37,
+     "sources_2_4_could_price": {
+      "pair_months": [
+       "2026-07",
+       "2026-06"
+      ],
+      "lines": 8,
+      "total_pp": 37239.0,
+      "margin_loss": 5294.48,
+      "by_source": {
+       "formulary_rule": {
+        "lines": 8,
+        "total_pp": 37239.0
+       }
+      }
+     }
+    },
+    "simulation": {
+     "rule": "sources 2-5 (HCG's pairs from earlier worksheets, HCG's master, our rule), every OOF line counted as if HCG had no worksheet this month",
+     "pair_months": [
+      "2026-07",
+      "2026-06"
+     ],
+     "by_source": {
+      "formulary_rule": {
+       "lines": 177,
+       "total_pp": 847106.84,
+       "margin_loss": 74563.72
+      },
+      "hcg_list": {
+       "lines": 120,
+       "total_pp": 1794366.36,
+       "margin_loss": 1395707.72
+      },
+      "hcg_sheet_pair": {
+       "lines": 539,
+       "total_pp": 3654344.44,
+       "margin_loss": 1749424.35
+      },
+      "none": {
+       "lines": 24,
+       "total_pp": 99054.31,
+       "margin_loss": 0.0
+      }
+     },
+     "by_status": {
+      "counted": {
+       "lines": 835,
+       "total_pp": 6292491.49
+      },
+      "no_alternative": {
+       "lines": 24,
+       "total_pp": 99054.31
+      },
+      "unpriced": {
+       "lines": 1,
+       "total_pp": 3326.15
+      }
+     },
+     "rule_levels": {
+      "A": {
+       "lines": 153
+      },
+      "A~": {
+       "lines": 4
+      },
+      "B": {
+       "lines": 4
+      },
+      "D": {
+       "lines": 10
+      },
+      "F": {
+       "lines": 6
+      }
+     },
+     "actual_margin": 7009590.75,
+     "suggested_margin": 10229286.54,
+     "margin_loss": 3219695.78,
+     "gain_loss": 4155027.41,
+     "better_loss": -935331.62,
+     "loss_pct": 31.48,
+     "loss_ours": 3219695.78,
+     "loss_hcg": 3243199.13,
+     "diff": -23503.35,
+     "diff_pct": -0.72,
+     "sum_abs_centre_diff": 48242.94,
+     "max_centre_diff": 8722.2,
+     "centres_within_5pct": 15,
+     "brands": {
+      "hcg_lines": 841,
+      "same_brand_lines": 794,
+      "same_brand_pct": 94.41
+     },
+     "centres": [
+      {
+       "plant": "AH01",
+       "centre_name": "Borivalli Mumbai",
+       "ours": 207054.41,
+       "hcg": 214143.62,
+       "diff": -7089.21,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC05",
+       "centre_name": "KR",
+       "ours": 1321119.59,
+       "hcg": 1323582.58,
+       "diff": -2462.99,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC06",
+       "centre_name": "DR",
+       "ours": 60002.49,
+       "hcg": 61985.75,
+       "diff": -1983.26,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC13",
+       "centre_name": "CUTTACK",
+       "ours": 130461.1,
+       "hcg": 136552.1,
+       "diff": -6091.0,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC16",
+       "centre_name": "HMS",
+       "ours": -201607.33,
+       "hcg": -200094.07,
+       "diff": -1513.26,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC17",
+       "centre_name": "Ranchi",
+       "ours": -4407.3,
+       "hcg": -6211.2,
+       "diff": 1803.9,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC22",
+       "centre_name": "BHAVNAGAR",
+       "ours": 570537.41,
+       "hcg": 571716.07,
+       "diff": -1178.66,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC24",
+       "centre_name": "Hubli",
+       "ours": 56483.97,
+       "hcg": 57838.5,
+       "diff": -1354.53,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC25",
+       "centre_name": "GULBARGA",
+       "ours": -4970.5,
+       "hcg": -4906.79,
+       "diff": -63.71,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC27",
+       "centre_name": "Vijayawada",
+       "ours": 235967.99,
+       "hcg": 239125.94,
+       "diff": -3157.95,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC31",
+       "centre_name": "JAIPUR",
+       "ours": 612.07,
+       "hcg": 6439.01,
+       "diff": -5826.94,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC32",
+       "centre_name": "VIZAG",
+       "ours": 15858.4,
+       "hcg": 15447.96,
+       "diff": 410.44,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC33",
+       "centre_name": "ICS MUMBAI",
+       "ours": 9315.25,
+       "hcg": 593.05,
+       "diff": 8722.2,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC35",
+       "centre_name": "INDORE",
+       "ours": 35325.09,
+       "hcg": 36202.42,
+       "diff": -877.33,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HC38",
+       "centre_name": "NAGPUR",
+       "ours": 5415.94,
+       "hcg": 6063.79,
+       "diff": -647.85,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HE01",
+       "centre_name": "KOLKATTA",
+       "ours": 19025.84,
+       "hcg": 17592.58,
+       "diff": 1433.26,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HM01",
+       "centre_name": "HCC SOLA",
+       "ours": 83751.28,
+       "hcg": 84550.87,
+       "diff": -799.59,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HO01",
+       "centre_name": "BARODA",
+       "ours": 117391.41,
+       "hcg": 117794.92,
+       "diff": -403.5,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "HS01",
+       "centre_name": "RAJKOT",
+       "ours": 137601.73,
+       "hcg": 140025.09,
+       "diff": -2423.36,
+       "in_hcg": true,
+       "in_ours": true
+      },
+      {
+       "plant": "SH01",
+       "centre_name": "SUCHIRAYU",
+       "ours": 424756.93,
+       "hcg": 424756.93,
+       "diff": 0.0,
+       "in_hcg": true,
+       "in_ours": true
+      }
+     ],
+     "kr": {
+      "plant": "HC05",
+      "ours": {
+       "actual_margin": 492781.81,
+       "suggested_margin": 1813901.4,
+       "margin_loss": 1321119.59,
+       "loss_pct": 72.83
+      },
+      "hcg_summary": {
+       "actual_margin": 492781.81,
+       "suggested_margin": 1816364.39,
+       "margin_loss": 1323582.58
+      },
+      "email": {
+       "actual_margin": 492782.0,
+       "suggested_margin": 1816364.0,
+       "margin_loss": 1323583.0,
+       "source": "HCG spend margin loss email, KR out-of-formulary table (rupees, rounded)"
+      },
+      "diff_vs_email": {
+       "actual_margin": -0.19,
+       "suggested_margin": -2462.6,
+       "margin_loss": -2463.41
+      },
+      "diff_vs_email_pct": -0.19
+     }
+    }
+   },
+   "prices": {
+    "lines": 17012,
+    "value": 455760310.08,
+    "by_status": {
+     "ok": {
+      "lines": 16717,
+      "value": 455725124.42
+     },
+     "no_price": {
+      "lines": 272,
+      "value": 0.0
+     },
+     "token": {
+      "lines": 2,
+      "value": 0.82
+     },
+     "other_unit": {
+      "lines": 21,
+      "value": 35184.84
+     }
+    },
+    "compared": {
+     "lines": 14982,
+     "value": 440137899.88,
+     "materials": 2850
+    },
+    "products": 1819,
+    "products_with_spread": 800,
+    "extra_paid_vs_cheapest": 54642940.44,
+    "unusually_low": {
+     "rows": 40,
+     "value": 170535.95,
+     "products": 32
+    },
+    "top_products": [
+     {
+      "molecule_key": "NIVOLUMAB|100MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 25599.0,
+      "min_price": 24813.0,
+      "max_price": 101110.95,
+      "brands": 2,
+      "vendors": 2,
+      "value": 21356308.48,
+      "extra_paid": 6923188.48
+     },
+     {
+      "molecule_key": "PEMBROLIZUMAB|100MG|INJ|",
+      "minor_group": "PEMBROLIZUMAB",
+      "cheapest_price": 180038.1,
+      "min_price": 180038.1,
+      "max_price": 200004.76,
+      "brands": 1,
+      "vendors": 1,
+      "value": 72943190.06,
+      "extra_paid": 6509131.16
+     },
+     {
+      "molecule_key": "CETUXIMAB|100MG|INJ|",
+      "minor_group": "CETUXIMAB",
+      "cheapest_price": 8100.0,
+      "min_price": 5100.0,
+      "max_price": 18938.1,
+      "brands": 3,
+      "vendors": 4,
+      "value": 12240121.0,
+      "extra_paid": 5422521.0
+     },
+     {
+      "molecule_key": "NIVOLUMAB|40MG|INJ|",
+      "minor_group": "NIVOLUMAB",
+      "cheapest_price": 12499.0,
+      "min_price": 12499.0,
+      "max_price": 40444.38,
+      "brands": 2,
+      "vendors": 1,
+      "value": 13743338.49,
+      "extra_paid": 3706641.49
+     },
+     {
+      "molecule_key": "PERTUZUMAB|420MG|INJ|",
+      "minor_group": "PERTUZUMAB",
+      "cheapest_price": 32000.0,
+      "min_price": 32000.0,
+      "max_price": 232686.54,
+      "brands": 4,
+      "vendors": 1,
+      "value": 9634119.24,
+      "extra_paid": 3362119.24
+     },
+     {
+      "molecule_key": "AVIBACTAM+CEFTAZIDIME|0.5MG|2000MG|INJ|",
+      "minor_group": "CEFTAZIDIME+AVIBACTAM (SCH H1)",
+      "cheapest_price": 1707.09,
+      "min_price": 450.0,
+      "max_price": 4950.0,
+      "brands": 4,
+      "vendors": 3,
+      "value": 4689212.94,
+      "extra_paid": 2393255.25
+     },
+     {
+      "molecule_key": "DURVALUMAB|500MG|INJ|",
+      "minor_group": "DURVALUMAB",
+      "cheapest_price": 142280.72,
+      "min_price": 142280.72,
+      "max_price": 158270.99,
+      "brands": 1,
+      "vendors": 1,
+      "value": 17011683.86,
+      "extra_paid": 1503085.38
+     },
+     {
+      "molecule_key": "CEFOPERAZONE+SULBACTAM|1500MG|INJ|",
+      "minor_group": "CEFOPERAZONE+SULBACTAM(SCH H1)",
+      "cheapest_price": 180.0,
+      "min_price": 84.0,
+      "max_price": 800.0,
+      "brands": 6,
+      "vendors": 5,
+      "value": 2666040.0,
+      "extra_paid": 1455780.0
+     },
+     {
+      "molecule_key": "OXALIPLATIN|100MG|INJ|",
+      "minor_group": "OXALIPLATIN",
+      "cheapest_price": 1150.0,
+      "min_price": 1150.0,
+      "max_price": 4000.0,
+      "brands": 5,
+      "vendors": 3,
+      "value": 2155708.2,
+      "extra_paid": 1316208.2
+     },
+     {
+      "molecule_key": "MEROPENEM|1000MG|INJ|",
+      "minor_group": "MEROPENEM (SCH H1)",
+      "cheapest_price": 450.0,
+      "min_price": 89.0,
+      "max_price": 870.0,
+      "brands": 6,
+      "vendors": 7,
+      "value": 4240250.0,
+      "extra_paid": 1132440.0
+     }
+    ]
+   },
+   "generic": {
+    "lines": 17012,
+    "value": 455760310.08,
+    "by_class": {
+     "branded": {
+      "lines": 1473,
+      "value": 235638720.2,
+      "materials": 256,
+      "value_pct": 51.7
+     },
+     "generic": {
+      "lines": 15539,
+      "value": 220121589.88,
+      "materials": 3117,
+      "value_pct": 48.3
+     }
+    },
+    "by_source": {
+     "override": {
+      "lines": 63,
+      "value": 8330336.19
+     },
+     "originator_list": {
+      "lines": 1410,
+      "value": 227308384.01
+     },
+     "default": {
+      "lines": 15539,
+      "value": 220121589.88
+     }
+    },
+    "overrides": [
+     {
+      "material": "100714",
+      "material_desc": "VECTIBIX 100MG INJ 5ML VIAL",
+      "class": "branded",
+      "value": 758043.0
+     },
+     {
+      "material": "102724",
+      "material_desc": "ZYTORVI 240MG INJ 6ML VIAL",
+      "class": "branded",
+      "value": 5060714.36
+     },
+     {
+      "material": "102881",
+      "material_desc": "HETRONIFLY INJ 10ML VIAL",
+      "class": "branded",
+      "value": 2511578.83
+     }
+    ],
+    "formulary": {
+     "branded": {
+      "FORMULARY": 233605060.78,
+      "NON FORMULARY": 1047058.16,
+      "OUT OF FORMULARY": 986601.26
+     },
+     "generic": {
+      "FORMULARY": 186364362.9,
+      "NON FORMULARY": 28357674.91,
+      "OUT OF FORMULARY": 5399552.07
+     }
+    },
+    "tiers": {
+     "branded": {
+      "preferred": 112694784.15,
+      "restricted": 120910276.63
+     },
+     "generic": {
+      "other": 1464460.03,
+      "preferred": 143253900.46,
+      "restricted": 23742830.48,
+      "scheme_only": 17903171.93
+     }
+    },
+    "cost_impact": {
+     "extra_vs_generic": 24702552.55,
+     "compared_value": 37090389.8,
+     "branded_value_not_compared": 198548330.4,
+     "top": [
+      {
+       "material": "101158",
+       "material_desc": "OPDYTA 100MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA 100MG INJ VIAL.",
+       "extra_vs_generic": 6923188.48
+      },
+      {
+       "material": "100177",
+       "material_desc": "ERBITUX 100MG INJ VIAL",
+       "manufacturer": "MERCK",
+       "cheapest_generic": "LUPITUX 100MG INJ VIAL",
+       "extra_vs_generic": 5422521.0
+      },
+      {
+       "material": "101159",
+       "material_desc": "OPDYTA 40MG INJ VIAL",
+       "manufacturer": "BMS",
+       "cheapest_generic": "TISHTHA  40MG INJ VIAL.",
+       "extra_vs_generic": 3706641.49
+      },
+      {
+       "material": "217827",
+       "material_desc": "ZAVICEFTA 2GM/0.5MG INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "XAVITAZ 2GM/0.5MG INJ VIAL",
+       "extra_vs_generic": 1946389.65
+      },
+      {
+       "material": "205911",
+       "material_desc": "MAGNEX FORTE 1.5GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "KEZONE-S FORTE 1.5GM INJ VIAL",
+       "extra_vs_generic": 1416800.0
+      },
+      {
+       "material": "100913",
+       "material_desc": "PERJETA 420MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "HERTUMAB 420MG INJ 14ML VIAL",
+       "extra_vs_generic": 1204119.24
+      },
+      {
+       "material": "206390",
+       "material_desc": "MERONEM 1GM INJ VIAL",
+       "manufacturer": "PFIZER",
+       "cheapest_generic": "MEROCRIT KIT 1GM INJ VIAL",
+       "extra_vs_generic": 989440.0
+      },
+      {
+       "material": "101098",
+       "material_desc": "KADCYLA 100MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 100MG INJ VIAL",
+       "extra_vs_generic": 521256.6
+      },
+      {
+       "material": "101099",
+       "material_desc": "KADCYLA 160MG INJ VIAL",
+       "manufacturer": "ROCHE",
+       "cheapest_generic": "UJVIRA 160MG INJ VIAL",
+       "extra_vs_generic": 507050.07
+      },
+      {
+       "material": "102749",
+       "material_desc": "VENCLEXTA 100MG TAB 28S CONTAINER",
+       "manufacturer": "ABBIVE",
+       "cheapest_generic": "IKRA 100MG TAB",
+       "extra_vs_generic": 270321.8
+      }
+     ]
+    }
+   }
+  }
+ },
+ "tables": {
+  "oof_purchase": {
+   "rows": 1539,
+   "kb": 160.0
+  },
+  "oof_hcg_summary": {
+   "rows": 61,
+   "kb": 10.0
+  },
+  "oof_hcg_pairs": {
+   "rows": 1633,
+   "kb": 48.5
+  },
+  "oof_hcg_parked": {
+   "rows": 10,
+   "kb": 4.9
+  },
+  "purchase_prices": {
+   "rows": 83715,
+   "kb": 1598.5
+  },
+  "purchase_generic": {
+   "rows": 79406,
+   "kb": 1500.2
+  }
+ }
+}

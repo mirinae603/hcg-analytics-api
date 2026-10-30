@@ -3,6 +3,11 @@
 Usage:
     python -m app.etl.run_etl              # full rebuild
     python -m app.etl.run_etl --stage curated   # only facts + dims
+
+The raw extracts are found under RAW_DATA_DIR (default: the repo's master/ folder); see
+app/etl/ingest.py. curated/_dq_report.json records, per source, what was read and what was
+left out (returns, deleted PO lines, lines without a material, which file each consumption
+month came from): counts, values and file names only.
 """
 from __future__ import annotations
 
@@ -26,13 +31,24 @@ def _save(df: pd.DataFrame, path: Path) -> None:
     print(f"[etl] wrote {path.name}: {len(df):,} rows")
 
 
-def build_curated() -> dict:
+def _periods(dates: pd.Series) -> list:
+    return sorted(dates.dropna().dt.strftime("%Y-%m").unique().tolist())
+
+
+def build_curated(raw=None, cache=None, out=None) -> dict:
+    """Read every source, build the dimensions and write curated/*.parquet + _dq_report.json.
+    `raw` defaults to RAW_DATA_DIR, `cache` to the GRN reader's cache, `out` to CURATED."""
     t0 = time.time()
+    out = Path(out or CURATED)
     print("=== Ingesting raw extracts ===")
-    consumption = ingest.load_consumption()
-    inventory = ingest.load_inventory()
-    grn = ingest.load_grn()
-    po = ingest.load_po()
+    reads = {
+        "consumption": ingest.load_consumption(raw),
+        "inventory": ingest.load_inventory(raw),
+        "grn": ingest.load_grn(raw, cache=cache),
+        "po": ingest.load_po(raw),
+    }
+    consumption, inventory, grn, po = (reads[k].frame for k in ("consumption", "inventory",
+                                                                 "grn", "po"))
 
     print("=== Building dimensions ===")
     dim_plant = dimensions.build_dim_plant(po, inventory, consumption)
@@ -52,7 +68,7 @@ def build_curated() -> dict:
         "dim_vendor": dim_vendor,
         "dim_costcenter": dim_costcenter,
     }.items():
-        _save(df, CURATED / f"{name}.parquet")
+        _save(df, out / f"{name}.parquet")
 
     report = {
         "consumption_rows": int(len(consumption)),
@@ -64,11 +80,15 @@ def build_curated() -> dict:
         "vendors": int(len(dim_vendor)),
         "cost_centers": int(len(dim_costcenter)),
         "months_consumption": sorted(consumption["month_num"].dropna().unique().tolist()),
+        "periods": {"consumption": _periods(consumption["posting_date"]),
+                    "grn": _periods(grn["posting_date"]),
+                    "po": _periods(po["po_date"])},
+        "sources": {k: r.report for k, r in reads.items()},
         "elapsed_sec": round(time.time() - t0, 1),
     }
-    (CURATED / "_dq_report.json").write_text(json.dumps(report, indent=2))
+    (out / "_dq_report.json").write_text(json.dumps(report, indent=2))
     print("=== Curated layer report ===")
-    print(json.dumps(report, indent=2))
+    print(json.dumps({k: v for k, v in report.items() if k != "sources"}, indent=2))
     return {
         "consumption": consumption, "inventory": inventory, "grn": grn, "po": po,
         "dim_plant": dim_plant, "dim_material": dim_material, "dim_sloc": dim_sloc,

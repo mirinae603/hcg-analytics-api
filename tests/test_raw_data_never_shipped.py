@@ -48,6 +48,19 @@ MUST_SHIP = [
     "app/data/reference/hospital_map.csv",
     "app/data/reference/payer_overrides.csv",
     "app/data/kpi/kpi_stock_value.parquet",
+    # the purchase build's tables and the reference files it reads: /spend/oof/*, /spend/prices/*
+    # and /spend/generic/* answer 503 without them
+    "app/data/purchase/oof_purchase.parquet",
+    "app/data/purchase/oof_hcg_summary.parquet",
+    "app/data/purchase/oof_hcg_pairs.parquet",
+    "app/data/purchase/oof_hcg_parked.parquet",
+    "app/data/purchase/purchase_prices.parquet",
+    "app/data/purchase/purchase_generic.parquet",
+    "app/data/purchase/purchase_validation.json",
+    "app/data/reference/purchase_scope_exclusions.csv",
+    "app/data/reference/oof_email_figures.csv",
+    "app/data/reference/originator_manufacturers.csv",
+    "app/data/reference/generic_overrides.csv",
     "app/main.py",
 ]
 

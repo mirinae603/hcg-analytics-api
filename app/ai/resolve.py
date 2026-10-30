@@ -229,9 +229,9 @@ _MEASURE_NOTES: dict[str, str] = {
                "because a percentage on a tiny base is noise, rank margins only above an "
                "explicit revenue floor and SAY what floor you used: -40.1% on \u20b92,927 of "
                "revenue is a rounding error wearing the clothes of a finding."),
-    "purchasing": ("Procurement spend is EX-TAX. The ₹649.91 Cr figure every dashboard "
+    "purchasing": ("Procurement spend is EX-TAX. The <<PROCUREMENT_TOTAL>> figure every dashboard "
                    "shows is fact_po.total_value_wo_tax; GST sits beside it in cgst_value / "
-                   "sgst_value / igst_value (₹48.79 Cr) and fact_grn carries "
+                   "sgst_value / igst_value (<<PROCUREMENT_GST>>) and fact_grn carries "
                    "total_amount_with_tax on the receipt side. Do NOT report a with-tax "
                    "column as procurement spend, and never add tax to the ex-tax total "
                    "unless the question asks for the inclusive figure."),
@@ -343,24 +343,26 @@ _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
      "level. dim_sloc.ip_op_class is the STORE's ward type (mostly OTHER) — never use it as "
      "the patient's IP/OP."),
     (r"\btax\b|\bgst\b|\bcgst\b|\bsgst\b|\bigst\b|\bduty\b",
-     "Tax is SEPARATE from spend. Procurement spend is EX-TAX by definition — the ₹649.91 Cr "
-     "figure is fact_po.total_value_wo_tax — and GST sits beside it in cgst_value / "
-     "sgst_value / igst_value (₹48.79 Cr, 7.5%). fact_grn carries tax_amount, tax_pct and "
+     "Tax is SEPARATE from spend. Procurement spend is EX-TAX by definition — the "
+     "<<PROCUREMENT_TOTAL>> figure is fact_po.total_value_wo_tax — and GST sits beside it in "
+     "cgst_value / sgst_value / igst_value (<<PROCUREMENT_GST>>). fact_grn carries tax_amount, tax_pct and "
      "total_amount_with_tax on the receipt side. NEVER add tax to the spend figure or report "
      "total_amount_with_tax as procurement spend; say which basis you used."),
     (r"\bdiscounts?\b|\brebates?\b",
-     "Discounts are fact_grn.discount_value — ₹0.15 Cr in total, non-zero on under 4% of "
-     "receipt lines. Report the covered share, not an average across all lines."),
+     "Discounts are fact_grn.discount_value — <<GRN_DISCOUNT>> in total, non-zero on "
+     "<<GRN_DISCOUNT_LINES>> of receipt lines. Report the covered share, not an average across "
+     "all lines."),
     (r"\bmrp\b|\bretail price\b|\bmargin at receipt\b",
-     "fact_grn.total_mrp_value (₹1,777.65 Cr) is the RETAIL value of goods received, not "
-     "revenue and not spend — it is roughly 3.5x the ₹506.68 Cr received at cost. Never "
+     "fact_grn.total_mrp_value (<<RECEIVED_MRP>>) is the RETAIL value of goods received, not "
+     "revenue and not spend — set it beside the <<RECEIVED_TOTAL>> received at cost. Never "
      "quote it as sales."),
     (r"\bcapex\b|\bcapital\b|\bequipment purchase",
      "Capital purchases are identified by doc_type — 'Dom Capital PO', 'Imp capital PO', "
      "'Service PO', 'CMC', 'AMC' — NOT by a separate table. They are already inside the "
-     "₹649.91 Cr procurement total (Dom Capital PO alone is 1,086 lines, ₹121.75 Cr), so a "
-     "capex figure is a SUBSET of procurement, never an addition to it. Say which doc_types "
-     "you counted."),
+     "<<PROCUREMENT_TOTAL>> procurement total, so a capex figure is a SUBSET of procurement, "
+     "never an addition to it. Only order lines WITH a material are in fact_po: services, "
+     "civil works and capital items without a code are left out by the import, so the figure "
+     "covers coded capital purchases only — say so. Say which doc_types you counted."),
     (r"\bgeneric\b|\bmolecule\b|\bsalt\b",
      "The molecule is dim_material.minor_group_desc (3,237 values) or generic_name; "
      "major_group_desc is the therapeutic CLASS, not the molecule."),
@@ -1130,35 +1132,34 @@ def city_reachability() -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(sorted(ok)), tuple(sorted(no))
 
 
-@lru_cache(maxsize=1)
 def reporting_window() -> str:
-    """The period the TRANSACTIONS cover, which is not the range of every date in the data.
+    """The period each TRANSACTION source covers, which is not the range of every date in the data.
 
     Asked "what period does our data cover", the engine scanned every column holding a date
     and answered "2020-01-31 to 2026-12-03" — a range built from expiry dates and forecast
-    horizons. The transactional window is Dec 2025 to May 2026, and everything a reader
-    infers about trend, growth or seasonality depends on knowing that.
+    horizons. The sources also end in different months (billing before the receipts, the
+    receipts before the orders, and consumption has a month with no extract), so one window
+    for all of them told the model that sales ran as late as the orders. Each source's window
+    is read from the data (windows.transaction_windows), sales first.
     """
-    from app.ai import warehouse
-    for table, column in (("fact_consumption", "posting_date"), ("fact_grn", "posting_date"),
-                          ("sales_monthly", "month")):
-        try:
-            lo, hi = warehouse.query(
-                f'SELECT MIN("{column}"), MAX("{column}") FROM "{table}"', one=True)
-        except Exception:
-            continue
-        if lo is None or hi is None:
-            continue
-        # The Jun–Aug 2026 HCG reports are NOT in this window and NOT in any table, so a
-        # bare "the window is Dec–May" told the model a "formulary compliance trend" could
-        # not exist. Name them as the one exception.
-        return (f"{str(lo)[:10]} to {str(hi)[:10]} (from {table}.{column}). Expiry dates and "
-                f"forecast horizons run past this and do NOT extend the reporting period; "
-                f"neither does any earlier date sitting in a master table. The formulary "
-                f"compliance, brand-rule, scheme/Attis saving and cash & TPA margin-loss "
-                f"reports cover <<REPORTS_RANGE>> (a separate window, reachable only through "
-                f"get_kpi).")
-    return ""
+    from app.ai import windows
+    parts = []
+    for src, months in windows.transaction_windows():
+        gaps = windows.missing_months(months)
+        parts.append(f"{months[0]}-01 to {windows.month_end(months[-1])} for {src.label} "
+                     f"({src.table}.{src.column})" + (f", with no data for {', '.join(gaps)}" if gaps else ""))
+    if not parts:
+        return ""
+    # The Jun–Aug 2026 HCG reports are NOT in this window and NOT in any table, so a bare
+    # "the window is Dec–May" told the model a "formulary compliance trend" could not exist.
+    # Name them as the one exception.
+    return ("; ".join(parts) + ". Each source covers its own months: a figure that sets two "
+            "of them side by side (purchases against sales, internal consumption against "
+            "billing) must keep to the months both have. Expiry dates and forecast horizons "
+            "run past this and do NOT extend the reporting period; neither does any earlier "
+            "date sitting in a master table. The formulary compliance, brand-rule, "
+            "scheme/Attis saving and cash & TPA margin-loss reports cover <<REPORTS_RANGE>> "
+            "(a separate window, reachable only through get_kpi).")
 
 
 # ── "LAST MONTH" IS THE LAST MONTH IN THE DATA ───────────────────────────────────────────
@@ -1180,10 +1181,29 @@ def _month_label(ym: str) -> str:
 
 
 def _sales_window_months() -> tuple[str, str] | None:
-    """(first, last) month of the sales/purchasing/consumption window as 'YYYY-MM', read
-    from reporting_window() — the same source the REPORTING PERIOD line quotes."""
-    m = re.match(r"\s*(\d{4}-\d{2})\S* to (\d{4}-\d{2})", reporting_window() or "")
-    return (m.group(1), m.group(2)) if m else None
+    """(first, last) month of the sales window as 'YYYY-MM' — the same months the REPORTING
+    PERIOD line leads with (windows.sales_months)."""
+    from app.ai import windows
+    s = windows.sales_months()
+    return (s[0], s[-1]) if s else None
+
+
+def _source_latest() -> list[tuple[str, list[str], list[str]]]:
+    """[(latest month 'YYYY-MM', the sources ending in it, notes on months they lack)], one
+    entry per latest month in SOURCES order: each source's 'last month' is its own."""
+    from app.ai import windows
+    out: dict[str, tuple[list[str], list[str]]] = {}
+    for src, months in windows.transaction_windows():
+        labels, gaps = out.setdefault(months[-1], ([], []))
+        labels.append(src.label)
+        missing = windows.missing_months(months)
+        if missing:
+            gaps.append(f"{src.label} has no {', '.join(_month_label(m) for m in missing)}")
+    return [(ym, labels, gaps) for ym, (labels, gaps) in out.items()]
+
+
+def _and(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
 
 
 def _latest_report_month() -> str | None:
@@ -1201,23 +1221,24 @@ def relative_date_note(question: str) -> str:
     if not _RELATIVE_DATE.search(question or ""):
         return ""
     sales, report = _sales_window_months(), _latest_report_month()
-    latest = []
-    if sales:
-        latest.append(f"{_month_label(sales[1])} ({sales[1]}) for sales, purchasing and "
-                      f"consumption")
+    latest = [f"{_month_label(ym)} ({ym}) for {_and(labels)}" + (f" ({'; '.join(gaps)})" if gaps else "")
+              for ym, labels, gaps in _source_latest()]
     if report:
         latest.append(f"{_month_label(report)} ({report}) for the formulary/spend/brand-rule "
                       f"reports")
-    note = ("RELATIVE DATE: The data does not run to today. 'Last/latest month' = the latest "
-            "month in the data" + (": " + "; ".join(latest) if latest else "") + ". ")
+    note = ("RELATIVE DATE: The data does not run to today, and each source ends in its own "
+            "month. 'Last/latest month' = the latest month that source has"
+            + (": " + "; ".join(latest) if latest else "") + ". ")
     if sales and _FY_WORDING.search(question or ""):
         # HCG's financial year runs April to March, so "this FY" / "YTD" in the data is a
-        # few months at most; say how many rather than let it read as a full year.
+        # few months at most; say how many rather than let it read as a full year. The
+        # sales months are the ones counted: the purchase side runs later (its own latest
+        # month is named above).
         first, last = sales
         y, m = (int(x) for x in last.split("-"))
         fy_start = max(f"{y if m >= 4 else y - 1}-04", first)
         cal_start = max(f"{y}-01", first)
-        note += (f"FY runs Apr–Mar, so FY-to-date in the data is {_month_label(fy_start)}.."
+        note += (f"FY runs Apr–Mar, so FY-to-date in the sales data is {_month_label(fy_start)}.."
                  f"{_month_label(last)}; calendar YTD is {_month_label(cal_start)}.."
                  f"{_month_label(last)}. ")
     return note + "Say which month you used. Never report an empty recent month as zero."

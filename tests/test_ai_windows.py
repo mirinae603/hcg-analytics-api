@@ -58,6 +58,37 @@ def test_a_new_month_changes_the_text_with_no_code_change(data):
     assert windows.fill("default (<<REPORTS_LATEST>>)") == "default (Sep-2026)"
 
 
+def test_each_transaction_source_has_its_own_window(data, tmp_path):
+    # billing ends first, the receipts later, and consumption has a month with no extract
+    data(sales=["2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"])
+    cur = tmp_path / "CURATED_DIR"
+    dates = lambda *ms: pd.to_datetime([f"{m}-15" for m in ms])
+    pd.DataFrame({"posting_date": dates("2025-12", "2026-03", "2026-08")}).to_parquet(cur / "fact_grn.parquet")
+    pd.DataFrame({"posting_date": dates("2025-12", "2026-07", "2026-09")}).to_parquet(cur / "fact_consumption.parquet")
+    v = windows.values()
+    assert v["RECEIPTS"] == "Dec-2025…Aug-2026 (no Jan-2026, Feb-2026, Apr-2026, May-2026, Jun-2026, Jul-2026)"
+    assert v["CONSUMPTION"].startswith("Dec-2025…Sep-2026 (no Jan-2026") and "Aug-2026)" in v["CONSUMPTION"]
+    assert v["ORDERS"] == "the purchase orders months"                     # fact_po not written
+    assert [s.label for s, _m in windows.transaction_windows()] == ["sales", "goods receipts", "internal consumption"]
+    assert windows.missing_months(("2026-06", "2026-07", "2026-09")) == ("2026-08",)
+    assert windows.missing_months(()) == ()
+    assert windows.month_end("2026-02") == "2026-02-28" and windows.month_end("2025-12") == "2025-12-31"
+
+
+def test_the_quoted_totals_come_from_the_tables(data, tmp_path):
+    from app.ai import figures
+    pd.DataFrame({"purchase_value": [6e9, 2.0690835741e9]}).to_parquet(tmp_path / "KPI_DIR" / "kpi_purchase_value.parquet")
+    pd.DataFrame({"cgst_value": [1e7, None], "sgst_value": [1e7, 0.0], "igst_value": [5e6, 0.0]}).to_parquet(
+        tmp_path / "CURATED_DIR" / "fact_po.parquet")
+    pd.DataFrame({"total_amount_wo_tax": [5e9, 1e9], "total_mrp_value": [1.5e10, 1e9],
+                  "discount_value": [0.0, 2e6]}).to_parquet(tmp_path / "CURATED_DIR" / "fact_grn.parquet")
+    v = figures.values()
+    assert (v["PROCUREMENT_TOTAL"], v["PROCUREMENT_GST"]) == ("₹806.91 Cr", "₹2.50 Cr")
+    assert (v["RECEIVED_TOTAL"], v["RECEIVED_MRP"], v["GRN_DISCOUNT"]) == ("₹600.00 Cr", "₹1,600.00 Cr", "₹0.20 Cr")
+    assert v["GRN_DISCOUNT_LINES"] == "50.0%"
+    assert windows.fill("spend <<PROCUREMENT_TOTAL>>") == "spend ₹806.91 Cr"
+
+
 def test_a_window_across_years_and_one_month():
     assert windows.span(("2025-12", "2026-01", "2026-02")) == "Dec 2025–Feb 2026"
     assert windows.span(("2026-09",)) == "Sep 2026"
@@ -68,7 +99,8 @@ def test_missing_tables_give_neutral_words_never_a_date(data):
     v = windows.values()
     assert v["REPORTS"] == "the report months" and v["SALES"] == "the sales months"
     assert v["SNAPSHOT_SQL"] == "(SELECT MAX(snapshot_date)::DATE FROM fact_inventory)"
-    assert not re.search(r"20\d\d", " ".join(v.values()))
+    assert (v["RECEIPTS"], v["PROCUREMENT_TOTAL"]) == ("the goods receipts months", "the procurement total")
+    assert not re.search(r"20\d\d|₹", " ".join(v.values()))
 
 
 def test_a_request_is_filled_messages_and_tools(data):

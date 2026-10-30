@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.api import kpi_generic, sales_forecast_kpi, replenishment_and_aging_risk
 from app.api import dashboard_summary, legacy_kpi, authenticate, chat, formulary, spend, brand_rules, consumables
+from app.api import purchase_insights
 from app.ai import router as ai_router
 from app.core.deps import get_current_user
 
@@ -27,6 +28,8 @@ api_router.include_router(formulary.router, dependencies=_login, tags=["Formular
 api_router.include_router(brand_rules.router, dependencies=_login, tags=["Brand Rules"])
 # Spend analysis: Attis brands for scheme patients (GET /spend/validation is admin only)
 api_router.include_router(spend.router, dependencies=_login, tags=["Spend Analysis"])
+# Spend analysis on HCG's purchases (GRN): price variation and generic vs branded
+api_router.include_router(purchase_insights.router, dependencies=_login, tags=["Spend Analysis"])
 # Consumables issued to each department (SAP cost centre), on the Consumption page
 api_router.include_router(consumables.router, dependencies=_login, tags=["Consumables by Department"])
 

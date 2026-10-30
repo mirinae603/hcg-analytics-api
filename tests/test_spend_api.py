@@ -3,7 +3,8 @@
 # The published tables are written here from 8 invented scheme switch rows, 5 Attis
 # consumption rows and 5 cash & TPA rows (with their bifurcation allowance). Every expected number below was worked out by hand from them (comments
 # show the arithmetic). tests/test_spend_golden.py checks HCG's real KR figures once the
-# built tables are present.
+# built tables are present. The out-of-formulary purchase tables are NOT built here (their
+# own tests: tests/test_spend_oof_purchase_api.py), so every out-of-formulary view is absent.
 from __future__ import annotations
 
 import json
@@ -118,6 +119,7 @@ def write_tables(folder) -> None:
 @pytest.fixture()
 def data(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "SPEND_DATA_DIR", str(tmp_path / "spend"))
+    monkeypatch.setattr(settings, "PURCHASE_DATA_DIR", str(tmp_path / "purchase-not-built"))
     monkeypatch.setattr(settings, "FORMULARY_DATA_DIR", str(tmp_path / "formulary-not-built"))
     monkeypatch.setattr(settings, "REFERENCE_DIR", str(tmp_path / "reference"))
     write_tables(tmp_path / "spend")
@@ -327,8 +329,25 @@ def test_every_spend_route_needs_a_login(anon_client, data):
     for path in ("/spend/meta", "/spend/attis/overview", "/spend/attis/items", "/spend/attis/doctors",
                  "/spend/attis/consumption", "/spend/scheme/overview", "/spend/scheme/items",
                  "/spend/scheme/doctors", "/spend/cash/overview", "/spend/cash/items", "/spend/cash/doctors",
-                 "/spend/brands", "/spend/validation"):
+                 "/spend/oof/overview", "/spend/oof/items", "/spend/oof/vendors", "/spend/brands",
+                 "/spend/validation"):
         assert anon_client.get(path).status_code == 401, path
+
+
+def test_out_of_formulary_waits_for_the_purchase_build(client, data):
+    # out of formulary is the purchase build's (python -m app.etl.purchase), not built here
+    for path in ("/spend/oof/overview", "/spend/oof/items", "/spend/oof/vendors"):
+        r = client.get(path)
+        assert r.status_code == 503, (path, r.text)
+        assert "python -m app.etl.purchase" in r.json()["detail"]
+    m = get(client, "/spend/meta")
+    assert (m["oof_built"], m["oof_months"], m["oof_latest"]) == (False, [], None)
+    assert (m["prices_months"], m["generic_months"], m["purchase_built_at"]) == ([], [], None)
+    # the rest of the page is served, without the out-of-formulary line
+    c = get(client, "/spend/cash/overview", Plant="HC05", Month=AUG)
+    assert c["with_oof"] is None and c["headline"]["margin_loss"] == pytest.approx(3180.0)
+    # the sales-based doctors view is gone: purchases have vendors, not doctors
+    assert client.get("/spend/oof/doctors").status_code == 404
 
 
 # ---------- scheme: every suggestion (Task 3b) ----------
