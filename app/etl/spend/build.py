@@ -11,7 +11,9 @@ Main Sheet; which cash brands HCG bifurcates comes from app/data/reference/
 cash_tpa_bifurcation.csv. The out-of-formulary margin is not built here: it follows HCG's
 purchase (GRN) method in python -m app.etl.purchase. Each month's KR figures are printed so
 they can be set beside HCG's email (tests/test_spend_golden.py checks KR Aug-26 against it).
-Tables are written to temp files and os.replace'd, spend_validation.json last.
+Tables are written to temp files and os.replace'd, spend_validation.json last. A file in the
+dashboard-data folder that is not an .xlsx or .xlsb workbook is not read: the build names it, with
+the reason, in its log and in the report's warnings, and carries on.
 """
 from __future__ import annotations
 
@@ -22,13 +24,14 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 from app.etl.formulary import config as FC
 from app.etl.formulary.aggregate import apply_doctor_names, connect, doctor_name_map
 from app.etl.formulary.build import _check_columns
-from app.etl.formulary.discover import BuildError, _excel_files, discover
+from app.etl.formulary.discover import BuildError, _excel_files, discover, not_read, payer_master_missing
 from app.etl.formulary.extract import cached_periods, read_sidecar
 from app.etl.formulary.masters import load_hospital_map, load_payer_master, load_payer_overrides
 from app.etl.spend import config as C
@@ -58,14 +61,19 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def find_main_sheet(raw=None) -> Path:
-    """The one '*Spend Analysis*' workbook in the dashboard-data folder(s)."""
+def find_main_sheet(raw=None, skipped: Optional[list] = None) -> Path:
+    """The one '*Spend Analysis*' workbook in the dashboard-data folder(s). The folder's files
+    that are not read (discover.SkippedFile) go into `skipped` when a list is given."""
     root = FC.raw_dir(raw)
     dashboards = sorted(d for d in root.rglob("*")
                         if d.is_dir() and FC.DASHBOARD_DIR_RE.match(d.name))
-    found = [p for d in dashboards for p in _excel_files(d) if C.MAIN_SHEET_FILE_RE.search(p.name)]
+    passed: list = []
+    found = [p for d in dashboards for p in _excel_files(d, passed) if C.MAIN_SHEET_FILE_RE.search(p.name)]
+    if skipped is not None:
+        skipped += passed
     if not found:
-        raise BuildError(f"no '*Spend Analysis*' workbook in the dashboard-data folder under {root}")
+        raise BuildError(f"no '*Spend Analysis*' workbook (.xlsx or .xlsb) in the dashboard-data folder "
+                         f"under {root}{not_read(passed, C.MAIN_SHEET_FILE_RE)}")
     if len(found) > 1:
         raise BuildError("more than one Spend Analysis workbook: "
                          + ", ".join(repr(p.name) for p in found))
@@ -261,8 +269,11 @@ def build(*, raw=None, cache=None, data=None, reference=None, dry_run: bool = Fa
     sidecars = {p: read_sidecar(cache, p) for p in periods}     # aborts on a --limit read
     manifest = discover(raw)
     if manifest.payer_master is None:
-        raise BuildError("no Payer Master ('*Payer Master*.xls[xb]') found")
-    main_sheet = find_main_sheet(raw)
+        raise BuildError(payer_master_missing(manifest))
+    skipped: list = []                     # files in the dashboard-data folder it does not read
+    main_sheet = find_main_sheet(raw, skipped)
+    for s in skipped:
+        log(f"[spend] warning: {s}")
     sl = load_scheme_list(main_sheet)
     cl = load_cash_list(main_sheet)
     for lst in (sl, cl):
@@ -296,6 +307,7 @@ def build(*, raw=None, cache=None, data=None, reference=None, dry_run: bool = Fa
     finally:
         con.close()
     report = full_report(reports, sl, cl, bifurcation, data, excluded, hit)
+    report["warnings"] = [str(s) for s in skipped]
     multi = blocks[blocks["block_size"] > 1]
     report["brand_blocks"] = {
         "sheet": C.CASH_SHEET, "brands": int(len(blocks)), "blocks": int(blocks["block_id"].nunique()),
@@ -319,7 +331,10 @@ def build(*, raw=None, cache=None, data=None, reference=None, dry_run: bool = Fa
 
 
 def list_files(raw=None, cache=None, data=None, reference=None, log=_log) -> None:
-    path = find_main_sheet(raw)
+    skipped: list = []
+    path = find_main_sheet(raw, skipped)
+    for s in skipped:
+        log(f"not read:     {s}")
     sl = load_scheme_list(path)
     cl = load_cash_list(path)
     bif = load_bifurcation(reference)

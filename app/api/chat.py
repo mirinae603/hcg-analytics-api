@@ -31,14 +31,15 @@ class RenameSessionRequest(BaseModel):
 
 
 # ---------- page context ----------
-# What the user is looking at when they ask (Formulary or Spend page, which tab, month,
-# hospital and filters), so "why is this low?" can be answered about THAT screen. It is
-# accepted as any JSON value and reduced by app/ai/page_context.normalise to a fixed set of
-# keys whose values come from fixed lists: the values end up inside a system message, and
-# chat sessions are shared by every logged-in user, so no free text may pass. Not a pydantic
-# model on purpose: a model either fails the request (a 422 for the whole question) or drops
-# the whole hint over one value it did not expect, such as a new tab. normalise drops only
-# what it does not know, key by key, and never fails the question.
+# What the user is looking at when they ask (the Formulary, Spend, Executive overview or Revenue
+# & margin page, which tab, month, hospital and filters), so "why is this low?" can be answered
+# about THAT screen. It is accepted as any JSON value and reduced by
+# app/ai/page_context.normalise to a fixed set of keys whose values come from fixed lists: the
+# values end up inside a system message, and chat sessions are shared by every logged-in user,
+# so no free text may pass. Not a pydantic model on purpose: a model either fails the request
+# (a 422 for the whole question) or drops the whole hint over one value it did not expect, such
+# as a new tab. normalise drops only what it does not know, key by key, and never fails the
+# question.
 
 
 class PostMessageRequest(BaseModel):

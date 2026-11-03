@@ -93,7 +93,7 @@ _CORPUS: list[tuple[str, str]] = [
     ("days of cover; DOH; how many days of stock; days of inventory",
      "DAYS OF COVER → MEDIAN(kpi_doh.doh_days) WHERE doh_days>0 for a portfolio figure; never AVG (skewed). Item-level extremes near-zero-consumption are artifacts — caveat them."),
     ("inventory turnover ratio; how fast is stock turning; ITR; turns per year",
-     "TURNOVER RATIO → the two-piece additive pattern in the worked examples (internal SUM from kpi_health_score + a SEPARATE, once-only billed SUM from sales_by_material, then ×2.0 to annualize). NEVER `SUM(consumption_cost)*2.0/SUM(closing_stock_value) FROM kpi_health_score` directly for a portfolio/group total — see gotcha #30, that naive form fans out the billed portion by however many plants each material is stocked at (confirmed ~10x too high)."),
+     "TURNOVER RATIO → the two-piece additive pattern in the worked examples (internal SUM from kpi_health_score + a SEPARATE, once-only billed SUM from sales_by_material, each part annualized over its OWN months: internal × 12/<<STOCK_MONTHS>>, billed × 12/<<SALES_MONTHS>>). NEVER `SUM(consumption_cost)*12.0/<<STOCK_MONTHS>>/SUM(closing_stock_value) FROM kpi_health_score` directly for a portfolio/group total — see gotcha #30, that naive form fans out the billed portion by however many plants each material is stocked at (confirmed ~10x too high)."),
     ("what is expiring; near-expiry stock; items expiring soon; expiry exposure",
      "EXPIRY → fact_inventory, date_diff('day', <<SNAPSHOT_SQL>>, expiry_date); bands per RULES. For cross-plant redistribution check the SAME material at other plants."),
     ("which departments or cost centres consume the most; consumption by department; department usage",

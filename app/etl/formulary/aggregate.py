@@ -3,6 +3,8 @@
 Task 4 adds two tables: formulary_rule_breach (the lines each per-doctor brand-rule measure of
 brand_rules.csv counts, per doctor x material x patient type x payer) and formulary_rules (the
 month's rule book: every FORMULARY item of that month's Item Master with its Category letter).
+Revenue & margin adds sales_items: every line (consumables too) per item x patient type x
+payer, with MRP, and how many of its lines had a blank cost price and their MRP.
 
 The classification rules run in Python on the month's DISTINCT keys only (~10k
 materials, ~500 payer names, 23 hospitals); DuckDB then joins those small lookups onto
@@ -182,6 +184,9 @@ def aggregate_month(period: str, *, cache, item_master, payer_master, overrides:
                    m.m_manufacturer AS manufacturer,
                    coalesce(x.total_cost, 0) AS cost, coalesce(x.total_mrp, 0) AS mrp,
                    coalesce(x.qty, 0) AS qty,
+                   -- a blank TOTALCOSTPRICE counts as cost 0 (HCG's sheet does the same); the
+                   -- flag lets revenue say how much MRP has no cost price behind it
+                   x.total_cost IS NULL AS cost_missing,
                    x.hcg_category, x.hcg_payer, x.hcg_segment
             FROM read_parquet('{src}') x
             JOIN mat_df m ON m.material = coalesce(x.material, '')
@@ -222,6 +227,17 @@ def aggregate_month(period: str, *, cache, item_master, payer_master, overrides:
                  AND (r.payer = '*' OR r.payer = l.payer_bucket)
                  AND (r.ptype = '*' OR r.ptype = l.patient_type)
             WHERE {DRUGS_SQL} GROUP BY ALL""").df()
+        # Revenue & margin and the sales export: every category, MRP beside cost. No doctor,
+        # bill or patient column: the grain stops at item x patient type x payer.
+        sales_items = con.execute("""
+            SELECT period, plant, hospital, hospital_name, patient_type, payer_bucket,
+                   material, material_desc, generic_name, manufacturer, category,
+                   formulary_class, formulary_group,
+                   round(sum(cost), 2) AS cost, round(sum(mrp), 2) AS mrp,
+                   sum(qty) AS qty, count(*) AS lines,
+                   count(*) FILTER (WHERE cost_missing) AS cost_missing_lines,
+                   round(coalesce(sum(mrp) FILTER (WHERE cost_missing), 0), 2) AS mrp_cost_missing
+            FROM l GROUP BY ALL""").df()
         book = rule_book(period, item_master, set(mat["material"]))
         # spellings of each doctor's name on drug lines, for the most-frequent-name rule
         doctor_names = con.execute(f"""
@@ -274,7 +290,8 @@ def aggregate_month(period: str, *, cache, item_master, payer_master, overrides:
             }
         return MonthResult(period, {C.SUMMARY: summary, C.BY_DOCTOR: by_doctor,
                                     C.BY_ITEM: by_item, C.DOCTOR_ITEM: doctor_item,
-                                    C.RULE_BREACH: rule_breach, C.RULE_BOOK: book},
+                                    C.RULE_BREACH: rule_breach, C.RULE_BOOK: book,
+                                    C.SALES_ITEMS: sales_items},
                            doctor_names, checks)
     finally:
         if own:

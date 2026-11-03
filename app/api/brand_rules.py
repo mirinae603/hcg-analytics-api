@@ -46,10 +46,18 @@ NOTE_SHARE = ("Each share is the measure's cost ÷ ALL drug spend in the same sc
               "report divides it.")
 NOTE_OVERLAP = ("A sale can count in more than one measure (e.g. a restricted -OPD brand given to a scheme "
                 "inpatient), so the measures are shown side by side and never added up.")
-NOTE_P1 = ("P1/P2 = rank by '2026-27 SHARING' within a block of interchangeable brands in HCG's FY Main Sheet "
-           "(CASH&TPA). Proposed until HCG confirms it or sends its Brand Priority Master.")
+# {sharing}: the Main Sheet's own SHARING column, named by the CASH&TPA list's FY (_note_p1).
+NOTE_P1 = ("P1/P2 = rank by {sharing} within a block of interchangeable brands in HCG's FY Main Sheet "
+           "(CASH&TPA): a proposed ranking.")
 NOTE_ALT = ("'Alternative' = the brand's block in HCG's Main Sheet has another brand with a letter the rule "
             "accepts for these patients; 'no alternative' = the brand is the only choice HCG lists.")
+
+
+def _note_p1() -> str:
+    """NOTE_P1 naming the SHARING column of the Main Sheet the spend build read ('2026-27
+    SHARING'): its FY comes from that build's report, so a new FY's sheet renames it."""
+    fy = S._cash_list().get("financial_year")
+    return NOTE_P1.format(sharing=f"'{fy} SHARING'" if fy else "the FY's SHARING")
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -214,7 +222,7 @@ def _overview_cached(sc: F.Scope, measure: str, version: tuple) -> dict:
     for i, x in enumerate(by_hospital):
         x["rank"] = i + 1
 
-    notes = [NOTE_SHARE, NOTE_OVERLAP, NOTE_ALT, NOTE_P1]
+    notes = [NOTE_SHARE, NOTE_OVERLAP, NOTE_ALT, _note_p1()]
     if len(sc.months) > 1:
         notes.append(F.NOTE_MONTHS)
     return {"scope": {"plant": sc.plant or "ALL",

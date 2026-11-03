@@ -3,9 +3,10 @@
 Aborts (nothing is published): a month whose sales dates fall outside the file's month,
 published cost != read cost (> Rs 1), < 99.9% of drug lines found in the month's Item
 Master, category agreement with HCG's own column < 99.5%. (0-row files, months without
-a master and unmapped hospitals abort earlier.) Payer and segment agreement never abort:
-they are reported, because HCG's payer column has hand edits and its Aug-26 segment column
-mislabels 151 onco codes.
+a master and unmapped hospitals abort earlier.) sales_items must hold the summary's lines,
+cost, MRP and qty (to rounding) and the blank-cost lines the read counted. Payer and segment
+agreement never abort: they are reported, because HCG's payer column has hand edits and its
+Aug-26 segment column mislabels 151 onco codes.
 
 The report holds totals, percentages and names of payers/hospitals only — never a sales
 line, invoice, patient or day-level date.
@@ -89,6 +90,29 @@ def rules_reconciliation(summary: pd.DataFrame, breach: pd.DataFrame, rules) -> 
     return out
 
 
+# Each published row's money is rounded to 2 dp, so two groupings of the same lines can differ
+# by at most half a paisa per row between them.
+ROUNDING_PER_ROW = 0.005
+
+
+def sales_items_block(summary: pd.DataFrame, items: pd.DataFrame) -> dict:
+    """sales_items beside the summary of the same month. Both hold every line; they differ
+    only by each row's rounding to the paisa, so a gap is allowed up to half a paisa per row
+    (`rounding_allowance`) and anything wider aborts the build."""
+    return {
+        "rows": int(len(items)), "lines": int(items["lines"].sum()),
+        "cost": _r(items["cost"].sum()), "mrp": _r(items["mrp"].sum()),
+        "qty": _r(items["qty"].sum(), 3),
+        "cost_missing_lines": int(items["cost_missing_lines"].sum()),
+        "mrp_cost_missing": _r(items["mrp_cost_missing"].sum()),
+        # + 0.0: a zero gap reads 0.0, never -0.0
+        "cost_diff_vs_summary": _r(items["cost"].sum() - summary["cost"].sum(), 4) + 0.0,
+        "mrp_diff_vs_summary": _r(items["mrp"].sum() - summary["mrp"].sum(), 4) + 0.0,
+        "qty_diff_vs_summary": _r(items["qty"].sum() - summary["qty"].sum(), 4) + 0.0,
+        "rounding_allowance": _r(ROUNDING_PER_ROW * (len(items) + len(summary)), 4),
+    }
+
+
 def month_report(*, period, sidecar, item_master, result, rules=()) -> dict:
     s = result.tables[C.SUMMARY]
     ck = result.checks
@@ -140,6 +164,8 @@ def month_report(*, period, sidecar, item_master, result, rules=()) -> dict:
         },
         "warnings": list(sidecar.get("warnings") or []),
     }
+    if C.SALES_ITEMS in result.tables:
+        rep["sales_items"] = sales_items_block(s, result.tables[C.SALES_ITEMS])
     if not sidecar["has_hcg_columns"]:
         rep["warnings"].append("no HCG lookup columns in this month's sheet: agreement not checked")
     if sidecar["dates_missing"]:
@@ -164,6 +190,10 @@ def month_report(*, period, sidecar, item_master, result, rules=()) -> dict:
         if a and (a["lines_pct"] or 0) < 100:
             rep["warnings"].append(f"{what} agrees with HCG's column on {a['lines_pct']}% of lines "
                                    f"/ {a['cost_pct']}% of cost (reported, not an error)")
+    si = rep.get("sales_items")
+    if si and si["cost_missing_lines"]:
+        rep["warnings"].append(f"{si['cost_missing_lines']:,} lines have a blank cost price (MRP "
+                               f"{si['mrp_cost_missing']:,.2f}); counted as cost 0, as HCG's sheet does")
     return rep
 
 
@@ -182,6 +212,21 @@ def abort_reasons(rep: dict) -> list:
     if found is not None and found < C.MIN_DRUGS_IN_MASTER_PCT:
         out.append(f"{p}: only {found}% of drug lines are in the {p} Item Master "
                    f"({rep['item_master']['file']!r}); need {C.MIN_DRUGS_IN_MASTER_PCT}%")
+    si = rep.get("sales_items")
+    if si:
+        if si["lines"] != rep["published"]["lines"]:
+            out.append(f"{p}: sales_items holds {si['lines']:,} lines but the summary "
+                       f"{rep['published']['lines']:,}")
+        for k in ("cost", "mrp"):
+            if abs(si[f"{k}_diff_vs_summary"] or 0) > si["rounding_allowance"]:
+                out.append(f"{p}: sales_items {k} differs from the summary by "
+                           f"{si[f'{k}_diff_vs_summary']:,.4f}, more than rounding "
+                           f"({si['rounding_allowance']:,.4f})")
+        if abs(si["qty_diff_vs_summary"] or 0) > 1e-6:
+            out.append(f"{p}: sales_items qty differs from the summary by {si['qty_diff_vs_summary']}")
+        if si["cost_missing_lines"] != src["cost_empty_lines"]:
+            out.append(f"{p}: sales_items counts {si['cost_missing_lines']:,} blank-cost lines but "
+                       f"the read found {src['cost_empty_lines']:,}")
     for problem in (rep.get("brand_rules") or {}).get("reconciliation") or []:
         out.append(f"{p}: brand rules do not reconcile: {problem}")
     cat = (rep.get("agreement") or {}).get("category")

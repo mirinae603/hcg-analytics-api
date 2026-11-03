@@ -8,6 +8,8 @@ and CSV projection every list endpoint shares.
 """
 from __future__ import annotations
 
+import calendar
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
@@ -16,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from app.core.config import settings
-from app.etl.transforms import consumption_until
+from app.etl.transforms import consumption_until, no_consumption_reason
 
 KPI = Path(settings.KPI_DIR)
 CURATED = Path(settings.CURATED_DIR)
@@ -209,9 +211,73 @@ def stock_consumption() -> pd.DataFrame:
     return consumption_until(load("fact_consumption"), stock_snapshot_date())
 
 
+# ── Data windows ──────────────────────────────────────────────────────────────
+# Each source covers its own months, read from the data and never written in code: the stock
+# count's date (stock_snapshot_date), the months of internal issues set against it (stock_months)
+# and the months of the legacy billed-sales tables (legacy_sales_months). A figure that turns a
+# window's total into a yearly or a daily rate divides by THAT window's months or days, so a new
+# stock count, or a new month of data, moves the rate with it instead of leaving a "6 months"
+# that is no longer true. On the data as built today both windows are Dec-25..May-26: six months
+# (x 2.0 to a year) and 182 days. GET /meta/windows reports them.
+_YM = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+@lru_cache(maxsize=1)
+def stock_months() -> tuple:
+    """The months ('2025-12', ...) holding internal issues up to the stock count: the window
+    stock_consumption() covers, which days on hand, turnover, non-moving and risk set the counted
+    stock against. A month with no extract is simply absent, so a total over the window is scaled
+    by the months that really hold issues. Only the posting dates are read, not the big table."""
+    p = CURATED / "fact_consumption.parquet"
+    if not p.exists():
+        return ()
+    dates = consumption_until(pd.read_parquet(p, columns=["posting_date"]), stock_snapshot_date())["posting_date"]
+    dates = pd.to_datetime(dates, errors="coerce").dropna()
+    return tuple(sorted(dates.dt.strftime("%Y-%m").unique()))
+
+
+@lru_cache(maxsize=1)
+def legacy_sales_months() -> tuple:
+    """The months of the legacy billed-sales tables (sales_*.parquet, app.etl.ingest_sales), read
+    from sales_monthly.month: one ingest run writes them all, so its months are theirs. () when
+    they are not built; the billed figures then fold in nothing."""
+    p = KPI / "sales_monthly.parquet"
+    if not p.exists():
+        return ()
+    months = pd.read_parquet(p, columns=["month"])["month"].astype(str).str[:7]
+    return tuple(sorted(m for m in months.unique() if _YM.match(m)))
+
+
+def per_year(months: int) -> float:
+    """The factor that turns a total over `months` months of data into a yearly figure: 12 / months
+    (2.0 for six months). 0.0 for a window with no months: it holds no total to scale."""
+    return 12.0 / months if months > 0 else 0.0
+
+
+def month_days(months) -> int:
+    """The days in the given months ('2026-02' -> 28): the days a total over them covers."""
+    return sum(calendar.monthrange(int(m[:4]), int(m[5:7]))[1] for m in months)
+
+
+def legacy_sales_days() -> int:
+    """The days the billed-sales totals cover: every day of every month the tables hold
+    (Dec-25..May-26: 31+31+28+31+30+31 = 182). 0 when they are not built."""
+    return month_days(legacy_sales_months())
+
+
+def yearly_cogs(internal, billed):
+    """Internal issues and billed cost as one yearly cost of goods, each part scaled over its OWN
+    window (internal: stock_months, up to the stock count; billed: legacy_sales_months). One factor
+    for both would be wrong as soon as the windows differ: a new stock count moves the first and
+    not the second. Numbers and Series alike."""
+    return internal * per_year(len(stock_months())) + billed * per_year(len(legacy_sales_months()))
+
+
 def refresh_cache() -> None:
     _load_cached.cache_clear()
     stock_snapshot_date.cache_clear()
+    stock_months.cache_clear()
+    legacy_sales_months.cache_clear()
     _name_to_code.cache_clear()
     _hospital_map_at.cache_clear()
     _material_category_map.cache_clear()
@@ -299,17 +365,25 @@ def nonmoving_scoped(scope: str) -> pd.DataFrame:
     a2 = load("kpi_inventory_aging")  # already carries its own last_sale_date (see transforms.py A2)
     cons = stock_consumption()        # the issues up to the stock count A9 classifies
     moving = set()
+    looked = []                       # the months each kind of use was looked for in
     if scope in ("billable", "both"):
         sm_path = KPI / "sales_by_material.parquet"
         if sm_path.exists():
             moving |= set(pd.read_parquet(sm_path)["material"].astype(str).unique())
+            looked.append(len(legacy_sales_months()))
     if scope == "both":
         moving |= set(cons["material"].astype(str).unique())
+        looked.append(len(stock_months()))
 
     a9 = a2.copy()
     a9["consumed_in_window"] = a9["material"].astype(str).isin(moving)
     a9 = a9[(~a9["consumed_in_window"]) | (a9["aging_days"] > 180)].copy()
-    a9["reason"] = np.where(~a9["consumed_in_window"], "No consumption in 6mo", "Aging > 180d")
+    # The reason names the months looked in: billing over the billed-sales months, issues over the
+    # months up to the stock count. With both, the shorter of the two: over those months neither
+    # kind of use was recorded. Today both are Dec-25..May-26, so it reads 'No consumption in 6mo'.
+    looked = [n for n in looked if n]
+    a9["reason"] = np.where(~a9["consumed_in_window"], no_consumption_reason(min(looked, default=0)),
+                            "Aging > 180d")
     # `category` carries over from kpi_inventory_aging (already attached at load()
     # time via _attach_category) so filter_category still works downstream — a plain
     # column-select without it would silently no-op any Category filter combined with
@@ -321,10 +395,9 @@ def nonmoving_scoped(scope: str) -> pd.DataFrame:
 
 
 # sales_by_material retains no per-row date to derive a dynamic span from (unlike
-# fact_consumption's own days_span, computed live from real posting dates). This is
-# the fixed Dec 2025-May 2026 window ingest_sales.py's own KEEP set already bakes in
-# ("match the rest of the data") -- 31+31+28+31+30+31 days, not a separate guess.
-_SALES_WINDOW_DAYS = 182
+# fact_consumption, whose months stock_months() reads from its posting dates). Its window is the
+# months the same ingest run wrote into sales_monthly: legacy_sales_days() counts their days
+# (Dec 2025-May 2026: 182), read from the data rather than fixed here.
 
 
 def doh_scoped(scope: str) -> pd.DataFrame:
@@ -345,11 +418,12 @@ def doh_scoped(scope: str) -> pd.DataFrame:
     """
     doh = load("kpi_doh").copy()
     billed_daily = pd.Series(dtype=float)
-    if scope in ("billable", "both"):
+    billed_days = legacy_sales_days()
+    if scope in ("billable", "both") and billed_days:
         sm_path = KPI / "sales_by_material.parquet"
         if sm_path.exists():
             sm = pd.read_parquet(sm_path, columns=["material", "qty"])
-            billed_daily = sm.groupby("material")["qty"].sum() / _SALES_WINDOW_DAYS
+            billed_daily = sm.groupby("material")["qty"].sum() / billed_days
     doh["material"] = doh["material"].astype(str)
     doh["billed_daily"] = doh["material"].map(billed_daily).fillna(0.0)
     if scope == "billable":
@@ -365,9 +439,13 @@ def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
     """Days Inventory Outstanding, client's own formula: Closing Inventory VALUE /
     (avg daily VALUE of goods sold+consumed). This is a DIFFERENT metric from
     doh_scoped's doh_days (unit quantity, per-SKU MEDIAN) -- a single, portfolio-
-    level, VALUE-weighted ratio: SUM(closing_stock_value) / (SUM(internal cost)/181
-    + SUM(billed cost)/182), the internal cost being the issues up to the stock count
-    (stock_consumption: the extracts run on past it). Verified against real data: ~29.3
+    level, VALUE-weighted ratio: SUM(closing_stock_value) / (SUM(internal cost) / the days of
+    stock_months() + SUM(billed cost) / the days of legacy_sales_months()), the internal cost
+    being the issues up to the stock count (stock_consumption: the extracts run on past it).
+    Each daily rate divides by the days of the months its window HOLDS (month_days), the same
+    months yearly_cogs scales the turnover by, so a month with no extract inside the window is
+    left out of both instead of being read as a month of zero use (Dec-25..May-26: 182 days,
+    x 2.0 a year). Verified against real data: ~29.3
     days at All Plants, vs. the unit-median DOH's 16.57 -- both correct, answering
     different questions (typical SKU's cover vs. rupee-weighted portfolio cover, which skews toward
     high-value slow movers exactly the way the mean-vs-median doh_days gap already
@@ -405,12 +483,13 @@ def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
     sv = filter_category(filter_plant(load("kpi_stock_value"), p), cat)
     closing_value = float(sv["stock_value_cost"].sum())
 
-    # the issues up to the stock count, over the days they span (Dec-25..31-May-26: 181)
+    # the issues up to the stock count, over the days of the months that hold them
+    # (Dec-25..May-26: 182); `days_span` keeps its name for the callers that print it
     cons_all = stock_consumption()
-    days_span = max((cons_all["posting_date"].max() - cons_all["posting_date"].min()).days, 1)
+    days_span = month_days(stock_months())
     cons_f = filter_category(filter_plant(cons_all, p), cat)
     internal_value = float(cons_f["amount_lc"].sum())
-    internal_daily = internal_value / days_span
+    internal_daily = internal_value / days_span if days_span else 0.0
 
     billed_applicable = p is None
     billed_value = 0.0
@@ -419,7 +498,8 @@ def doh_value_scoped(plant: Optional[str], category: Optional[str]) -> dict:
         if cat:
             sm = sm[sm["category"].astype(str) == cat]
         billed_value = float(sm["cost"].sum())
-    billed_daily = billed_value / _SALES_WINDOW_DAYS
+    billed_days = legacy_sales_days()
+    billed_daily = billed_value / billed_days if billed_days else 0.0
 
     avg_daily_value = internal_daily + billed_daily
     days = (closing_value / avg_daily_value) if avg_daily_value > 0 else None
@@ -444,11 +524,12 @@ def itr_scoped(scope: str) -> pd.DataFrame:
     COST before recomputing turnover_annualized -- cost+cost, the mirror of
     doh_scoped's qty+qty rule, never mixing the two units.
 
-    Annualization uses ANN=2.0 (6mo -> annual), the same convention
-    /kpi/inventory-turnover-ratio/insights already hardcodes for its own live
-    aggregates -- not transforms.py's slightly different dynamic `months` factor,
-    which is within a rounding error of 2.0 over this dataset's real ~6-month window.
-    This keeps the recompute symmetric with the endpoint that reads it.
+    Annualization is yearly_cogs(): each part times 12 / the months of its own window
+    (x 2.0 for both on today's six-month windows), the same rule
+    /kpi/inventory-turnover-ratio/insights uses for its own live aggregates -- not
+    transforms.py's slightly different days-based `months` factor, which is within a
+    rounding error of 2.0 over this dataset's real ~6-month window. This keeps the
+    recompute symmetric with the endpoint that reads it.
 
     health_score/health_tier are NOT recomputed -- that composite (aging + turnover +
     movement) is a separate KPI this Scope toggle doesn't claim to redefine.
@@ -466,13 +547,14 @@ def itr_scoped(scope: str) -> pd.DataFrame:
             billed_cogs = sm.groupby("material")["cost"].sum()
     hs["material"] = hs["material"].astype(str)
     hs["billed_cogs"] = hs["material"].map(billed_cogs).fillna(0.0)
+    internal = hs["consumption_cost"] if scope != "billable" else 0.0
     if scope == "billable":
         hs["consumption_cost"] = hs["billed_cogs"]
     elif scope == "both":
         hs["consumption_cost"] = hs["consumption_cost"] + hs["billed_cogs"]
-    ANN = 2.0
+    yearly = yearly_cogs(internal, hs["billed_cogs"] if scope in ("billable", "both") else 0.0)
     hs["turnover_annualized"] = np.where(hs["closing_stock_value"] > 0,
-                                         hs["consumption_cost"] * ANN / hs["closing_stock_value"], 0.0)
+                                         yearly / hs["closing_stock_value"], 0.0)
     return hs.drop(columns=["billed_cogs"])
 
 
@@ -774,7 +856,8 @@ def paginate(table: str, plant: Optional[str], params, col_map: dict,
              category: Optional[str] = None,
              frame: Optional[pd.DataFrame] = None,
              sum_cols: Optional[list[str]] = None,
-             facets: Sequence = (), scope: Sequence = ()) -> dict:
+             facets: Sequence = (), scope: Sequence = (),
+             max_page_size: Optional[int] = None) -> dict:
     """Server-side table: cut to the plant and category, then filter + search + sort + page
     (app.core.table_query). Returns {data, total}.
 
@@ -786,7 +869,8 @@ def paginate(table: str, plant: Optional[str], params, col_map: dict,
     column is a share of. `facets` are the table's own filters beside the standard Month /
     Hospital / Category ones, and `scope` the page filters echoed back; both are only sent
     with facets=1. Without these the response is exactly {data, total}, as every legacy page
-    expects.
+    expects. `max_page_size` caps the rows one page may ask for (default
+    table_query.MAX_PAGE_SIZE; a list the Export CSV pages through passes EXPORT_MAX_PAGE).
     """
     # Imported here: table_query builds on this module (labels, month order, records).
     from app.core import table_query as tq
@@ -795,7 +879,8 @@ def paginate(table: str, plant: Optional[str], params, col_map: dict,
     df = filter_plant(df, plant)
     df = filter_category(df, category)
     return tq.table_page(df, params, facets=facets, scope=scope, columns=columns, rename=rename,
-                         sum_cols=sum_cols, col_map=col_map)
+                         sum_cols=sum_cols, col_map=col_map,
+                         max_page_size=tq.MAX_PAGE_SIZE if max_page_size is None else max_page_size)
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:

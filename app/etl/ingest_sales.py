@@ -3,8 +3,8 @@
 The raw sales files are large (IP xlsx up to ~280MB) and have inconsistent schemas
 month to month (29 vs 41 cols, different sheet names, .xlsx and .xlsb). We stream
 each file row-by-row (never hold a whole file in memory), auto-detect the data
-sheet + header, harmonise columns, keep the Dec-2025..May-2026 window, and
-accumulate aggregates the dashboards need:
+sheet + header, harmonise columns, keep the months of LEGACY_SALES_MONTHS (Dec-2025..May-2026,
+on purpose: see below), and accumulate aggregates the dashboards need:
 
   sales_monthly.parquet        month × patient(IP/OP) → revenue, cost, qty, lines
   sales_by_hospital.parquet    hospital(code) → revenue, cost, qty
@@ -18,10 +18,11 @@ Revenue = TOTALMRP (billed), Cost = TOTALCOSTPRICE, Margin = revenue − cost (r
 Run from the repo root, pointing SALES_RAW at the folder that holds "IP Sales" and
 "OP Sales" (see RUNBOOK_HCG.md):
     SALES_RAW=/path/to/folder python -m app.etl.ingest_sales
+SALES_MONTHS=YYYY-MM..YYYY-MM moves the window it keeps (default LEGACY_SALES_WINDOW).
 """
 from __future__ import annotations
 import os, glob, re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -43,8 +44,43 @@ RAW = os.environ.get("SALES_RAW") or settings.RAW_DATA_DIR
 KPI = os.path.join(HERE, "app", "data", "kpi")
 LIMIT = int(os.environ.get("SALES_LIMIT", "0"))  # >0 = only first N data rows/file (prototype)
 
-KEEP = {(2025, 12), (2026, 1), (2026, 2), (2026, 3), (2026, 4), (2026, 5)}  # match the rest of the data
+# ── The months this ingest keeps ──────────────────────────────────────────────────────────
+# Dec-2025..May-2026, on purpose. These legacy sales_*.parquet tables sit beside the stock count
+# of 31-May-26 and the internal issues up to it: days on hand, turnover, non-moving and the
+# billed-vs-internal views set them side by side. Every month from Jun-26 on is served by the
+# formulary build (its line cache and sales_items, app/etl/formulary), never by this ingest, so a
+# re-run on a newer HIS file still keeps these months only, and its log says how many rows it
+# left out. SALES_MONTHS=YYYY-MM..YYYY-MM moves the window without a code change.
+# Nothing reads the window from here: app.core.data_access takes it back from the published
+# sales_monthly (legacy_sales_months), so the tables and every rate built on them (billed units
+# per day, turnover per year) always agree, and GET /meta/windows reports it as `legacy_sales`.
+LEGACY_SALES_WINDOW = "2025-12..2026-05"
+_YM = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+
+
+def window_months(spec: str) -> tuple:
+    """'2025-12..2026-05' -> ('2025-12', '2026-01', ..., '2026-05'): every month from the first to
+    the last, both included. A spec that is not two YYYY-MM months in order stops the run."""
+    parts = [p.strip() for p in str(spec).split("..")]
+    if len(parts) != 2 or not all(_YM.match(p) for p in parts) or parts[0] > parts[1]:
+        raise SystemExit(f"[sales] ABORT — the sales window {spec!r} is not YYYY-MM..YYYY-MM "
+                         "(first month first). Nothing was written.")
+    out, (y, m) = [], (int(parts[0][:4]), int(parts[0][5:]))
+    while f"{y:04d}-{m:02d}" <= parts[1]:
+        out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return tuple(out)
+
+
+# The window as months ('2025-12', ...) and as the (year, month) keys the row loop checks.
+LEGACY_SALES_MONTHS = window_months(os.environ.get("SALES_MONTHS") or LEGACY_SALES_WINDOW)
+KEEP = {(int(m[:4]), int(m[5:])) for m in LEGACY_SALES_MONTHS}
 EXCEL_BASE = datetime(1899, 12, 30)
+# A file whose SALESDATE cannot be read on more than this share of its rows stops the run: that is
+# a reader fault (a date format parse_ym does not know, a blank column), not rows outside the
+# window, and leaving them out would drop the month as surely as a file that reads empty. A few
+# blank dates (a total row, an empty line) stay far below it and are only counted.
+MAX_NO_DATE_SHARE = 0.5
 
 FIELDS = {
     "date": ["SALESDATE", "BILLDATE"],
@@ -81,6 +117,31 @@ def parse_ym(v):
         d = EXCEL_BASE + timedelta(days=float(s)); return (d.year, d.month)
     except Exception:
         return None
+
+
+def outside_window(ym) -> str:
+    """Why a row the window does not keep is left out: 'no_date' when its SALESDATE is blank or
+    unreadable (parse_ym gave None), else 'before' or 'after' the window. Only 'after' is served
+    elsewhere (the formulary build's sales_items)."""
+    if ym is None:
+        return "no_date"
+    return "before" if ym < min(KEEP) else "after"
+
+
+def left_out_lines(left: Counter) -> list:
+    """The run log's lines for the rows the window left out, by why (outside_window)."""
+    first, last = LEGACY_SALES_MONTHS[0], LEGACY_SALES_MONTHS[-1]
+    out = []
+    if left["before"]:
+        out.append(f"[sales] {left['before']:,} rows dated before {first} were left out "
+                   "(SALES_MONTHS moves the window).")
+    if left["after"]:
+        out.append(f"[sales] {left['after']:,} rows dated after {last} were left out; months after the "
+                   "window come from the formulary build (sales_items).")
+    if left["no_date"]:
+        out.append(f"[sales] {left['no_date']:,} rows have no readable SALESDATE (blank, or a date format "
+                   "the reader does not know) and were not counted.")
+    return out
 
 
 def col_map(header):
@@ -200,12 +261,17 @@ def run():
         return sorted(glob.glob(d + "/*.xlsx") + glob.glob(d + "/*.xlsb"))
 
     sources = [("IP", f) for f in files("IP Sales")] + [("OP", f) for f in files("OP Sales")]
+    print(f"[sales] keeping {LEGACY_SALES_MONTHS[0]}..{LEGACY_SALES_MONTHS[-1]} "
+          f"({len(LEGACY_SALES_MONTHS)} months, LEGACY_SALES_MONTHS)", flush=True)
+    left_total = Counter()
+    no_date = {}                    # path -> rows whose SALESDATE could not be read
     for patient, path in sources:
-        kept = 0; seen = 0
+        kept = 0; seen = 0; left = Counter()
         for g in records(path):
             seen += 1
             ym = parse_ym(g("date"))
             if ym not in KEEP:
+                left[outside_window(ym)] += 1
                 continue
             rev = _num(g("rev")); cost = _num(g("cost")); qty = _num(g("qty"))
             if rev is None:
@@ -238,7 +304,14 @@ def run():
             matdesc.setdefault(code, str(g("desc")) if g("desc") else code)
             kept += 1
         read_counts[path] = seen
-        print(f"[sales] {patient:2s} {os.path.basename(path)[:38]:38s} seen={seen:>8,} kept={kept:>8,}", flush=True)
+        no_date[path] = left["no_date"]
+        left_total += left
+        print(f"[sales] {patient:2s} {os.path.basename(path)[:38]:38s} seen={seen:>8,} kept={kept:>8,} "
+              f"outside_window={left['before'] + left['after']:>8,} no_date={left['no_date']:>8,}", flush=True)
+    # Said out loud, each for what it is: a newer HIS file's later months are left out by design
+    # (the formulary build serves them); an unreadable date is not a month served elsewhere.
+    for line in left_out_lines(left_total):
+        print(line, flush=True)
 
     # category from material master
     grp = {}
@@ -272,6 +345,15 @@ def run():
             "\n\nNothing was written. A .xlsb file reading empty usually means pyxlsb is "
             "not installed (pip install pyxlsb). Fix the reader and re-run; do NOT ship "
             "these aggregates, because they silently drop whole months.")
+
+    # Same idea for the dates: a file whose SALESDATE mostly cannot be read drops its month too.
+    undated = [f"{os.path.basename(p_)}: {no_date[p_]:,} of {n_:,} rows" for p_, n_ in read_counts.items()
+               if no_date[p_] > MAX_NO_DATE_SHARE * n_]
+    if undated:
+        raise SystemExit(
+            "[sales] ABORT — these files have no readable SALESDATE on most rows, so their months "
+            "would be left out:\n  " + "\n  ".join(undated) +
+            "\n\nNothing was written. Check the date column's format (parse_ym) and re-run.")
 
     # Same idea for the material key: if a reader change ever brings back float-shaped
     # codes, stop before they split every product in two again.

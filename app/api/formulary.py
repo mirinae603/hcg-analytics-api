@@ -3,11 +3,13 @@
 Served from the small aggregated tables `python -m app.etl.formulary` publishes into
 settings.FORMULARY_DATA_DIR (line-level sales never reach the repo or this process):
 
-    GET /formulary/meta           -> months, hospitals, filter options, sources
+    GET /formulary/meta           -> months, hospitals, filter options, sources, and the
+                                     page's notes in the words of its Basis
     GET /formulary/overview       -> headline %, trend, segments, IP/OP, hospital ranking and
-                                     the all-hospitals figure beside it (network),
-                                     class mix, GOV scheme views, HCG's onco / non-onco
-                                     consumption table, consumption by payer
+                                     the all-hospitals figure beside it (network), each
+                                     unit's consumption split and its all-units total
+                                     (unit_mix_total), class mix, GOV scheme views, HCG's
+                                     onco / non-onco consumption table, consumption by payer
     GET /formulary/doctors        -> {data,total} per treating doctor; with Material=, the
                                      doctors behind one item
     GET /formulary/items          -> {data,total} items of one formulary group; with
@@ -19,6 +21,12 @@ Compliance = Formulary (A) / (Formulary (A) + Out of Formulary (B)) on drug cost
 Formulary (C) is outside the ratio and consumables are outside it altogether. Every
 percentage is a ratio of SUMS taken after filtering — never an average of percentages
 across hospitals or months — and is None when its denominator is 0.
+
+Basis=qty (overview, doctors, items, scheme items) sums units sold instead of drug cost: the
+same split and ratios, counted in units (on meta, Basis only words the notes for units). It is
+a secondary lens — units add tablets, vials and bottles together — so it is never set against
+HCG's budget, which is a drug-cost target. Without Basis (or with Basis=value) every figure and
+note is the drug-cost one HCG reports.
 
 The list endpoints also return `sums` (data_access.paginate) over the filtered rows, so every
 share column has its amount on screen, and take the shared table filters (app.core.table_query:
@@ -79,6 +87,11 @@ GROUPS = {"A": "formulary", "B": "out_of_formulary", "C": "non_formulary"}
 GROUP_LABELS = {"A": "Formulary", "B": "Out of formulary", "C": "Non formulary"}
 SCHEME_KIND_LABELS = {"restricted": "Restricted for scheme", "preferred": "Preferred for scheme"}
 CONSUMABLES = "Consumables"
+# Basis= -> the table column every amount and ratio is summed from. Value (drug cost, ₹) is
+# HCG's own measure and the default; qty counts units sold. No unit of measure is kept, so
+# units of different forms add together — which is why a units view is never budget-judged.
+BASES = {"value": "cost", "qty": "qty"}
+BASIS_LABELS = {"value": "Value", "qty": "Units"}
 
 _PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
@@ -170,6 +183,7 @@ class Scope(NamedTuple):
     segment: Optional[str]        # 'onco' / 'non-onco'; None => both
     payer: Optional[str]          # 'CASH' / 'CASH(TPA)' / 'GOV'; None => all
     method: str                   # 'pooled' / 'mean'
+    basis: str = "value"          # 'value' (drug cost) / 'qty' (units sold); see BASES
 
 
 def _bad(msg: str):
@@ -214,7 +228,11 @@ def _periods() -> list:
     return sorted(_table("formulary_summary")["period"].astype(str).unique())
 
 
-def _months_arg(month, periods: list) -> tuple:
+def _months_arg(month, periods: list, data: str = "formulary") -> tuple:
+    """Month= as the months it picks of `periods`: the latest when not given, every one for
+    ALL, else one YYYY-MM or a comma list of them; 400 for a month `periods` does not hold,
+    naming the data the section serves (`data`: "No sales data for 2025-01"). Every section
+    that takes Month= reads it here."""
     s = _str(month)
     if s is None:
         return tuple(periods[-1:])          # latest period, like HCG's monthly report
@@ -227,7 +245,7 @@ def _months_arg(month, periods: list) -> tuple:
         if not _PERIOD_RE.match(m):
             _bad(f"Invalid Month '{m}'. Use YYYY-MM, a comma list of them, or ALL")
         if m not in periods:
-            _bad(f"No formulary data for {m}. Available months: {', '.join(periods)}")
+            _bad(f"No {data} data for {m}. Available months: {', '.join(periods)}")
         out.append(m)
     if not out:
         _bad("Month is empty. Use YYYY-MM, a comma list of them, or ALL")
@@ -258,7 +276,17 @@ def _method_arg(method) -> str:
     return s.lower()
 
 
-def _scope(Plant, Month, Type, Segment, Category, Payer, Method=None) -> Scope:
+def _basis_arg(basis) -> str:
+    s = _str(basis)
+    if s is None:
+        return "value"
+    if s.lower() not in BASES:
+        _bad(f"Invalid Basis '{s}'. Use value or qty")
+    return s.lower()
+
+
+# Basis comes after Method and defaults to None: brand_rules calls this positionally up to Payer.
+def _scope(Plant, Month, Type, Segment, Category, Payer, Method=None, Basis=None) -> Scope:
     periods = _periods()                    # 503 first: nothing below means anything without data
     return Scope(
         plant=_plant_arg(Plant),
@@ -267,7 +295,13 @@ def _scope(Plant, Month, Type, Segment, Category, Payer, Method=None) -> Scope:
         segment=_segment_arg(Segment, Category),
         payer=_choice(Payer, {p: p for p in PAYERS}, "Payer"),
         method=_method_arg(Method),
+        basis=_basis_arg(Basis),
     )
+
+
+def _measure(sc: Scope) -> str:
+    """The column every amount and ratio of `sc` is summed from: drug cost, or units sold."""
+    return BASES[sc.basis]
 
 
 def _code(v) -> Optional[str]:
@@ -309,12 +343,13 @@ def _ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return a / den.where(den != 0) * 100
 
 
-def _rollup(df: pd.DataFrame, keys: list) -> pd.DataFrame:
+def _rollup(df: pd.DataFrame, keys: list, measure: str = "cost") -> pd.DataFrame:
     """Per `keys` ([] = one row): A / B / C cost, all drug cost (and its onco / non-onco
     split) and lines, and the ratios —
     pooled over both segments, per segment, and the mean of the segment ratios (a segment
-    whose A + B is 0 is skipped)."""
-    cost = df["cost"].astype(float)
+    whose A + B is 0 is skipped). `measure` is the column summed (BASES: cost, or qty for
+    the same figures in units); the output names stay the same either way."""
+    cost = df[measure].astype(float)
     grp = df["formulary_group"].astype(str)
     cat = _category(df)
     d = pd.DataFrame({
@@ -367,6 +402,16 @@ def _split(r, method: str) -> dict:
             "lines": int(r["lines"])}
 
 
+def _unit_split(r) -> dict:
+    """A unit's own consumption split: each group's share of its A + B + C (non formulary
+    included, unlike the compliance %), so the three add to 100. None when A + B + C is 0."""
+    whole = r["formulary"] + r["out_of_formulary"] + r["non_formulary"]
+    return {"total": _money(whole),
+            "formulary_share_pct": _share(r["formulary"], whole),
+            "oof_share_pct": _share(r["out_of_formulary"], whole),
+            "nf_share_pct": _share(r["non_formulary"], whole)}
+
+
 # HCG's month heading ('Aug-26'), the same one the table filters label their months with.
 _month_label = tq.month_label
 
@@ -393,22 +438,65 @@ def _budget_book(version: tuple) -> dict:
     return {"month": by_month, "fy": by_fy}
 
 
-def _budget(plant: Optional[str], periods) -> tuple:
-    """(budget %, source) of one hospital over `periods`. HCG sets budgets per unit, so all
-    hospitals together have none; nor does a unit outside HCG's PAN list, a FY the MIS does not
-    cover, or a span whose months' budgets differ. Before the MIS is built: TARGET_PCT."""
-    if plant is None or not periods:
-        return None, None
+# _budget's source when the months selected do not share one budget (a mid-year change, or a
+# span across the April FY boundary, or a month the MIS sets none for): there is a budget, but
+# no single one to set the span against. Pages word it apart from "no budget for this unit".
+BUDGET_DIFFERS = "differs"
+
+
+def _month_budgets(plant: str, periods) -> dict:
+    """period -> the hospital's budget % that month (HCG's MIS month, else its FY's latest),
+    None where the MIS sets none. {} before the MIS is built."""
     book = _budget_book(_version())
     if not book:
-        return float(TARGET_PCT), "default"
-    vals = set()
+        return {}
+    out = {}
     for p in periods:
         b = book["month"].get((plant, p))
-        vals.add(book["fy"].get((plant, _fy(p))) if b is None else b)
-    if len(vals) != 1 or None in vals:
+        out[p] = book["fy"].get((plant, _fy(p))) if b is None else b
+    return out
+
+
+def _budget(plant: Optional[str], periods) -> tuple:
+    """(budget %, source) of one hospital over `periods`. HCG sets budgets per unit, so all
+    hospitals together have none (None, None); nor does a unit outside HCG's PAN list or a FY
+    the MIS does not cover (None, None). A span whose months' budgets differ has no one budget
+    either: (None, BUDGET_DIFFERS), so the page can say why. Before the MIS is built:
+    TARGET_PCT."""
+    if plant is None or not periods:
         return None, None
+    by_month = _month_budgets(plant, periods)
+    if not by_month:
+        return float(TARGET_PCT), "default"
+    vals = set(by_month.values())
+    if vals == {None}:
+        return None, None
+    if len(vals) != 1:
+        return None, BUDGET_DIFFERS
     return vals.pop(), "hcg_mis"
+
+
+def budget_differs_note(plant: str, periods) -> Optional[str]:
+    """Plain words for a span whose budgets differ ('HCG's MIS sets this unit 98% in Jun-26 and
+    100% in Jul-26 to Aug-26, so the months selected are not set against one budget'); None
+    when they do not."""
+    if _budget(plant, periods)[1] != BUDGET_DIFFERS:
+        return None
+    by_value: dict = {}
+    for p, b in sorted(_month_budgets(plant, periods).items()):
+        by_value.setdefault(b, []).append(p)
+    parts = [f"{'no budget' if b is None else f'{b:g}%'} {_months_words(ms)}"
+             for b, ms in sorted(by_value.items(), key=lambda x: x[1][0])]
+    said = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"HCG's MIS sets this unit {said}, so the months selected are not set against one budget."
+
+
+def _months_words(months: list) -> str:
+    """'in Aug-26', 'in Jun-26 to Aug-26' (one run of months), 'in Jun-26, Aug-26'."""
+    index = [int(m[:4]) * 12 + int(m[5:7]) for m in months]
+    if len(months) > 1 and index[-1] - index[0] == len(months) - 1:
+        return f"in {_month_label(months[0])} to {_month_label(months[-1])}"
+    return "in " + ", ".join(_month_label(m) for m in months)
 
 
 @_cache
@@ -462,28 +550,58 @@ def _month_reports(v: Optional[dict]) -> dict:
     return {}
 
 
-NOTE_RATIO = ("Compliance = Formulary ÷ (Formulary + Out of Formulary), on drug cost. Non Formulary "
-              "is outside the ratio; consumables are excluded.")
-NOTE_METHOD = {
-    "pooled": "Pooled: one ratio over onco and non-onco drug spend together (HCG's current method).",
+# What the amounts are, per Basis, in the notes' own words ("... on drug cost").
+MEASURE_WORDS = {"value": "drug cost", "qty": "units sold"}
+NOTE_RATIO_ON = ("Compliance = Formulary ÷ (Formulary + Out of Formulary), on {measure}. Non Formulary "
+                 "is outside the ratio; consumables are excluded.")
+NOTE_RATIO = NOTE_RATIO_ON.format(measure=MEASURE_WORDS["value"])
+NOTE_UNITS = ("Quantity view: every amount is a count of units sold — tablets, vials, bottles and so on added "
+              "together, as the sales files keep no unit of measure — and every % is a ratio of those counts. "
+              "It is not set against HCG's budget, which is a drug-cost target; Value gives the figures HCG budgets.")
+# The notes' own word for the amount itself ("drug spend"), per Basis.
+AMOUNT_WORDS = {"value": "spend", "qty": "units sold"}
+NOTE_METHOD_ON = {
+    "pooled": "Pooled: one ratio over onco and non-onco drug {amount} together (HCG's current method).",
     "mean": ("Mean: the average of the onco ratio and the non-onco ratio (HCG's earlier method); a segment "
-             "with no formulary or out-of-formulary spend is left out."),
+             "with no formulary or out-of-formulary {amount} is left out."),
 }
+NOTE_METHOD = {k: v.format(amount=AMOUNT_WORDS["value"]) for k, v in NOTE_METHOD_ON.items()}
 NOTE_SEGMENT = "Onco / Non-Onco follow the material code's first digit (1 = onco, 2 = non-onco)."
 NOTE_VIEWS = ("The trend ignores the Month filter, the hospital ranking ignores the hospital selector, and the "
               "scheme views count GOV-billed drug lines only, whatever the Payer filter.")
 NOTE_MONTHS = ("Several months are selected: amounts are summed first and the ratio is taken once — never an "
                "average of monthly percentages.")
+NOTE_NO_DATA_ON = "No formulary drug {amount} for {name} in this selection."
+
+
+def _ratio_note(basis: str) -> str:
+    return NOTE_RATIO_ON.format(measure=MEASURE_WORDS[basis])
+
+
+def _method_note(method: str, basis: str) -> str:
+    return NOTE_METHOD_ON[method].format(amount=AMOUNT_WORDS[basis])
+
+
+def _page_notes(basis: str) -> list:
+    """The page's general notes (meta), in the words of `basis`. The overview's ratio and method
+    notes are these same strings, so a page that lists both shows each note once. On value they
+    are HCG's wording, byte for byte as before Basis existed."""
+    notes = [_ratio_note(basis), _method_note("pooled", basis), _method_note("mean", basis), NOTE_SEGMENT]
+    if basis == "qty":
+        notes.append(NOTE_UNITS)
+    return notes
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @router.get("/formulary/meta")
-def formulary_meta():
-    return _meta_cached(_version())
+def formulary_meta(Basis: str = Query(None)):
+    # Basis words the notes and nothing else. No data is said first (503), as on every endpoint.
+    _table("formulary_summary")
+    return _meta_cached(_basis_arg(Basis), _version())
 
 
 @_cache
-def _meta_cached(version: tuple) -> dict:
+def _meta_cached(basis: str, version: tuple) -> dict:
     periods = _periods()
     names = _sap_names()
     hospitals = [{"plant": p, "name": names.get(p, h["his_name"]), "his_code": h["his_code"],
@@ -513,15 +631,15 @@ def _meta_cached(version: tuple) -> dict:
                            if isinstance(x, (str, int, float)) and not isinstance(x, bool)}
                        for p, rep in sorted(reports.items())},
         },
-        "notes": [NOTE_RATIO, NOTE_METHOD["pooled"], NOTE_METHOD["mean"], NOTE_SEGMENT],
+        "notes": _page_notes(basis),
     }
 
 
 @router.get("/formulary/overview")
 def formulary_overview(Plant: str = Query(None), Month: str = Query(None), Type: str = Query(None),
                        Segment: str = Query(None), Category: str = Query(None),
-                       Payer: str = Query(None), Method: str = Query(None)):
-    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Method)
+                       Payer: str = Query(None), Method: str = Query(None), Basis: str = Query(None)):
+    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Method, Basis)
     return _overview_cached(sc, _version())
 
 
@@ -532,9 +650,12 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
     names = _sap_names()
     hosp = _hospitals()
     method = sc.method
+    measure = _measure(sc)
+    # HCG's budget is a drug-cost target, so only the value view is set against it.
+    judged = sc.basis == "value"
     drugs = _cut(s, sc)
 
-    h = _rollup(drugs, []).iloc[0]
+    h = _rollup(drugs, [], measure).iloc[0]
     sp = _split(h, method)
     headline = {"compliance_pct": sp["compliance_pct"], "pooled_pct": _pct(h["pooled_pct"]),
                 "mean_pct": _pct(h["mean_pct"]), "onco_pct": _pct(h["onco_pct"]),
@@ -543,9 +664,9 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
                 "total": _money(h["total"]), "lines": sp["lines"],
                 # the ratio's denominator (A + B) and HCG's MIS budget, beside the %
                 "in_ratio": _money(h["formulary"] + h["out_of_formulary"])}
-    headline["budget_pct"], headline["budget_source"] = _budget(sc.plant, sc.months)
+    headline["budget_pct"], headline["budget_source"] = _budget(sc.plant, sc.months) if judged else (None, None)
 
-    t = _rollup(_cut(s, sc, months=False), ["period"]).set_index("period")
+    t = _rollup(_cut(s, sc, months=False), ["period"], measure).set_index("period")
     trend = []
     for p in periods:
         r = t.loc[p] if p in t.index else None
@@ -560,12 +681,12 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
                         "out_of_formulary": sp["out_of_formulary"],
                         "non_formulary": sp["non_formulary"], "lines": sp["lines"]})
         # HCG's MIS table per month: Budget beside Actual, and the amounts behind the %.
-        row.update({"budget_pct": _budget(sc.plant, [p])[0],
+        row.update({"budget_pct": _budget(sc.plant, [p])[0] if judged else None,
                     "in_ratio": _money(row["formulary"] + row["out_of_formulary"]),
                     "total": _money(row["formulary"] + row["out_of_formulary"] + row["non_formulary"])})
         trend.append(row)
 
-    seg = _rollup(drugs.assign(_seg=_category(drugs)), ["_seg"]).set_index("_seg")
+    seg = _rollup(drugs.assign(_seg=_category(drugs)), ["_seg"], measure).set_index("_seg")
     segments = []
     for key, cat in SEGMENTS.items():
         r = seg.loc[cat] if cat in seg.index else None
@@ -574,49 +695,53 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
             "compliance_pct": None, "formulary": 0.0, "out_of_formulary": 0.0, "non_formulary": 0.0, "lines": 0}
         segments.append({"key": key, "label": SEGMENT_LABELS[key], **sp})
 
-    ty = _rollup(drugs, ["patient_type"]).set_index("patient_type")
+    ty = _rollup(drugs, ["patient_type"], measure).set_index("patient_type")
     by_type = [{"type": k, **(_split(ty.loc[k], method) if k in ty.index else {
         "compliance_pct": None, "formulary": 0.0, "out_of_formulary": 0.0, "non_formulary": 0.0, "lines": 0})}
         for k in TYPES]
 
     every_unit = _cut(s, sc, plant=False)
-    hb = _rollup(every_unit, ["plant"])
+    hb = _rollup(every_unit, ["plant"], measure)
     by_hospital = []
     for r in hb.to_dict("records"):
         p = r["plant"]
         hh = hosp.get(p, {"his_code": None, "his_name": None})
         by_hospital.append({"plant": p, "name": names.get(p, hh["his_name"] or p),
                             "his_code": hh["his_code"], "his_name": hh["his_name"],
-                            **_split(r, method), "budget_pct": _budget(p, sc.months)[0],
-                            "rank": None, "selected": p == sc.plant})
+                            **_split(r, method), "budget_pct": _budget(p, sc.months)[0] if judged else None,
+                            "rank": None, "selected": p == sc.plant, **_unit_split(r)})
     # Worst first; a hospital with no A + B spend has no ratio, so no rank, and goes last.
     by_hospital.sort(key=lambda x: (x["compliance_pct"] is None,
                                     x["compliance_pct"] if x["compliance_pct"] is not None else 0.0,
                                     -x["out_of_formulary"], x["his_name"] or ""))
     for i, x in enumerate(b for b in by_hospital if b["compliance_pct"] is not None):
         x["rank"] = i + 1
+    # Every hospital together, from the ranking's own rows: the network figure and the unit
+    # split's Total row both come from it.
+    net = _rollup(every_unit, [], measure).iloc[0]
 
-    total = float(drugs["cost"].sum())
-    cl = (drugs.groupby(["formulary_class", "formulary_group"], as_index=False)[["cost", "lines"]].sum()
-          .sort_values(["formulary_group", "cost"], ascending=[True, False]))
+    # by_class and the scheme blocks keep their `cost` key on every basis: it holds the measure.
+    total = float(drugs[measure].sum())
+    cl = (drugs.groupby(["formulary_class", "formulary_group"], as_index=False)[[measure, "lines"]].sum()
+          .sort_values(["formulary_group", measure], ascending=[True, False]))
     by_class = [{"formulary_class": r["formulary_class"], "formulary_group": r["formulary_group"],
-                 "cost": _money(r["cost"]), "lines": int(r["lines"]), "share_pct": _share(r["cost"], total)}
+                 "cost": _money(r[measure]), "lines": int(r["lines"]), "share_pct": _share(r[measure], total)}
                 for r in cl.to_dict("records")]
 
     # Scheme views: GOV lines only, whatever the Payer filter; shares are of the drug
     # spend of ALL payers in the same scope (per segment for the segment rows).
     every_payer = _cut(s, sc, payer=False)
     cat_all = _category(every_payer)
-    tot_all = float(every_payer["cost"].sum())
-    tot_seg = {k: float(every_payer.loc[cat_all == c, "cost"].sum()) for k, c in SEGMENTS.items()}
+    tot_all = float(every_payer[measure].sum())
+    tot_seg = {k: float(every_payer.loc[cat_all == c, measure].sum()) for k, c in SEGMENTS.items()}
     gov = every_payer[every_payer["payer_bucket"].astype(str) == SCHEME_PAYER]
 
     def scheme_figure(k: pd.DataFrame) -> dict:
         kc = _category(k)
-        block = {"cost": _money(k["cost"].sum()), "lines": int(k["lines"].sum()),
-                 "share_pct": _share(k["cost"].sum(), tot_all)}
+        block = {"cost": _money(k[measure].sum()), "lines": int(k["lines"].sum()),
+                 "share_pct": _share(k[measure].sum(), tot_all)}
         for key, c in SEGMENTS.items():
-            v = float(k.loc[kc == c, "cost"].sum())
+            v = float(k.loc[kc == c, measure].sum())
             block[key.replace("-", "_")] = {"cost": _money(v), "share_pct": _share(v, tot_seg[key])}
         return block
 
@@ -626,18 +751,22 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
     non_gov = every_payer[every_payer["payer_bucket"].astype(str) != SCHEME_PAYER]
     scheme["restricted_cash_tpa"] = scheme_figure(
         non_gov[non_gov["formulary_class"].astype(str).isin(SCHEME_CLASSES["restricted"])])
-    scheme["gov_total"] = _money(gov["cost"].sum())
+    scheme["gov_total"] = _money(gov[measure].sum())
     # The amounts every share above divides by (all payers' drug spend in the same scope).
     scheme["base"] = {"all": _money(tot_all), "onco": _money(tot_seg["onco"]),
                       "non_onco": _money(tot_seg["non-onco"])}
 
-    notes = [NOTE_RATIO, NOTE_METHOD[method], NOTE_SEGMENT, NOTE_VIEWS]
+    notes = [_ratio_note(sc.basis), _method_note(method, sc.basis), NOTE_SEGMENT, NOTE_VIEWS]
+    if sc.basis == "qty":
+        notes.append(NOTE_UNITS)
     if len(sc.months) > 1:
         notes.append(NOTE_MONTHS)
     if sc.segment and method == "mean":
         notes.append("Only one segment is selected, so the mean method equals that segment's own ratio.")
+    if headline["budget_source"] == BUDGET_DIFFERS:
+        notes.append(budget_differs_note(sc.plant, sc.months))
     if sc.plant and drugs.empty:
-        notes.append(f"No formulary drug spend for {names.get(sc.plant, sc.plant)} in this selection.")
+        notes.append(NOTE_NO_DATA_ON.format(amount=AMOUNT_WORDS[sc.basis], name=names.get(sc.plant, sc.plant)))
 
     return {
         "headline": headline,
@@ -645,14 +774,21 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
                   "plant_name": names.get(sc.plant, sc.plant) if sc.plant else "All Hospitals",
                   "his_name": _his_name(sc.plant) if sc.plant else None, "months": list(sc.months),
                   "type": sc.ptype or "ALL", "segment": sc.segment or "ALL",
-                  "payer": sc.payer or "ALL", "method": method},
+                  "payer": sc.payer or "ALL", "method": method,
+                  "basis": sc.basis, "budget_judged": judged},
         "trend": trend,
         "segments": segments,
         "by_type": by_type,
         "by_hospital": by_hospital,
         # The same figure over every hospital (the ranking's own scope): the reference a unit is
         # set against. Equals the All-hospitals headline of the same filters.
-        "network": {"compliance_pct": _split(_rollup(every_unit, []).iloc[0], method)["compliance_pct"]},
+        "network": {"compliance_pct": _split(net, method)["compliance_pct"]},
+        # The unit split over every hospital together (by_hospital's rows and filters, on the
+        # basis): the Total row under each unit's split. Its shares are a ratio of the summed
+        # amounts, never an average of the units' shares.
+        "unit_mix_total": {"formulary": _money(net["formulary"]),
+                           "out_of_formulary": _money(net["out_of_formulary"]),
+                           "non_formulary": _money(net["non_formulary"]), **_unit_split(net)},
         "by_class": by_class,
         "scheme": scheme,
         "consumption": _consumption(s, sc),
@@ -662,12 +798,13 @@ def _overview_cached(sc: Scope, version: tuple) -> dict:
     }
 
 
-NOTE_CONSUMPTION = (
-    "HCG's 'Onco and Non Onco Formulary Consumption' table, on drug cost (consumables excluded). Every % here "
+NOTE_CONSUMPTION_ON = (
+    "HCG's 'Onco and Non Onco Formulary Consumption' table, on {measure} (consumables excluded). Every % here "
     "is the value ÷ that row's total consumption (Formulary + Out of formulary + Non formulary), so non "
     "formulary IS in this denominator — unlike the compliance %, which is Formulary ÷ (Formulary + Out of "
     "formulary). Scheme = GOV-billed lines; cash & TPA = CASH and CASH(TPA). The table shows every payer and "
     "both segments whatever the Payer and Segment filters; Month, hospital and IP/OP apply.")
+NOTE_CONSUMPTION = NOTE_CONSUMPTION_ON.format(measure=MEASURE_WORDS["value"])
 
 
 def _consumption(s: pd.DataFrame, sc: Scope) -> dict:
@@ -675,6 +812,7 @@ def _consumption(s: pd.DataFrame, sc: Scope) -> dict:
     restricted / preferred brand spend for scheme and restricted for cash & TPA, each with
     its share of that segment's total consumption."""
     d = _cut(s, sc._replace(segment=None), payer=False)          # drugs, every payer
+    measure = _measure(sc)
     cat = _category(d)
     cls = d["formulary_class"].astype(str)
     grp = d["formulary_group"].astype(str)
@@ -688,7 +826,7 @@ def _consumption(s: pd.DataFrame, sc: Scope) -> dict:
     rows = []
     for key, label, seg in (("onco", "Onco", cat == ONCO), ("non-onco", "Non-Onco", cat == NON_ONCO),
                             ("all", "Total", cat.isin(DRUGS))):
-        v = {k: float(d.loc[seg & m, "cost"].sum()) for k, m in parts.items()}
+        v = {k: float(d.loc[seg & m, measure].sum()) for k, m in parts.items()}
         total = v["formulary"] + v["out_of_formulary"] + v["non_formulary"]
         row = {"segment": key, "label": label}
         for k in ("formulary", "out_of_formulary", "non_formulary"):
@@ -700,25 +838,26 @@ def _consumption(s: pd.DataFrame, sc: Scope) -> dict:
             row[k] = _money(v[k])
             row[f"{k}_pct"] = _share(v[k], total)
         rows.append(row)
-    return {"scope_note": NOTE_CONSUMPTION, "rows": rows}
+    return {"scope_note": NOTE_CONSUMPTION_ON.format(measure=MEASURE_WORDS[sc.basis]), "rows": rows}
 
 
 def _by_payer(s: pd.DataFrame, sc: Scope) -> dict:
     """The spend email's payer-wise consumption (consumables included) and the layout of HCG's
     S5 'Summary' pivot (drug cost by class x payer, onco / non-onco x IP / OP). Every payer,
-    both segments, whatever the Payer and Segment filters."""
+    both segments, whatever the Payer and Segment filters. Amounts are of the Basis measure."""
     d = _cut(s, sc._replace(segment=None), payer=False, drugs=False)
+    measure = _measure(sc)
     cat = _category(d)
     pay = d["payer_bucket"].astype(str)
     ptype = d["patient_type"].astype(str)
-    cost = d["cost"].astype(float)
+    amount = d[measure].astype(float)
 
     def figures(m: pd.Series) -> dict:
-        c = cost[m]
+        c = amount[m]
         onco, non_onco = float(c[cat == ONCO].sum()), float(c[cat == NON_ONCO].sum())
         consumables = float(c[cat == CONSUMABLES].sum())
         drugs = d[m & cat.isin(DRUGS)]
-        r = _rollup(drugs, []).iloc[0]
+        r = _rollup(drugs, [], measure).iloc[0]
         return {"onco": _money(onco), "non_onco": _money(non_onco), "consumables": _money(consumables),
                 "drugs": _money(onco + non_onco), "total": _money(onco + non_onco + consumables),
                 "onco_ip": _money(c[(cat == ONCO) & (ptype == "IP")].sum()),
@@ -739,8 +878,8 @@ def _by_payer(s: pd.DataFrame, sc: Scope) -> dict:
     cells = ["onco_ip", "onco_op", "non_onco_ip", "non_onco_op"]
     classes = []
     if not drugs.empty:
-        pv = (drugs.assign(_k=key.values, cost=drugs["cost"].astype(float))
-              .groupby(["formulary_class", "formulary_group", "payer_bucket", "_k"])["cost"].sum()
+        pv = (drugs.assign(_k=key.values, _v=drugs[measure].astype(float))
+              .groupby(["formulary_class", "formulary_group", "payer_bucket", "_k"])["_v"].sum()
               .unstack("_k").reindex(columns=cells).fillna(0.0).reset_index())
         # Excel's pivot order: class name, then payer
         pv = pv.astype({"formulary_class": str, "payer_bucket": str}).sort_values(
@@ -777,8 +916,10 @@ def _page(request: Request, frame: pd.DataFrame, sum_cols: Optional[list] = None
     # sum_cols, also {sums} over the filtered rows for the table's totals row. The frame is
     # already aggregated over the page's filters (`scope`, echoed with facets=1); `facets`
     # filter its rows, so sums follow them while share_pct stays a share of the whole selection.
+    # A page holds at most the Export CSV's page (tq.EXPORT_MAX_PAGE): the exports and the
+    # purchase lists page through here too.
     return da.paginate("formulary", None, request.query_params, col_map={}, frame=frame,
-                       sum_cols=sum_cols, facets=facets, scope=scope)
+                       sum_cols=sum_cols, facets=facets, scope=scope, max_page_size=tq.EXPORT_MAX_PAGE)
 
 
 def scope_chips(sc: Scope, *extra: tq.ScopeChip) -> tuple:
@@ -792,6 +933,8 @@ def scope_chips(sc: Scope, *extra: tq.ScopeChip) -> tuple:
         chips.append(tq.chip("Payer", "Payer", sc.payer))
     if sc.method != "pooled":
         chips.append(tq.chip("Method", "Method", sc.method, METHODS[sc.method]))
+    if sc.basis != "value":
+        chips.append(tq.chip("Basis", "Counted in", sc.basis, BASIS_LABELS[sc.basis]))
     return (*chips, *extra)
 
 
@@ -805,11 +948,19 @@ def _drill_type(sc: Scope) -> None:
         _bad("The doctor × item table is not split by patient type — drop Type (IP and OP together)")
 
 
+def _biggest_first(r: pd.DataFrame, sc: Scope) -> pd.DataFrame:
+    """An item list's order: largest on the Basis measure first. Rows keep both `cost` and `qty`
+    on every basis; on units, equal counts fall back to the dearer row."""
+    m = _measure(sc)
+    return r.sort_values([m] if m == "cost" else [m, "cost"], ascending=False, kind="mergesort")
+
+
 @router.get("/formulary/doctors")
 def formulary_doctors(request: Request, Plant: str = Query(None), Month: str = Query(None),
                       Type: str = Query(None), Segment: str = Query(None), Category: str = Query(None),
-                      Payer: str = Query(None), Method: str = Query(None), Material: str = Query(None)):
-    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Method)
+                      Payer: str = Query(None), Method: str = Query(None), Material: str = Query(None),
+                      Basis: str = Query(None)):
+    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Method, Basis)
     material = _code(Material)
     if material:
         _drill_type(sc)
@@ -826,7 +977,7 @@ ITEM_SUMS = ["cost", "qty", "lines"]
 def _doctors_cached(sc: Scope, version: tuple) -> pd.DataFrame:
     d = _cut(_table("formulary_by_doctor"), sc)
     keys = ["plant", "doctor_id"]
-    r = _rollup(d, keys)
+    r = _rollup(d, keys, _measure(sc))          # amounts (and the default OOF-first order) on the basis
     r = r.merge(_last(d.astype({k: str for k in keys}), keys, ["doctor_name", "hospital_name"]),
                 on=keys, how="left")
     r["compliance_pct"] = r["mean_pct"] if sc.method == "mean" else r["pooled_pct"]
@@ -851,7 +1002,7 @@ def _item_doctors_cached(sc: Scope, material: str, version: tuple) -> pd.DataFra
     r = r.merge(_last(d, ["plant", "doctor_id"], ["doctor_name"]), on=["plant", "doctor_id"], how="left")
     hosp = _hospitals()
     r["hospital_name"] = r["plant"].map(lambda p: hosp.get(p, {}).get("his_name"))
-    r = _round(r, money=("cost",), qty=("qty",)).sort_values("cost", ascending=False, kind="mergesort")
+    r = _biggest_first(_round(r, money=("cost",), qty=("qty",)), sc)
     return r[["doctor_id", "doctor_name", "plant", "hospital_name", "formulary_class", "cost", "qty",
               "lines"]].reset_index(drop=True)
 
@@ -883,8 +1034,9 @@ ITEM_COLUMNS = ["material", "material_desc", "generic_name", "manufacturer", "ca
 @router.get("/formulary/items")
 def formulary_items(request: Request, Plant: str = Query(None), Month: str = Query(None),
                     Type: str = Query(None), Segment: str = Query(None), Category: str = Query(None),
-                    Payer: str = Query(None), Group: str = Query(None), Doctor: str = Query(None)):
-    sc = _scope(Plant, Month, Type, Segment, Category, Payer)
+                    Payer: str = Query(None), Group: str = Query(None), Doctor: str = Query(None),
+                    Basis: str = Query(None)):
+    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Basis=Basis)
     group = _choice(Group, {g: g for g in GROUPS}, "Group") or "B"
     doctor = _str(Doctor)
     group_chip = tq.chip("Group", "Formulary group", group, GROUP_LABELS[group])
@@ -902,7 +1054,7 @@ def formulary_items(request: Request, Plant: str = Query(None), Month: str = Que
 def _items_cached(sc: Scope, group: str, version: tuple) -> pd.DataFrame:
     d = _cut(_table("formulary_by_item"), sc)
     d = d[d["formulary_group"].astype(str) == group]
-    return _finish_items(_items(d, _describe(d)))
+    return _finish_items(_items(d, _describe(d)), sc)
 
 
 @_cache
@@ -916,14 +1068,15 @@ def _doctor_items_cached(sc: Scope, group: str, doctor: str, version: tuple) -> 
     names = _last(d.astype({"material": str}), ["material"], ["material_desc"])
     r = r.merge(names, on="material", how="left")
     r["category"] = r["category"].fillna(r["material"].str[:1].map(_CATEGORY_OF_DIGIT))
-    return _finish_items(r)
+    return _finish_items(r, sc)
 
 
-def _finish_items(r: pd.DataFrame) -> pd.DataFrame:
-    tot = float(r["cost"].sum())
-    r["share_pct"] = r["cost"] / tot * 100 if tot else np.nan
-    r = _round(r, money=("cost",), pct=("share_pct",), qty=("qty",))
-    r = r.sort_values("cost", ascending=False, kind="mergesort")
+def _finish_items(r: pd.DataFrame, sc: Scope) -> pd.DataFrame:
+    """share_pct = the row's share of the list's total on the Basis measure (cost, or units)."""
+    m = _measure(sc)
+    tot = float(r[m].sum())
+    r["share_pct"] = r[m] / tot * 100 if tot else np.nan
+    r = _biggest_first(_round(r, money=("cost",), pct=("share_pct",), qty=("qty",)), sc)
     return r[ITEM_COLUMNS].reset_index(drop=True)
 
 
@@ -931,9 +1084,9 @@ def _finish_items(r: pd.DataFrame) -> pd.DataFrame:
 def formulary_scheme_items(request: Request, Plant: str = Query(None), Month: str = Query(None),
                            Type: str = Query(None), Segment: str = Query(None),
                            Category: str = Query(None), Payer: str = Query(None),
-                           Kind: str = Query(None)):
+                           Kind: str = Query(None), Basis: str = Query(None)):
     # Payer is validated but not applied: the scheme views are GOV-billed lines by definition.
-    sc = _scope(Plant, Month, Type, Segment, Category, Payer)._replace(payer=SCHEME_PAYER)
+    sc = _scope(Plant, Month, Type, Segment, Category, Payer, Basis=Basis)._replace(payer=SCHEME_PAYER)
     kind = _choice(Kind, {k.upper(): k for k in SCHEME_CLASSES}, "Kind") or "restricted"
     return _page(request, _scheme_items_cached(sc, kind, _version()), sum_cols=ITEM_SUMS, facets=ITEM_FACETS,
                  scope=scope_chips(sc, tq.chip("Kind", "Scheme brands", kind, SCHEME_KIND_LABELS[kind])))
@@ -943,8 +1096,7 @@ def formulary_scheme_items(request: Request, Plant: str = Query(None), Month: st
 def _scheme_items_cached(sc: Scope, kind: str, version: tuple) -> pd.DataFrame:
     d = _cut(_table("formulary_by_item"), sc)
     d = d[d["formulary_class"].astype(str).isin(SCHEME_CLASSES[kind])]
-    r = _items(d, _describe(d))
-    r = _round(r, money=("cost",), qty=("qty",)).sort_values("cost", ascending=False, kind="mergesort")
+    r = _biggest_first(_round(_items(d, _describe(d)), money=("cost",), qty=("qty",)), sc)
     return r[["material", "material_desc", "generic_name", "manufacturer", "category", "formulary_class",
               "cost", "qty", "lines", "hospitals"]].reset_index(drop=True)
 

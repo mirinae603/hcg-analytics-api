@@ -210,6 +210,12 @@ def test_a_net_loss_below_zero_keeps_every_share_between_0_and_100(client, data)
 
 
 # ---------- HCG's own figure ----------
+# Served for the check against HCG's sheet; the page does not show it, so no note describes it.
+
+def says_hcgs_figure(notes: list) -> bool:
+    return any("HCG's figure" in n or "HCG's own Summary" in n or "HCG's Summary" in n
+               or "Margin Value Difference" in n for n in notes)
+
 
 def test_hcgs_figure_beside_ours(client, data):
     d = oof(client, Plant=KR, Month=AUG)
@@ -217,7 +223,7 @@ def test_hcgs_figure_beside_ours(client, data):
     assert d["hcg"] == {"months": [AUG], "centres": 1, "actual_margin": 7000.0, "potential_margin": 9820.0,
                         "margin_loss": 2820.0, "loss_pct": pytest.approx(28.7169, abs=1e-4), "diff": 0.0,
                         "matches": True}
-    assert any("Margin Value Difference" in n for n in d["notes"])
+    assert not says_hcgs_figure(d["notes"])
     # every hospital: HCG also lists HC13 (loss 50), which we do not have -> off by 50
     a = oof(client, Month=AUG)["hcg"]
     assert (a["margin_loss"], a["diff"], a["centres"], a["matches"]) == (1270.0, -50.0, 3, False)
@@ -228,12 +234,12 @@ def test_no_hcg_figure_under_a_segment_or_brand_or_a_month_hcg_lacks(client, dat
         d = oof(client, Plant=KR, Month=AUG, **params)
         assert d["hcg"] is None and d["headline"]["hcg_figure"] is None, params
         assert all(t["hcg_loss"] is None for t in d["trend"]) and all(x["hcg_loss"] is None for x in d["by_hospital"])
-        assert any("per hospital and month only" in n for n in d["notes"]), params
+        assert not says_hcgs_figure(d["notes"]), params
     # Jul has no HCG Summary: no figure beside a total that includes it, the Aug point stays
     d = oof(client, Plant=KR, Month="ALL")
     assert d["hcg"] is None and d["headline"]["hcg_figure"] is None
     assert [(t["period"], t["hcg_loss"]) for t in d["trend"]] == [(JUL, None), (AUG, 2820.0)]
-    assert any("covers Aug-26 only" in n for n in d["notes"])
+    assert not says_hcgs_figure(d["notes"])
 
 
 # ---------- breakdowns ----------
@@ -423,6 +429,7 @@ def test_brand_filter_offers_every_out_of_formulary_brand_bought(client, data):
 def test_meta_names_the_purchase_months(client, data):
     m = get(client, "/spend/meta")
     assert (m["oof_built"], m["oof_months"], m["oof_latest"], m["oof_built_at"]) == (True, [JUL, AUG], AUG, BUILT_AT)
+    assert m["oof_waiting"] == []                       # the report names no month waiting for an Item Master
     assert [s["key"] for s in m["oof_suggested_by"] if s["estimated"]] == [PO.FORMULARY_RULE]
     assert "python -m app.etl.purchase" in m["sources"]["out_of_formulary"]
     assert oof(client, Month=AUG)["data_as_of"] == BUILT_AT
@@ -454,6 +461,113 @@ def test_no_purchase_identifier_in_any_response(client, data):
     for path in ("/spend/oof/overview", "/spend/oof/items", "/spend/oof/vendors"):
         text = json.dumps(get(client, path, Month="ALL", facets=1)).lower()
         assert not any(f'"{b}' in text for b in bad), path
+
+
+# ---------- a new month: estimated without HCG's working, or waiting for its Item Master ----------
+# Sep was built without HCG's worksheet (sources 2-5: HCG's pair from another month, the app's
+# rule, no alternative); Oct's GRN came without its Item Master, so the purchase build's report
+# names it as waiting and oof_purchase has no row for it. Sep, KR, by hand:
+#   s1  PP 1200 | earned 2 x (1000 - 600) = 800 | possible 2 x (1000 - 300) = 1400 | missed 600
+#   s2  PP 200  | earned 1 x (300 - 200) = 100  | possible 1 x (300 - 120) = 180   | missed 80 (Estimated)
+#   s3  PP 500, no alternative: shown, adds nothing
+SEP, OCT = "2026-09", "2026-10"
+SEP_ROWS = [
+    (SEP, KR, "101100", V1, PO.COUNTED, PO.HCG_SHEET_PAIR, None, "101900", PO.PRICE_LIST_LOWEST, 1, 2, 600, 1050, 300, 1050),
+    (SEP, KR, "101600", V2, PO.COUNTED, PO.FORMULARY_RULE, "A", "101901", PO.PRICE_CASH_TPA, 1, 1, 200, 315, 120, 315),
+    (SEP, KR, "201400", V1, PO.NO_ALTERNATIVE, PO.NONE, None, None, None, 1, 5, 100, 157.5, None, None),
+]
+SEP_NOTE = ("Estimated: HCG's working for Sep-26 was not received; suggestions come from HCG's other months and "
+            "lists, then the app's match (Estimated)")
+OCT_NOTE = "Out of formulary for Oct-26 waits for its Item Master; prices and generic are built"
+
+
+def write_report(folder: Path, months: dict) -> None:
+    """purchase_validation.json with the month sections the API reads (only their oof part)."""
+    (folder / PC.VALIDATION_FILE).write_text(json.dumps({
+        "built_at": BUILT_AT, "oof": {"months": sorted(p for p, m in months.items() if "estimated" in m)},
+        "months": {p: {"period": p, "oof": m} for p, m in months.items()}}))
+
+
+@pytest.fixture()
+def new_months(data):
+    folder = data / "purchase"
+    oof_rows = pd.DataFrame([_row(*r) for r in ROWS + SEP_ROWS])[PO.OOF_COLUMNS]
+    oof_rows.to_parquet(folder / f"{PC.OOF}.parquet", index=False)
+    write_report(folder, {JUL: {"hcg_working": True, "estimated": False, "warnings": []},
+                          AUG: {"hcg_working": True, "estimated": False, "warnings": []},
+                          SEP: {"hcg_working": False, "estimated": True, "warnings": [SEP_NOTE]},
+                          OCT: {"item_master": None, "waiting_for_item_master": True, "warnings": [OCT_NOTE]}})
+    spend.clear_caches()
+    return data
+
+
+def test_a_month_without_hcgs_working_is_estimated(client, new_months):
+    d = oof(client, Plant=KR, Month=SEP)
+    h = d["headline"]
+    assert (h["estimated"], h["hcg_working"], h["estimated_months"]) == (True, False, [SEP])
+    assert margins(h) == (900.0, 1580.0, 680.0) and h["purchase_value"] == 1900.0
+    assert d["hcg"] is None and h["hcg_figure"] is None                  # HCG sent no Summary for Sep
+    assert SEP_NOTE in d["notes"]
+    cov = h["coverage"]
+    assert (cov[PO.HCG_SHEET_PAIR]["value"], cov[PO.FORMULARY_RULE]["value"], cov[PO.NONE]["value"]) == \
+        (1200.0, 200.0, 500.0)
+    assert [(t["period"], t["estimated"]) for t in d["trend"]] == [(JUL, False), (AUG, False), (SEP, True)]
+
+
+def test_estimated_is_a_property_of_the_month_not_of_the_cut(client, new_months):
+    # DR bought nothing in Sep, and a brand filter keeps no Estimated row: the month is still estimated
+    for params in ({"Plant": DR, "Month": SEP}, {"Month": SEP, "Material": "201400"}, {"Month": SEP, "Segment": "onco"}):
+        h = oof(client, **params)["headline"]
+        assert (h["estimated"], h["hcg_working"], h["estimated_months"]) == (True, False, [SEP]), params
+    assert oof(client, Plant=DR, Month=SEP)["headline"]["lines"] == 0
+
+
+def test_months_with_hcgs_working_are_not_estimated(client, new_months):
+    d = oof(client, Plant=KR, Month=AUG)
+    assert (d["headline"]["estimated"], d["headline"]["hcg_working"], d["headline"]["estimated_months"]) == (False, True, [])
+    assert not any(n.startswith("Estimated:") for n in d["notes"])
+    assert d["headline"]["margin_loss"] == 2820.0                        # Aug unchanged by Sep's rows
+
+
+@pytest.mark.parametrize("month, months", [("ALL", [JUL, AUG, SEP]), (f"{AUG},{SEP}", [AUG, SEP])])
+def test_a_run_of_months_with_an_estimated_one(client, new_months, month, months):
+    d = oof(client, Plant=KR, Month=month)
+    h = d["headline"]
+    assert d["scope"]["months"] == months
+    assert (h["estimated"], h["hcg_working"], h["estimated_months"]) == (True, False, [SEP])
+    assert [n for n in d["notes"] if n.startswith("Estimated:")] == [SEP_NOTE]
+
+
+def test_a_month_waiting_for_its_item_master_says_so(client, new_months):
+    for path in ("/spend/oof/overview", "/spend/oof/items", "/spend/oof/vendors"):
+        for month in (OCT, f"{AUG},{OCT}"):
+            r = client.get(path, params={"Month": month})
+            assert r.status_code == 400, (path, month)
+            assert r.json()["detail"] == f"{OCT_NOTE}. Available months: {JUL}, {AUG}, {SEP}", (path, month)
+    # every overview names it (it is why the latest out-of-formulary month is Sep), but ALL stays the
+    # months that have out-of-formulary rows
+    for month in ("ALL", AUG):
+        d = oof(client, Month=month)
+        assert OCT_NOTE in d["notes"] and OCT not in d["scope"]["months"], month
+    m = get(client, "/spend/meta")
+    assert m["oof_waiting"] == [{"period": OCT, "label": "Oct-26", "note": OCT_NOTE}]
+    assert (m["oof_months"], m["oof_latest"]) == ([JUL, AUG, SEP], SEP)
+    # an unknown month is still 'no data'
+    r = client.get("/spend/oof/overview", params={"Month": "2026-11"})
+    assert r.status_code == 400 and "No out-of-formulary purchase data for 2026-11" in r.json()["detail"]
+
+
+def test_a_month_the_table_holds_is_never_waiting(client, new_months):
+    # a report kept from an older build may still call Sep waiting: the rows decide
+    folder = new_months / "purchase"
+    write_report(folder, {SEP: {"item_master": None, "waiting_for_item_master": True, "warnings": ["old"]}})
+    spend.clear_caches()
+    assert get(client, "/spend/meta")["oof_waiting"] == []
+    assert oof(client, Plant=KR, Month=SEP)["headline"]["margin_loss"] == 680.0
+    (folder / PC.VALIDATION_FILE).unlink()                               # no report at all: nothing waits
+    spend.clear_caches()
+    assert get(client, "/spend/meta")["oof_waiting"] == []
+    assert oof(client, Month=SEP)["headline"]["estimated"] is True       # read off the table, not the report
 
 
 # ---------- HCG's real figures, on the committed purchase tables ----------
@@ -491,6 +605,18 @@ def test_real_kr_and_every_centre_equal_hcgs_summary(client, real):
         assert x["margin_loss"] == pytest.approx(x["hcg_loss"], abs=0.011), x["plant"]
     for t in oof(client, Month="ALL")["trend"]:
         assert t["margin_loss"] == pytest.approx(t["hcg_loss"], abs=0.011), t["period"]
+
+
+@_real
+def test_real_months_with_hcgs_working_are_not_estimated(client, real):
+    # Jun, Jul and Aug 26 were built from HCG's own worksheets: nothing on the page changes
+    d = oof(client, Month="ALL")
+    for t in d["trend"]:
+        if t["period"] in set(real["period"]):
+            assert t["estimated"] is False, t["period"]
+    for p in sorted(set(real["period"]) & set(d["scope"]["months"])):
+        h = oof(client, Month=p)["headline"]
+        assert (h["estimated"], h["hcg_working"], h["estimated_months"]) == (False, True, []), p
 
 
 @_real

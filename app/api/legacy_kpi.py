@@ -87,6 +87,23 @@ def _pc(df, plant, category=None):
     return da.filter_category(da.filter_plant(df, _plant(plant)), category)
 
 
+def _count_period() -> tuple:
+    """(year, month name) of the stock count, e.g. (2026, 'May') for a 31-May-26 count: the period
+    the snapshot charts and tables label every row with, read from fact_inventory rather than
+    written here. (None, None) when there is no count."""
+    snap = da.stock_snapshot_date()
+    return (None, None) if pd.isna(snap) else (int(snap.year), snap.strftime("%B"))
+
+
+def _months_held(table: str) -> str:
+    """'10-mo' for a monthly KPI table: the months it holds, every plant together, so a card's sub
+    names the window its total covers instead of a fixed '6-mo'. Read from the same cached table
+    as the figure, so the two cannot disagree; a hospital with no rows one month still had that
+    month in its window. '' when the table holds no months (the sub then names none)."""
+    n = len(da.load(table)[["year", "month"]].drop_duplicates())
+    return f"{n}-mo" if n else ""
+
+
 def _year_month(df: pd.DataFrame) -> pd.Series:
     """fact_consumption's year + month_num as the 'YYYY-MM' key sales_monthly uses."""
     return df["year"].astype(int).astype(str) + "-" + df["month_num"].astype(int).astype(str).str.zfill(2)
@@ -202,7 +219,8 @@ def inventory_valuation(Plant: str = Query(None), Material: str = Query(None), M
     # "inventory-valuation" declares top:12); every other existing caller is unaffected.
     if top:
         g = g.head(top)
-    return [{"Year": 2026, "Month": "May", "Period": "May", "Material Group": r["material_group"],
+    year, month = _count_period()
+    return [{"Year": year, "Month": month, "Period": month, "Material Group": r["material_group"],
              "Inventory Valuation": float(r["stock_value_cost"])} for _, r in g.iterrows()]
 
 
@@ -244,7 +262,7 @@ def valuation_insights(Plant: str = Query(None), Category: str = Query(None)):
 @router.get("/kpi/inventory-valuation-table")
 def inventory_valuation_table(request: Request, Plant: str = Query(None), Category: str = Query(None)):
     df = _pc(da.load("kpi_stock_value"), Plant, Category).copy()
-    df["year"] = 2026; df["period"] = "May"
+    df["year"], df["period"] = _count_period()
     return da.paginate("kpi_stock_value", None, request.query_params, col_map={}, frame=df,
         columns=["year", "period", "material", "material_desc", "material_group", "stock_value_cost"],
         rename={"year": "year", "period": "period", "material": "materialId", "material_desc": "materialName",
@@ -253,8 +271,9 @@ def inventory_valuation_table(request: Request, Plant: str = Query(None), Catego
 
 
 # ---------------- INVENTORY TURNOVER — velocity insights (A4) ----------------
-# ITR = annualized COGS / inventory value. COGS = 6-month consumption cost, so we
-# annualize (×2). Single snapshot ⇒ "average inventory" is the snapshot point (proxy).
+# ITR = annualized COGS / inventory value. COGS = the consumption cost over the window, so each
+# part is annualised over its own months (da.yearly_cogs: x2 on today's six-month windows).
+# Single snapshot ⇒ "average inventory" is the snapshot point (proxy).
 @router.get("/kpi/inventory-turnover-ratio/insights")
 def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
     # Always billed+internal ("both") -- no Scope param, no "internal only" view left
@@ -262,7 +281,7 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
     # keyed on `scope` already implements the correct math (and the fan-out-bug fix),
     # this just removes the way to ask for the old, incomplete answer.
     scope = "both"
-    ANN = 2.0  # 6 months -> annual
+    in_internal, in_billed = scope != "billable", scope in ("billable", "both")
     # `orig` — the untouched (plant,material) frame, always internal-only. Portfolio
     # and category totals are literal SUMs across (plant,material) rows, and billed
     # COGS only exists once per MATERIAL (sales_by_material carries no plant key) —
@@ -295,7 +314,10 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
             billed_by_group = sm.groupby("group")["cost"].sum()
             billed_total = float(sm["cost"].sum())
     cogs6 = billed_total if scope == "billable" else (internal_cogs6 + billed_total if scope == "both" else internal_cogs6)
-    port_itr = (cogs6 * ANN) / inv if inv else 0.0
+    # To a year with each part over its own window (internal: the months up to the stock count;
+    # billed: the billing months) -- one factor for both is wrong once a new count moves one.
+    cogs_annual = da.yearly_cogs(internal_cogs6 if in_internal else 0.0, billed_total if in_billed else 0.0)
+    port_itr = cogs_annual / inv if inv else 0.0
     tv = df["turnover_annualized"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     movers = df[df["consumption_cost"] > 0]
     movers_itr = float(movers["turnover_annualized"].replace([np.inf, -np.inf], np.nan).clip(upper=60).mean()) if len(movers) else 0.0
@@ -304,7 +326,8 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
         internal_cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"), skus=("material", "nunique")).reset_index()
     g["billed_cogs"] = g["material_group"].map(billed_by_group).fillna(0.0)
     g["cogs"] = g["billed_cogs"] if scope == "billable" else (g["internal_cogs"] + g["billed_cogs"] if scope == "both" else g["internal_cogs"])
-    g["itr"] = np.where(g["inv"] > 0, g["cogs"] * ANN / g["inv"], 0.0)
+    g["itr"] = np.where(g["inv"] > 0, da.yearly_cogs(g["internal_cogs"] if in_internal else 0.0,
+                                                    g["billed_cogs"] if in_billed else 0.0) / g["inv"], 0.0)
     cats = [{"name": r["material_group"], "itr": float(r["itr"]), "cogs": float(r["cogs"]),
              "inv": float(r["inv"]), "skus": int(r["skus"])} for _, r in g.sort_values("inv", ascending=False).head(12).iterrows()]
 
@@ -345,7 +368,7 @@ def itr_insights(Plant: str = Query(None), Category: str = Query(None)):
 
     return {
         "timeline_billed_available": timeline_billed_available,
-        "totals": {"portfolio_itr": port_itr, "cogs_6mo": cogs6, "cogs_annual": cogs6 * ANN, "inventory": inv,
+        "totals": {"portfolio_itr": port_itr, "cogs_6mo": cogs6, "cogs_annual": cogs_annual, "inventory": inv,
                    "months_on_hand": (12.0 / port_itr) if port_itr else 0.0, "total_skus": int(len(df)),
                    "movers": int(len(movers)), "movers_itr": movers_itr},
         "categories": cats, "bands": bands, "timeline": timeline,
@@ -384,14 +407,15 @@ def itr(Plant: str = Query(None), Material: str = Query(None), MaterialGroup: st
     g = df.groupby("material_group", as_index=False).agg(
         cogs=("consumption_cost", "sum"), inv=("closing_stock_value", "sum"))
     g["billed_cogs"] = g["material_group"].map(billed_by_group).fillna(0.0)
-    g["cogs"] = g["cogs"] + g["billed_cogs"]
-    g["ITR"] = np.where(g["inv"] > 0, g["cogs"] * 2.0 / g["inv"], 0.0)
+    # each part to a year over its own window, as itr_insights does (da.yearly_cogs)
+    g["ITR"] = np.where(g["inv"] > 0, da.yearly_cogs(g["cogs"], g["billed_cogs"]) / g["inv"], 0.0)
     g = g.sort_values("ITR", ascending=False)
     # OPTIONAL, defaults to every group (unchanged prior behaviour) -- only the registry
     # chart (kpiRegistry "inventory-turnover-ratio" declares top:12) sends this.
     if top:
         g = g.head(top)
-    return [{"Year": 2026, "Month": "May", "Period": "May", "Material Group": r["material_group"],
+    year, month = _count_period()
+    return [{"Year": year, "Month": month, "Period": month, "Material Group": r["material_group"],
              "ITR": round(float(r["ITR"]), 2)} for _, r in g.iterrows()]
 
 
@@ -404,7 +428,7 @@ def itr_table(request: Request, Plant: str = Query(None), Category: str = Query(
     # alone) -- unlike itr()'s group-level aggregate above, which needs the fan-out-safe
     # additive pattern instead.
     df = _pc(da.health_scoped("both"), Plant, Category).copy()
-    df["year"] = 2026; df["period"] = "May"
+    df["year"], df["period"] = _count_period()
     return da.paginate("kpi_health_score", None, request.query_params, col_map={}, frame=df,
         columns=["year", "period", "material", "material_desc", "material_group", "consumption_cost",
                  "closing_stock_value", "turnover_annualized"],
@@ -770,8 +794,14 @@ def _inv_expiry(pl, cat=None):
     df = df[df["qty"] > 0]
     snap = pd.to_datetime(df["snapshot_date"], errors="coerce").max()
     if pd.isna(snap):
-        snap = pd.Timestamp("2026-05-31")
-    df["dte"] = (pd.to_datetime(df["expiry_date"], errors="coerce") - snap).dt.days
+        # No dated stock line in this cut (a hospital or category holding no stock): its ladder
+        # is empty, "as of" the network's own stock count, read from the data.
+        snap = da.stock_snapshot_date()
+    if pd.isna(snap):
+        # No stock count at all: nothing can be placed on the ladder, and no date is claimed.
+        df, snap = df.iloc[0:0].assign(dte=pd.Series(dtype=float)), None
+    else:
+        df["dte"] = (pd.to_datetime(df["expiry_date"], errors="coerce") - snap).dt.days
     df = df.dropna(subset=["dte"])
     bins = [-10**12, -1, 30, 90, 180, 365, 10**12]
     df["slab"] = pd.cut(df["dte"], bins=bins, labels=_EXP_SLAB_ORDER, right=True)
@@ -1130,7 +1160,7 @@ def _procurement_overview_cached(pl, cat=None):
     margin_pct = (margin_val / mrp_val * 100) if mrp_val else 0.0
 
     cards = {
-        "purchase-value": {"value": spend, "kind": "inr", "sub": "6-mo PO spend"},
+        "purchase-value": {"value": spend, "kind": "inr", "sub": f"{_months_held('kpi_purchase_value')} PO spend".strip()},
         "monthly-purchase-value": {"value": spend / max(len(timeline), 1), "kind": "inr", "sub": "avg / month"},
         "procurement-variance": {"value": last_mom, "kind": "pct", "sub": "latest MoM"},
         "vendor-volume-contribution": {"value": top5_share, "kind": "pct", "sub": "top-5 vendors"},
@@ -1740,7 +1770,8 @@ def _consumption_overview_cached(pl, cat=None):
     sg = uc.groupby(["material", "material_desc"], observed=True).agg(units=("total_units", "sum"), cost=("consumption_cost", "sum")).reset_index().sort_values("cost", ascending=False)
     skus = [{"material": str(r["material"]), "desc": str(r["material_desc"]), "units": float(r["units"]), "cost": float(r["cost"])} for _, r in sg.head(8).iterrows()]
     cards = {"unit-sold-per-sku": {"value": units, "kind": "num", "sub": "units consumed"},
-             "consumption-by-department": {"value": cost, "kind": "inr", "sub": "6-mo cost"}}
+             "consumption-by-department": {"value": cost, "kind": "inr",
+                                           "sub": f"{_months_held('kpi_units_consumed')} cost".strip()}}
     return {"totals": {"cost": cost, "units": units, "materials": int(uc["material"].nunique()),
                        "departments": int(dp["cost_ctr"].nunique()), "plants": int(uc["plant"].nunique()),
                        "avg_month": cost / max(len(timeline), 1), "last_mom": last_mom, "dept_top5": dept_top5},

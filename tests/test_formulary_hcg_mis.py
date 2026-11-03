@@ -6,6 +6,7 @@ Sep-26 MIS has: the Apr-26 non-onco OOF repeating the onco value in the FY sheet
 actuals on two formulas, an unmarked % block, a label with the wrong year, a block pasted
 twice, and a month (Jul-26) that only the FY sheet has.
 """
+import json
 from datetime import datetime
 
 import openpyxl
@@ -190,6 +191,85 @@ def test_latest_workbook_is_read_and_two_for_one_month_abort(tmp_path):
     write_mis(tmp_path, name="Onco and Non Onco Formulary Compliance Sep 2026 - MIS.xlsx")
     with pytest.raises(BuildError, match="two MIS workbooks for 2026-09"):
         hcg_mis.find_mis(raw)
+
+
+# ---------- files the MIS build does not read: named with the reason, never in silence ----------
+MIS_DIR = ("x", DASH, "HCG MIS")
+
+
+def _touch(raw, name):
+    (raw.joinpath(*MIS_DIR) / name).write_bytes(b"not a workbook")    # never opened
+
+
+def test_files_of_other_types_are_named_and_the_build_goes_on(tmp_path):
+    raw = write_mis(tmp_path)
+    _touch(raw, "Onco and Non Onco Formulary Compliance Oct 26 - MIS.xls")
+    _touch(raw, "MIS cover note.pdf")
+    for lock in ("~$Onco and Non Onco Formulary Compliance Sep 26 - MIS.xlsx",
+                 ".~lock.Onco and Non Onco Formulary Compliance Sep 26 - MIS.xlsx#"):
+        _touch(raw, lock)                                           # lock files: not HCG's, no word
+    skipped: list = []
+    latest, every = hcg_mis.find_mis(raw, skipped)
+    assert latest.period == "2026-09" and len(every) == 1             # Sep is read, not the .xls Oct
+    assert [str(s) for s in skipped] == [
+        "HCG MIS/MIS cover note.pdf is not read: not an Excel workbook (.pdf): only .xlsx and .xlsb files are read",
+        "HCG MIS/Onco and Non Onco Formulary Compliance Oct 26 - MIS.xls is not read: "
+        + hcg_mis.C.SKIPPED_SUFFIX_REASONS[".xls"]]
+    assert hcg_mis.find_mis(raw) == (latest, every)                  # no list given: same answer
+    logs: list = []
+    report = hcg_mis.build(raw=raw, data=tmp_path / "data", log=logs.append)
+    assert report["warnings"] == [str(s) for s in skipped]
+    assert f"note: {skipped[1]}" in logs
+    published = json.loads((tmp_path / "data" / hcg_mis.C.MIS_VALIDATION_FILE).read_text())
+    assert published["warnings"] == report["warnings"] and published["file_period"] == "2026-09"
+
+
+def test_a_sub_folder_of_the_mis_folder_is_named(tmp_path):
+    raw = write_mis(tmp_path)
+    older = raw.joinpath(*MIS_DIR) / "Oct 26"
+    older.mkdir()
+    (older / "Onco and Non Onco Formulary Compliance Oct 26 - MIS.xlsx").write_bytes(b"x")    # never opened
+    skipped: list = []
+    latest, every = hcg_mis.find_mis(raw, skipped)
+    assert latest.period == "2026-09" and len(every) == 1             # the MIS in a sub-folder is not read
+    assert [str(s) for s in skipped] == [
+        "HCG MIS/Oct 26 is not read: a sub-folder (the build reads only the files directly in 'HCG MIS'): "
+        "move its files up into 'HCG MIS'"]
+
+
+def test_a_workbook_not_named_like_the_mis_is_named_too(tmp_path):
+    raw = write_mis(tmp_path)
+    assert hcg_mis.build(raw=raw, data=tmp_path / "data", log=lambda *_: None)["warnings"] == []
+    # HCG's next MIS, renamed: Sep stays the one read, and the report says why Oct is not
+    (raw.joinpath(*MIS_DIR) / "Formulary MIS Oct 26.xlsx").write_bytes(b"x")    # never opened
+    report = hcg_mis.build(raw=raw, data=tmp_path / "data", log=lambda *_: None)
+    assert report["file_period"] == "2026-09"
+    assert report["warnings"] == [f"HCG MIS/Formulary MIS Oct 26.xlsx is not read: {hcg_mis.NOT_MIS_REASON}"]
+    # with no MIS left, the abort names it
+    (raw.joinpath(*MIS_DIR) / "Onco and Non Onco Formulary Compliance Sep 26 - MIS.xlsx").unlink()
+    with pytest.raises(BuildError, match=r"no MIS workbook found: .*; not read: 'Formulary MIS Oct 26.xlsx' "
+                                         r"\(not named like HCG's MIS workbook"):
+        hcg_mis.find_mis(raw)
+
+
+def test_an_mis_sent_in_the_wrong_format_is_named_in_the_abort(tmp_path):
+    raw = write_mis(tmp_path)
+    sep = raw.joinpath(*MIS_DIR) / "Onco and Non Onco Formulary Compliance Sep 26 - MIS.xlsx"
+    sep.rename(sep.with_suffix(".xls"))
+    with pytest.raises(BuildError, match=r"no MIS workbook found: .*; not read: 'Onco and Non Onco Formulary "
+                                         r"Compliance Sep 26 - MIS.xls' \(an Excel 97-2003 workbook"):
+        hcg_mis.build(raw=raw, data=tmp_path / "data", log=lambda *_: None)
+    assert not (tmp_path / "data").exists()
+
+
+def test_list_names_the_files_not_read(tmp_path, capsys):
+    raw = write_mis(tmp_path)
+    _touch(raw, "Onco and Non Onco Formulary Compliance Oct 26 - MIS.csv")
+    assert hcg_mis.main(["--list", "--raw", str(raw)]) == 0
+    out = capsys.readouterr().out
+    assert "2026-09" in out and "<- read" in out
+    assert ("note: HCG MIS/Onco and Non Onco Formulary Compliance Oct 26 - MIS.csv is not read: "
+            + hcg_mis.C.SKIPPED_SUFFIX_REASONS[".csv"]) in out
 
 
 # ---------- the API's unit budgets ----------

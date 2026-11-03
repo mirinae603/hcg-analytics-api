@@ -13,6 +13,10 @@ repo) -> classify with that month's Item Master, the Payer Master and our refere
 -> aggregate -> validate. Only when every month passes are the tables published, into
 FORMULARY_DATA_DIR: written to temp files, then os.replace'd; rebuilding some months
 replaces only those months' rows. formulary_validation.json is written last.
+
+A run that keeps months from the published tables stops before it reads any workbook (a dry
+run too) when a table lacks one of them, e.g. a table added after the last publish
+(check_kept_months); the message names the command that rebuilds every month.
 """
 from __future__ import annotations
 
@@ -46,9 +50,14 @@ SORT_KEYS = {
     C.RULE_BREACH: ["measure", "period", "plant", "patient_type", "payer_bucket", "doctor_id",
                     "material"],
     C.RULE_BOOK: ["period", "material"],
+    C.SALES_ITEMS: ["period", "plant", "patient_type", "payer_bucket", "material"],
 }
-INT_COLS = ("lines",)
-FLOAT_COLS = ("cost", "mrp", "qty")
+INT_COLS = ("lines", "cost_missing_lines")
+FLOAT_COLS = ("cost", "mrp", "qty", "mrp_cost_missing")
+# The tables that hold every published line: a month of formulary_summary is in sales_items too
+# (validate checks that they add up). The other tables hold a part of the lines (drugs, out-of-
+# and non-formulary items, brand-rule measures) and can lack a month.
+EVERY_LINE_TABLES = (C.SUMMARY, C.SALES_ITEMS)
 
 
 def _log(msg: str) -> None:
@@ -85,17 +94,76 @@ def _tidy(name: str, df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(SORT_KEYS[name], kind="stable").reset_index(drop=True)
 
 
+def published_periods(data=None) -> dict:
+    """table -> the months its published file holds (None: never published). Reads the period
+    column only."""
+    d = C.data_dir(data)
+    return {name: (set(pd.read_parquet(d / f"{name}.parquet", columns=["period"])["period"].astype(str))
+                   if (d / f"{name}.parquet").exists() else None)
+            for name in C.TABLES}
+
+
+def table_gaps(published: dict, periods) -> tuple:
+    """(the months a run of `periods` keeps from the published tables, what the tables lack for
+    them). published: published_periods. Publishing would leave a kept month silently missing
+    from a table never published (sales_items, added after the first publish) or from one of
+    EVERY_LINE_TABLES that lacks it (a file restored from an older copy)."""
+    keeping = sorted(set().union(*(p for p in published.values() if p)) - set(periods))
+    gaps = []
+    for name in C.TABLES if keeping else ():
+        have = published[name]
+        if have is None:
+            gaps.append(f"{name} has not been published before")
+        elif name in EVERY_LINE_TABLES and set(keeping) - have:
+            gaps.append(f"{name} holds no rows for {', '.join(sorted(set(keeping) - have))}")
+    return keeping, gaps
+
+
+def rebuild_advice(published: dict, *, cached, sales, from_cache: bool) -> str:
+    """The command that rebuilds every published month in one run, so every table covers them:
+    from the line cache when it holds them all (seconds), else from HCG's sales workbooks (`sales`:
+    the months the raw folder has a workbook for), once every month's workbook is in the folder."""
+    months = set().union(*(p for p in published.values() if p))
+    if months <= set(cached):
+        return "python -m app.etl.formulary --from-cache" + ("" if from_cache else ", then run this build again")
+    uncached = ", ".join(sorted(months - set(cached)))
+    gone = sorted(months - set(sales))
+    if gone:
+        return (f"put the sales workbook of {', '.join(gone)} back in the 'IP and OP sales' folder, then "
+                f"python -m app.etl.formulary (not in the line cache: {uncached})")
+    return (f"python -m app.etl.formulary (it reads every month's sales workbook again; not in the line "
+            f"cache: {uncached})")
+
+
+def check_kept_months(periods, manifest, *, cache=None, data=None, from_cache: bool = False) -> None:
+    """Stop before any workbook is read (a dry run too) when publishing `periods` would leave a
+    month the run keeps missing from a table (table_gaps), naming the command that rebuilds every
+    month (rebuild_advice)."""
+    published = published_periods(data)
+    keeping, gaps = table_gaps(published, periods)
+    if gaps:
+        raise BuildError(
+            f"{'; '.join(gaps)}, and this run keeps {', '.join(keeping)} from the published tables: every "
+            f"table must cover the same months, so rebuild every month: "
+            + rebuild_advice(published, cached=cached_periods(cache), sales=manifest.sales,
+                             from_cache=from_cache))
+
+
 def merge_tables(results: list, data=None) -> dict:
     """New months' rows + the published rows of every other month, with one doctor name
     per (plant, doctor_id) across all of them."""
     d = C.data_dir(data)
     periods = {r.period for r in results}
     merged = {}
-    kept = {}
-    for name in C.TABLES:
-        path = d / f"{name}.parquet"
-        old = pd.read_parquet(path) if path.exists() else None
-        kept[name] = (old[~old["period"].isin(periods)] if old is not None else None)
+    old = {name: (pd.read_parquet(d / f"{name}.parquet") if (d / f"{name}.parquet").exists() else None)
+           for name in C.TABLES}
+    # build() stops on these before it reads a workbook (check_kept_months); checked again on the
+    # files merged, so no caller publishes a table with a month it keeps missing.
+    _, gaps = table_gaps({name: None if df is None else set(df["period"].astype(str))
+                          for name, df in old.items()}, periods)
+    if gaps:
+        raise BuildError("; ".join(gaps) + ": rebuild every month, so every table covers the same months")
+    kept = {name: (df[~df["period"].isin(periods)] if df is not None else None) for name, df in old.items()}
     # most frequent spelling: exact line counts for the months being built, the published
     # rows' line counts for the months kept
     counts = [r.doctor_names for r in results]
@@ -150,8 +218,11 @@ def publish(merged: dict, report: dict, data=None) -> dict:
     return sizes
 
 
-def full_report(month_reports: dict, pm, overrides, hospitals, data=None, rules=()) -> dict:
-    """The new months' reports merged into the published validation file."""
+def full_report(month_reports: dict, pm, overrides, hospitals, data=None, rules=(), warnings=()) -> dict:
+    """The new months' reports merged into the published validation file. `warnings` are this
+    run's discovery notes (manifest.warnings): the files in HCG's folders it did not read and
+    why, and an Item Master with no sales month. They describe the raw folder as it is now, so
+    they are not kept from the last report; each month's own warnings are in its report."""
     vpath = C.data_dir(data) / C.VALIDATION_FILE
     old = {}
     if vpath.exists():
@@ -167,6 +238,7 @@ def full_report(month_reports: dict, pm, overrides, hospitals, data=None, rules=
         "generator": "python -m app.etl.formulary",
         "periods": list(months),
         "latest": max(months) if months else None,
+        "warnings": list(warnings),
         "rules": {
             "category": "first digit of MATERIALCODE: 1 Onco Drugs, 2 Other Drugs, 3 Consumables",
             "formulary_class": "same month's Item Master: FORMULARY+Category | NON FORMULARY | "
@@ -202,6 +274,8 @@ def build(months=None, *, raw=None, cache=None, data=None, reference=None,
         log(f"[formulary] note: {w}")
     available = cached_periods(cache) if from_cache else list(manifest.sales)
     periods = select_periods(manifest, months, available)
+    if not limit:                  # a --limit run never publishes; a dry run stops where the real one would
+        check_kept_months(periods, manifest, cache=cache, data=data, from_cache=from_cache)
     hospitals = load_hospital_map(reference)
     overrides = load_payer_overrides(reference)
     pm = load_payer_master(manifest.payer_master)
@@ -241,13 +315,13 @@ def build(months=None, *, raw=None, cache=None, data=None, reference=None,
                 log(summary_line(rep))
                 problems = V.abort_reasons(rep)
                 if problems:
-                    _save_failed(reports, pm, overrides, hospitals, cache, data, rules)
+                    _save_failed(reports, pm, overrides, hospitals, cache, data, rules, manifest.warnings)
                     raise BuildError("validation failed, nothing published:\n  "
                                      + "\n  ".join(problems))
         finally:
             con.close()
 
-    report = full_report(reports, pm, overrides, hospitals, data, rules)
+    report = full_report(reports, pm, overrides, hospitals, data, rules, manifest.warnings)
     if publishing:
         merged = merge_tables(results, data)
         sizes = publish(merged, report, data)
@@ -265,11 +339,11 @@ def build(months=None, *, raw=None, cache=None, data=None, reference=None,
     return report
 
 
-def _save_failed(reports, pm, overrides, hospitals, cache, data, rules=()) -> None:
+def _save_failed(reports, pm, overrides, hospitals, cache, data, rules=(), warnings=()) -> None:
     try:
         out = C.cache_dir(cache) / "formulary_validation.failed.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(full_report(reports, pm, overrides, hospitals, data, rules),
+        out.write_text(json.dumps(full_report(reports, pm, overrides, hospitals, data, rules, warnings),
                                   indent=1, ensure_ascii=False) + "\n")
         _log(f"[formulary] failing report saved to {out}")
     except Exception:

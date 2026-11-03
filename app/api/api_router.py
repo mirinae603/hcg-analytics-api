@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.api import kpi_generic, sales_forecast_kpi, replenishment_and_aging_risk
 from app.api import dashboard_summary, legacy_kpi, authenticate, chat, formulary, spend, brand_rules, consumables
-from app.api import purchase_insights
+from app.api import purchase_insights, revenue, exports, executive
 from app.ai import router as ai_router
 from app.core.deps import get_current_user
 
@@ -30,6 +30,12 @@ api_router.include_router(brand_rules.router, dependencies=_login, tags=["Brand 
 api_router.include_router(spend.router, dependencies=_login, tags=["Spend Analysis"])
 # Spend analysis on HCG's purchases (GRN): price variation and generic vs branded
 api_router.include_router(purchase_insights.router, dependencies=_login, tags=["Spend Analysis"])
+# Revenue and margin of HIS pharmacy sales, IP and OP, by unit and formulary bucket
+api_router.include_router(revenue.router, dependencies=_login, tags=["Revenue & Margin"])
+# Data exports: IP & OP sales by item and GRN purchases (paged tables the UI exports as CSV)
+api_router.include_router(exports.router, dependencies=_login, tags=["Data Exports"])
+# Executive overview: the first screen (KPIs, units, bridge, insights and actions)
+api_router.include_router(executive.router, dependencies=_login, tags=["Executive Overview"])
 # Consumables issued to each department (SAP cost centre), on the Consumption page
 api_router.include_router(consumables.router, dependencies=_login, tags=["Consumables by Department"])
 

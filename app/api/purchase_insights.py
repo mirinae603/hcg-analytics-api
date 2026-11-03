@@ -5,10 +5,15 @@ settings.PURCHASE_DATA_DIR (no GR, PO or invoice number and no line-level row re
 or this process):
 
     GET /spend/prices/overview   -> price variation: headline, the products that cost most
-                                    above their cheapest price (Molecule= picks one: its
+                                    above their usual cheapest price (Molecule= picks one: its
                                     purchases and vendors), every hospital, the biggest
-                                    vendors' price index, every month, what was not compared
-    GET /spend/prices/molecules  -> {data,total,sums} per product (Contract A)
+                                    vendors' price index, every month, what was not compared,
+                                    the unusually low prices to check, the rule's thresholds
+    GET /spend/prices/molecules  -> {data,total,sums} per product (Contract A), with the rule's
+                                    thresholds (`rule`, as on the overview)
+    GET /spend/prices/low        -> {data,total,sums} every unusually low purchase to check, one
+                                    row per hospital x brand x supplier (Contract A; the
+                                    overview's low_prices lists the first TOP_N of the same)
     GET /spend/generic/overview  -> generic vs branded: headline, every month, every hospital,
                                     onco / non-onco, each side by formulary class (months with
                                     their own Item Master), the branded products a generic of
@@ -24,17 +29,23 @@ app/etl/purchase/molecule.py reads the Item Master's minor group and description
 price is the price after discount (Total Amount without tax / GR Qty). Only rows with a
 comparable unit price (price_status ok) and a product key are compared; `value` counts every
 row. The cheapest is the product's USUAL cheapest price in the page's scope (hospital,
-months, segment): the lowest unit price at which at least prices.USUAL_SHARE of its quantity
-was bought (prices.usual_cheapest), so one odd purchase cannot set it; Vendor= and Material=
+months, segment): the unit price reached once at least prices.USUAL_SHARE of its quantity has
+been counted, cheapest purchase first (prices.usual_cheapest), so one odd cheap purchase cannot
+set it — the price it names can itself hold less than that share; Vendor= and Material=
 narrow whose purchases are set against it. Extra paid = Σ over purchases of what each paid
 above the cheapest, max(0, value - cheapest x qty); price index = Σ value / Σ (cheapest x qty)
-(1.00 = always at the cheapest; under 1 for a vendor that sold under it). A purchase under
-prices.LOW_RATIO x the cheapest is unusually low: still compared, and listed (low_prices) for
-HCG to check. A vendor
-is a supplier as HCG names it ('Goods supplier name', spacing and case aside): one supplier
-holds several SAP supplier codes (Vardhman Health Specialities has one per region).
+(1.00 = always at the cheapest; under 1 for a vendor or hospital that bought under it — the
+usual cheapest is not the lowest price). A purchase under prices.LOW_RATIO x the cheapest is
+unusually low: still compared, and listed (low_prices) for HCG to check. Both flags a product's
+purchases carry are read per purchase_prices row (one month x SAP supplier code) and reported
+per hospital x brand x supplier (LOW_KEYS): such a group is unusually low when ANY of its rows
+is, and sets the cheapest when any of its rows is priced at it — so a product's purchases
+(points), its low_rows, the headline's low_rows and the low_prices list all count the same
+groups, whatever the months selected. A vendor is a supplier as HCG names it ('Goods supplier
+name', spacing and case aside): one supplier holds several SAP supplier codes (Vardhman Health
+Specialities has one per region).
 
-Generic vs branded ('Estimated definition' until HCG confirms it): branded = an originator
+Generic vs branded ('Estimated definition', the app's own reading): branded = an originator
 company's product (app/data/reference/originator_manufacturers.csv, generic_overrides.csv);
 generic = every other product. Extra vs generic = what the branded purchases cost above the
 usual cheapest generic price of the same product that month (any hospital), worked out per
@@ -79,6 +90,9 @@ SEGMENT_LABELS = F.SEGMENT_LABELS
 MOLECULE_LIMIT, MOLECULE_MAX = 100, 500      # products the overview sends for its chart
 TOP_N = 10                                   # vendors and branded products listed (HCG's top 10)
 PRICE_DECIMALS = P.UNIT_PRICE_DECIMALS
+# A row is priced AT the usual cheapest when its own price (value / qty) is within this share of
+# it: the cheapest is read from such a row, so this only absorbs floating-point noise.
+CHEAPEST_TOLERANCE = 1e-9
 
 # Why a purchase's unit price is not compared: the build's price statuses, or no product key.
 NO_PRODUCT = "no_product"
@@ -175,23 +189,7 @@ def _periods(name: str) -> list:
 
 
 def _months_arg(month, periods: list) -> tuple:
-    s = F._str(month)
-    if s is None:
-        return tuple(periods[-1:])          # latest month, like HCG's monthly report
-    if s.upper() == "ALL":
-        return tuple(periods)
-    out = []
-    for m in (x.strip() for x in s.split(",")):
-        if not m:
-            continue
-        if not F._PERIOD_RE.match(m):
-            F._bad(f"Invalid Month '{m}'. Use YYYY-MM, a comma list of them, or ALL")
-        if m not in periods:
-            F._bad(f"No purchase data for {m}. Available months: {', '.join(periods)}")
-        out.append(m)
-    if not out:
-        F._bad("Month is empty. Use YYYY-MM, a comma list of them, or ALL")
-    return tuple(sorted(set(out)))
+    return F._months_arg(month, periods, "purchase")
 
 
 def _segment_arg(segment, category) -> Optional[str]:
@@ -286,29 +284,35 @@ def months_meta() -> dict:
 
 NOTE_SCOPE = ("Purchases: the goods receipts HCG's out-of-formulary workings count{steps} ({file}); every month "
               "with a GRN file, every formulary class.")
+# The usual cheapest's share as the pages print the rule ('10%', '12.5%': spend insights.tsx
+# rulePct), from the build's own constant, so these notes and the UI's Method say the same.
+USUAL_SHARE_TEXT = f"{round(P.USUAL_SHARE * 100, 2):g}%"
 NOTE_PRICE_VALUES = ("Unit price = the price after discount (Total Amount without tax ÷ GR Qty). A product is one "
                      "molecule, strength, form and kind (e.g. CETUXIMAB 100MG injection): its brands are the same "
-                     f"medicine. Cheapest = the usual cheapest price in this selection: the lowest unit price at "
-                     f"which at least {P.USUAL_SHARE:.0%} of the product's quantity was bought, so one odd purchase "
-                     f"cannot set it. Extra paid = what each purchase paid above it; price index = paid ÷ the same "
-                     f"quantity at the cheapest (1.00 = always the cheapest). A purchase under "
-                     f"{P.LOW_RATIO:.0%} of the cheapest is listed as an unusually low price to check.")
+                     f"medicine. Cheapest = the usual cheapest price in this selection: the unit price reached once "
+                     f"at least {USUAL_SHARE_TEXT} of the product's units have been counted, cheapest purchase "
+                     f"first, so one odd cheap purchase cannot set it. Extra paid = what each purchase paid above "
+                     f"it (a purchase below it adds nothing); price index = paid ÷ the same quantity at the usual "
+                     f"cheapest (1.00 = at the usual cheapest; under 1.00 = bought below it, as a supplier or "
+                     f"hospital with cheaper purchases can be). A purchase under {P.LOW_RATIO:.0%} of the usual "
+                     f"cheapest is listed as an unusually low price to check, one row per hospital × brand × "
+                     f"supplier.")
 NOTE_PRICE_MONTHS = ("Several months are selected: the cheapest is the usual cheapest over all of them, so the "
                      "extra paid differs from the months' own figures added up.")
-NOTE_PRICE_VIEWS = ("Every month ignores the Month filter and sets each month against its own cheapest; the "
-                    "hospital ranking ignores the hospital selector and sets each hospital against the cheapest "
-                    "price any hospital paid.")
+NOTE_PRICE_VIEWS = ("Every month ignores the Month filter and sets each month against its own usual cheapest; the "
+                    "hospital ranking ignores the hospital selector and sets each hospital against the usual "
+                    "cheapest of all hospitals together, which can be above or below a hospital's own.")
 NOTE_NOT_COMPARED = "Not compared (counted in the value only): " + "; ".join(NOT_COMPARED.values()) + "."
-NOTE_DRILL = ("A vendor or brand is selected: only its purchases are counted, set against the cheapest price "
-              "anyone paid in the selection.")
+NOTE_DRILL = ("A vendor or brand is selected: only its purchases are counted, set against the usual cheapest of "
+              "the whole selection (every vendor and brand).")
 NOTE_IGNORED = "Purchases have no patient type or payer, so the {filters} filter does not apply to this section."
 NOTE_MONTHS = ("Several months are selected: amounts are summed first and the % is taken once — never an "
                "average of monthly percentages.")
 NOTE_GENERIC_VALUES = ("Value = Total Amount without tax (the price after discount). Extra vs generic: a branded "
                        "purchase of a product also bought as a generic that month (at any hospital) counts its unit "
-                       f"price above the usual cheapest generic price (the lowest at which at least "
-                       f"{P.USUAL_SHARE:.0%} of the generic quantity was bought) × the quantity; % = that ÷ the "
-                       f"branded value set against a generic.")
+                       f"price above the usual cheapest generic price (the generic price reached once at least "
+                       f"{USUAL_SHARE_TEXT} of that month's generic units have been counted, cheapest purchase "
+                       f"first) × the quantity; % = that ÷ the branded value set against a generic.")
 NOTE_GENERIC_VIEWS = ("Every month ignores the Month filter, the hospital ranking ignores the hospital selector and "
                       "onco / non-onco ignores the segment filter.")
 NOTE_COMPLIANCE = ("The formulary split uses each month's own Item Master, so it covers {months} only — "
@@ -330,6 +334,25 @@ def _ignored_notes(ignored: tuple) -> list:
     return [NOTE_IGNORED.format(filters=" / ".join(ignored))] if ignored else []
 
 
+def _price_rule() -> dict:
+    """The price benchmark's thresholds (app/etl/purchase/prices.py) as percentages, so the page
+    words them from here and never hardcodes them: usual_share_pct — the usual cheapest is the
+    price reached once at least this share of the product's quantity has been counted, cheapest
+    purchase first;
+    low_ratio_pct — a purchase under this share of the usual cheapest is unusually low;
+    spread_min_pct — a product whose dearest is at least this far above the usual cheapest is
+    'Dearest above the usual cheapest' (varies)."""
+    return {"usual_share_pct": F._pct(P.USUAL_SHARE * 100), "low_ratio_pct": F._pct(P.LOW_RATIO * 100),
+            "spread_min_pct": F._pct(P.SPREAD_MIN * 100)}
+
+
+def _generic_rule() -> dict:
+    """The same block for the generic benchmark, the usual cheapest generic (generic.py reads it
+    with prices.usual_cheapest when the table is built): generic vs branded flags no purchase as
+    unusually low and reports no spread, so those two are None."""
+    return {"usual_share_pct": F._pct(P.USUAL_SHARE * 100), "low_ratio_pct": None, "spread_min_pct": None}
+
+
 # ── Price variation ───────────────────────────────────────────────────────────
 PRODUCT_COLUMNS = ["molecule_key", "minor_group", "molecule", "strength", "form", "kind", "category",
                    "cheapest_price", "min_price", "max_price", "wavg_price", "spread_ratio", "price_index",
@@ -345,7 +368,12 @@ CHART_COLUMNS = ["molecule_key", "minor_group", "molecule", "strength", "form", 
 VENDOR_COLUMNS = ["vendor_name", "vendor_codes", "value", "at_cheapest", "extra_paid", "price_index", "share_pct",
                   "molecules", "brands", "plants", "lines"]
 POINT_COLUMNS = ["plant", "plant_name", "material", "material_desc", "vendor_name", "unit_price", "unit_price_min",
-                 "unit_price_max", "qty", "value", "lines", "unusually_low"]
+                 "unit_price_max", "qty", "value", "lines", "unusually_low", "sets_cheapest"]
+# One product's purchases are shown and checked per hospital x brand x supplier (a supplier by
+# name: all its SAP codes, all the months selected); the low_rows counts and the low_prices list
+# count these groups too, as the purchase build's report does (prices.LOW_GROUP).
+POINT_KEYS = list(P.LOW_GROUP)
+LOW_KEYS = ["molecule_key", *POINT_KEYS]
 LOW_COLUMNS = ["molecule_key", "minor_group", "strength", "form", "plant", "plant_name", "material", "material_desc",
                "vendor_name", "unit_price", "cheapest_price", "qty", "value", "below_cheapest", "lines"]
 _PRICE_FIELDS = ("cheapest_price", "min_price", "max_price", "wavg_price", "spread_ratio", "price_index",
@@ -382,6 +410,15 @@ def _extra(rows: pd.DataFrame, cheapest: pd.Series) -> pd.Series:
     return P.extra_paid(rows, _row_cheapest(rows, cheapest))
 
 
+def _sets_cheapest(rows: pd.DataFrame, cheapest: pd.Series) -> pd.Series:
+    """Whether each compared row is priced at its product's usual cheapest (`cheapest`: per
+    molecule_key): its own price, value / qty as prices.usual_cheapest reads it, within
+    CHEAPEST_TOLERANCE of it. These are the purchases the benchmark was read from (the page
+    marks them); a row's min / max unit price would miss them, as the row price is an average."""
+    ref = _row_cheapest(rows, cheapest)
+    return ((P.row_prices(rows) - ref).abs() <= CHEAPEST_TOLERANCE * ref.abs()).astype(bool)
+
+
 def _round_prices(df: pd.DataFrame, cols=_PRICE_FIELDS) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
@@ -397,18 +434,21 @@ def _empty_products() -> pd.DataFrame:
 def _products(rows: pd.DataFrame, cheapest: pd.DataFrame) -> pd.DataFrame:
     """One row per product of the compared `rows` (PRODUCT_COLUMNS): P.products' price range,
     value-weighted price and counts, set against `cheapest` (_cheapest of the scope) — spread =
-    dearest / cheapest, price index, extra paid and its share of the whole; most extra paid
-    first."""
+    dearest / cheapest, price index, extra paid and its share of the whole, and its unusually low
+    prices: low_rows = the hospital x brand x supplier groups with one (LOW_KEYS, as the
+    headline and low_prices count them, so the products add up to the headline), low_value =
+    what those low rows cost; most extra paid first."""
     view = P.products(rows)
     if view.empty:
         return _empty_products()
     low = P.unusually_low(rows, _row_cheapest(rows, cheapest["cheapest_price"]))
-    info = (rows.assign(_extra=_extra(rows, cheapest["cheapest_price"]), _low=low.astype(int),
+    info = (rows.assign(_extra=_extra(rows, cheapest["cheapest_price"]),
                         _low_value=rows["value"].where(low, 0.0))
             .groupby("molecule_key").agg(molecule=("molecule", "first"), kind=("kind", "first"),
                                          category=("category", "first"), lines=("lines", "sum"),
-                                         extra_paid=("_extra", "sum"), low_rows=("_low", "sum"),
-                                         low_value=("_low_value", "sum")))
+                                         extra_paid=("_extra", "sum"), low_value=("_low_value", "sum")))
+    groups = rows.loc[low, LOW_KEYS].drop_duplicates()
+    info["low_rows"] = groups["molecule_key"].value_counts().reindex(info.index, fill_value=0)
     out = (view.drop(columns=["cheapest_price", "spread_ratio", "extra_paid", "low_rows", "low_value"])
            .join(info, on="molecule_key").join(cheapest, on="molecule_key"))
     cheap = out["cheapest_price"].astype(float)
@@ -427,30 +467,33 @@ def _products(rows: pd.DataFrame, cheapest: pd.DataFrame) -> pd.DataFrame:
 
 
 def _vendors(rows: pd.DataFrame, cheapest: pd.Series) -> pd.DataFrame:
-    """One row per vendor of the compared `rows` (VENDOR_COLUMNS + qty): what it was paid, the
-    same purchases at each product's cheapest price, the extra paid and the price index;
-    biggest first."""
+    """One row per vendor of the compared `rows` (VENDOR_COLUMNS + qty, sets_cheapest): what it
+    was paid, the same purchases at each product's cheapest price, the extra paid, the price
+    index (under 1 for a vendor that sold under the usual cheapest) and whether any of its rows
+    is priced at the usual cheapest; biggest first."""
     if rows.empty:
-        return pd.DataFrame(columns=VENDOR_COLUMNS + ["qty"])
+        return pd.DataFrame(columns=VENDOR_COLUMNS + ["qty", "sets_cheapest"])
     v = rows.assign(at_cheapest=_at_cheapest(rows, cheapest), extra=_extra(rows, cheapest),
-                    qty=rows["qty"].astype(float))
+                    qty=rows["qty"].astype(float), sets=_sets_cheapest(rows, cheapest))
     g = v.groupby("vendor").agg(vendor_name=("vendor_name", "last"),
                                 vendor_codes=("vendor_code", lambda s: sorted(s.astype(str).unique())),
                                 value=("value", "sum"), at_cheapest=("at_cheapest", "sum"), qty=("qty", "sum"),
                                 extra_paid=("extra", "sum"), molecules=("molecule_key", "nunique"),
                                 brands=("material", "nunique"), plants=("plant", "nunique"),
-                                lines=("lines", "sum")).reset_index()
+                                lines=("lines", "sum"), sets_cheapest=("sets", "any")).reset_index()
     g["price_index"] = g["value"] / g["at_cheapest"].where(g["at_cheapest"] != 0)
     tot = float(g["value"].sum())
     g["share_pct"] = g["value"] / tot * 100 if tot else np.nan
     g = _round_prices(F._round(g, money=("value", "at_cheapest", "extra_paid"), pct=("share_pct",), qty=("qty",)))
     g = g.sort_values(["value", "vendor"], ascending=[False, True], kind="mergesort")
-    return g[VENDOR_COLUMNS + ["qty"]].reset_index(drop=True)
+    return g[VENDOR_COLUMNS + ["qty", "sets_cheapest"]].reset_index(drop=True)
 
 
 def _by_hospital(every: pd.DataFrame, network: pd.DataFrame, sc: Scope) -> list:
-    """Every hospital's compared purchases set against the cheapest price ANY hospital paid in
-    the same months (the ranking ignores the hospital selector): most extra paid first."""
+    """Every hospital's compared purchases set against the usual cheapest of ALL hospitals in the
+    same months (the ranking ignores the hospital selector): most extra paid first. That
+    benchmark can be above or below a hospital's own usual cheapest, so its row can be below or
+    above the hospital's own headline, and its price index under 1."""
     if every.empty:
         return []
     names = _names()
@@ -471,7 +514,8 @@ def _by_hospital(every: pd.DataFrame, network: pd.DataFrame, sc: Scope) -> list:
 
 def _by_month(rows: pd.DataFrame, base: pd.DataFrame, periods: list) -> list:
     """Every month of the selection's purchases (the Month filter aside), each set against its
-    own month's cheapest: value, compared value, extra paid, products and how many varied."""
+    own month's usual cheapest: value, compared value, extra paid, products and how many had
+    their dearest above it (varies)."""
     comp, ref = _compared(rows), _compared(base)
     cheapest = P.usual_cheapest(ref.assign(_price=P.row_prices(ref)), ["period", "molecule_key"], "_price")["_price"]
     keys = pd.MultiIndex.from_arrays([comp["period"], comp["molecule_key"]])
@@ -507,17 +551,22 @@ def _not_compared(rows: pd.DataFrame) -> list:
              "value": F._money(g.loc[k, "value"]) if k in g.index else 0.0} for k, label in NOT_COMPARED.items()]
 
 
-def _low_prices(comp: pd.DataFrame, cheapest: pd.DataFrame) -> dict:
-    """The selection's purchases priced unusually low (prices.unusually_low: under LOW_RATIO x
-    their product's usual cheapest) per hospital x brand x vendor: how many, what they cost,
-    and the biggest TOP_N by how far under the cheapest they were bought. Still compared — a
-    one-off deal or a keying slip for HCG to check, never the benchmark."""
-    flag = P.unusually_low(comp, _row_cheapest(comp, cheapest["cheapest_price"]))
-    rows = comp[flag]
+def _low_rows(comp: pd.DataFrame, cheapest: pd.DataFrame) -> pd.DataFrame:
+    """The compared rows priced unusually low (prices.unusually_low: under LOW_RATIO x their
+    product's usual cheapest)."""
+    return comp[P.unusually_low(comp, _row_cheapest(comp, cheapest["cheapest_price"]))]
+
+
+def _low_groups(rows: pd.DataFrame, cheapest: pd.DataFrame) -> pd.DataFrame:
+    """The unusually low `rows` (_low_rows) per hospital x brand x supplier (LOW_KEYS; each
+    group's figures are its low rows only), LOW_COLUMNS, furthest under the cheapest first:
+    the list HCG checks, a one-off deal or a keying slip, never the benchmark."""
     if rows.empty:
-        return {"rows": 0, "value": 0.0, "products": 0, "items": []}
+        return pd.DataFrame({c: pd.Series(dtype=float if c in ("unit_price", "cheapest_price", "qty", "value",
+                                                                "below_cheapest") else
+                                          "int64" if c == "lines" else object) for c in LOW_COLUMNS})
     g = (rows.assign(qty=rows["qty"].astype(float))
-         .groupby(["molecule_key", "plant", "material", "vendor"])
+         .groupby(LOW_KEYS)
          .agg(minor_group=("minor_group", "first"), strength=("strength", "first"), form=("form", "first"),
               material_desc=("material_desc", "last"), vendor_name=("vendor_name", "last"),
               qty=("qty", "sum"), value=("value", "sum"), lines=("lines", "sum")).reset_index())
@@ -528,34 +577,50 @@ def _low_prices(comp: pd.DataFrame, cheapest: pd.DataFrame) -> dict:
     g["plant_name"] = g["plant"].map(lambda p: names.get(p, p))
     g = _round_prices(F._round(g, money=("value", "below_cheapest"), qty=("qty",)))
     g = g.sort_values(["below_cheapest", "molecule_key", "plant"], ascending=[False, True, True], kind="mergesort")
+    return g[LOW_COLUMNS].reset_index(drop=True)
+
+
+def _low_prices(comp: pd.DataFrame, cheapest: pd.DataFrame) -> dict:
+    """The selection's unusually low purchases (_low_groups): how many hospital x brand x
+    supplier groups, what their low rows cost, how many products, and the first TOP_N groups
+    (the overview's preview; /spend/prices/low pages through every one). Still compared."""
+    rows = _low_rows(comp, cheapest)
+    if rows.empty:
+        return {"rows": 0, "value": 0.0, "products": 0, "items": []}
+    g = _low_groups(rows, cheapest)
     return {"rows": int(len(g)), "value": F._money(rows["value"].sum()), "products": int(g["molecule_key"].nunique()),
-            "items": da._clean_records(g.head(TOP_N)[LOW_COLUMNS])}
+            "items": da._clean_records(g.head(TOP_N))}
 
 
 def _molecule_detail(comp: pd.DataFrame, cheapest: pd.DataFrame, view: pd.DataFrame, key: str) -> Optional[dict]:
     """One product: its products-view row, its purchases per hospital x brand x supplier over the
     selected months (points, cheapest first) and its suppliers with their value-weighted price
-    (by_vendor). None when the selection did not buy it."""
+    (by_vendor). Both flags are read per row, never on a point's price averaged over months: a
+    point is unusually_low when ANY of its rows is (exactly the groups low_prices lists), and a
+    point or supplier sets_cheapest when any of its rows is priced at the usual cheapest. None
+    when the selection did not buy it."""
     hit = view[view["molecule_key"] == key]
     if hit.empty:
         return None
-    rows = comp[comp["molecule_key"] == key].assign(qty=lambda d: d["qty"].astype(float))
-    pts = rows.groupby(["plant", "material", "vendor"]).agg(
+    rows = comp[comp["molecule_key"] == key]
+    rows = rows.assign(qty=rows["qty"].astype(float),
+                       _low=P.unusually_low(rows, _row_cheapest(rows, cheapest["cheapest_price"])),
+                       _sets=_sets_cheapest(rows, cheapest["cheapest_price"]))
+    pts = rows.groupby(POINT_KEYS).agg(
         material_desc=("material_desc", "last"), vendor_name=("vendor_name", "last"), lines=("lines", "sum"),
         qty=("qty", "sum"), value=("value", "sum"), unit_price_min=("unit_price_min", "min"),
-        unit_price_max=("unit_price_max", "max")).reset_index()
+        unit_price_max=("unit_price_max", "max"), unusually_low=("_low", "any"),
+        sets_cheapest=("_sets", "any")).reset_index()
     pts["unit_price"] = pts["value"] / pts["qty"].where(pts["qty"] != 0)
-    pts["unusually_low"] = (pts["unit_price"] < P.LOW_RATIO * float(cheapest.loc[key, "cheapest_price"])
-                            ).fillna(False).astype(bool)
     names = _names()
     pts["plant_name"] = pts["plant"].map(lambda p: names.get(p, p))
     pts = _round_prices(F._round(pts, money=("value",), qty=("qty",)))
-    pts = pts.sort_values(["unit_price", "value", "plant", "material", "vendor"],
+    pts = pts.sort_values(["unit_price", "value", *POINT_KEYS],
                           ascending=[True, False, True, True, True], kind="mergesort")
     vend = _vendors(rows, cheapest["cheapest_price"])
     vend["wavg_price"] = (vend["value"] / vend["qty"].where(vend["qty"] != 0)).astype(float).round(PRICE_DECIMALS)
     return {**da._clean_records(hit)[0], "points": da._clean_records(pts[POINT_COLUMNS]),
-            "by_vendor": da._clean_records(vend[VENDOR_COLUMNS + ["qty", "wavg_price"]])}
+            "by_vendor": da._clean_records(vend[VENDOR_COLUMNS + ["qty", "wavg_price", "sets_cheapest"]])}
 
 
 @router.get("/spend/prices/overview")
@@ -567,8 +632,18 @@ def spend_prices_overview(Plant: str = Query(None), Month: str = Query(None), Se
     purchases and vendors are shown (default: the one with the most extra paid); `limit` caps
     the products sent for the chart (most extra paid first)."""
     sc = _scope(C.PRICES, Plant, Month, Segment, Category, Vendor, Material)
-    molecule = (F._str(Molecule) or "").upper() or None
-    return _prices_overview_cached(sc, molecule, _limit(limit), _ignored(Type=Type, Payer=Payer), _version())
+    return _prices_overview_cached(sc, F._str(Molecule), _limit(limit), _ignored(Type=Type, Payer=Payer), _version())
+
+
+def _product_key(view: pd.DataFrame, molecule: str) -> str:
+    """Molecule= as one of the selection's product keys: exactly as sent, else the key it spells
+    ignoring case. A key keeps the purchase build's own spelling (a strength such as '4.5e+06IU'
+    is lower case), so upper-casing what was sent would miss it. Unmatched: as sent."""
+    keys = view["molecule_key"].astype(str)
+    if (keys == molecule).any():
+        return molecule
+    same = keys[keys.str.upper() == molecule.upper()]
+    return str(same.iloc[0]) if len(same) else molecule
 
 
 @_cache
@@ -591,12 +666,12 @@ def _prices_overview_cached(sc: Scope, molecule: Optional[str], limit: int, igno
         "value": F._money(value), "compared_value": F._money(cvalue), "compared_pct": F._share(cvalue, value),
         "lines": int(rows["lines"].sum()), "brands": int(rows["material"].nunique()),
         "vendors": int(rows["vendor"].nunique()), "hospitals": int(rows["plant"].nunique()),
-        # one hospital: what it paid above the cheapest price ANY hospital paid (its ranking row)
+        # one hospital: what it paid above the usual cheapest of ALL hospitals (its ranking row)
         "extra_paid_vs_network_cheapest": (next((h["extra_paid"] for h in by_hospital if h["selected"]), 0.0)
                                            if sc.plant else None),
     }
 
-    key = molecule or (str(view["molecule_key"].iloc[0]) if len(view) else None)
+    key = _product_key(view, molecule) if molecule else (str(view["molecule_key"].iloc[0]) if len(view) else None)
     chosen = _molecule_detail(comp, cheapest, view, key) if key else None
     vendors = _vendors(comp, cheapest["cheapest_price"])
 
@@ -623,6 +698,7 @@ def _prices_overview_cached(sc: Scope, molecule: Optional[str], limit: int, igno
                               _periods(C.PRICES)),
         "not_compared": _not_compared(rows),
         "low_prices": low,
+        "rule": _price_rule(),
         "months_available": _months_available(C.PRICES),
         "notes": notes,
         "data_as_of": _built_at(),
@@ -630,9 +706,11 @@ def _prices_overview_cached(sc: Scope, molecule: Optional[str], limit: int, igno
 
 
 LIST_SUMS = ["value", "extra_paid", "lines"]
-# The list's own filters (Category comes from its column).
+# The list's own filters (Category comes from its column). varies = the dearest is at least
+# prices.SPREAD_MIN above the USUAL cheapest — not 'bought at more than one price': a product
+# with one low outlier under the usual cheapest and every other purchase at one price does not vary.
 LIST_FACETS = (tq.Facet("form", "Form", order="label"),
-               tq.Facet("varies", "Bought at more than one price", value_label=tq.yes_no))
+               tq.Facet("varies", "Dearest above the usual cheapest", value_label=tq.yes_no))
 
 
 def _vendor_name(vendor: str) -> str:
@@ -661,15 +739,45 @@ def spend_prices_molecules(request: Request, Plant: str = Query(None), Month: st
                            Material: str = Query(None)):
     """Every product of the selection, most extra paid first (Contract A: paging, sort, search,
     f.form / f.varies / f.category facets, sums for the Total row). Vendor= / Material= keep
-    one vendor's or brand's purchases, set against the selection's cheapest."""
+    one vendor's or brand's purchases, set against the selection's usual cheapest. `rule` is the
+    overview's block, so the table's method can print the thresholds its columns use."""
     sc = _scope(C.PRICES, Plant, Month, Segment, Category, Vendor, Material)
-    return F._page(request, _molecules_cached(sc, _version()), LIST_SUMS, facets=LIST_FACETS, scope=_chips(sc))
+    page = F._page(request, _molecules_cached(sc, _version()), LIST_SUMS, facets=LIST_FACETS, scope=_chips(sc))
+    return {**page, "rule": _price_rule()}
 
 
 @_cache
 def _molecules_cached(sc: Scope, version: tuple) -> pd.DataFrame:
     t = _table(C.PRICES)
     return _products(_compared(_cut(t, sc)), _cheapest(_compared(_cut(t, sc, drill=False))))
+
+
+LOW_SUMS = ["qty", "value", "below_cheapest", "lines"]
+# The list's own filters beside Month / Hospital: the product and the supplier.
+LOW_FACETS = (tq.Facet("minor_group", "Product"), tq.VENDOR)
+
+
+@router.get("/spend/prices/low")
+def spend_prices_low(request: Request, Plant: str = Query(None), Month: str = Query(None),
+                     Segment: str = Query(None), Category: str = Query(None), Vendor: str = Query(None),
+                     Material: str = Query(None)):
+    """Every unusually low purchase of the selection for HCG to check, one row per hospital x
+    brand x supplier, furthest under the usual cheapest first (Contract A: paging, sort, search,
+    f.plant / f.minor_group / f.vendor_name facets, sums for the Total row; the Export CSV pages
+    through it). The same groups, figures and order as the overview's low_prices, whose `items`
+    are the first TOP_N of this list; `rule` is the overview's block, so the page words the
+    threshold from it."""
+    sc = _scope(C.PRICES, Plant, Month, Segment, Category, Vendor, Material)
+    page = F._page(request, _low_cached(sc, _version()), LOW_SUMS, facets=LOW_FACETS, scope=_chips(sc))
+    return {**page, "rule": _price_rule()}
+
+
+@_cache
+def _low_cached(sc: Scope, version: tuple) -> pd.DataFrame:
+    t = _table(C.PRICES)
+    comp = _compared(_cut(t, sc))
+    cheapest = _cheapest(_compared(_cut(t, sc, drill=False)))
+    return _low_groups(_low_rows(comp, cheapest), cheapest)
 
 
 # ── Generic vs branded ────────────────────────────────────────────────────────
@@ -849,5 +957,6 @@ def _generic_overview_cached(sc: Scope, ignored: tuple, version: tuple) -> dict:
     return {"headline": headline, "scope": _scope_echo(sc, ignored=ignored), "by_month": by_month,
             "by_hospital": by_hospital, "by_segment": by_segment, "by_source": by_source,
             "compliance": compliance, "top_molecules": _top_branded(cur), "definition": _definition(),
-            "estimated": True, "months_available": _months_available(C.GENERIC), "notes": notes,
+            "estimated": True, "rule": _generic_rule(), "months_available": _months_available(C.GENERIC),
+            "notes": notes,
             "data_as_of": _built_at()}

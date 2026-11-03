@@ -35,6 +35,12 @@ HCG's sheet has quirks; each is handled by rule and reported, never patched by h
     years most labels agree with set the placement (see _resolve_months).
   - Jul-26 has no block in the history sheets.
 
+Only .xlsx and .xlsb workbooks named like HCG's MIS are read. Any other file in the HCG MIS
+folder (an .xls, a PDF, a workbook renamed) is named with the reason (discover.skip_reason,
+NOT_MIS_REASON) in the log, in --list and in the validation report's warnings, never passed
+over in silence: a renamed September MIS would otherwise leave August's budgets in place
+without a word. Lock files are ignored.
+
 Run:  python -m app.etl.formulary.hcg_mis           (reads the latest MIS workbook)
       python -m app.etl.formulary.hcg_mis --list    (shows which file it would read)
 """
@@ -55,7 +61,7 @@ import pandas as pd
 from app.etl.formulary import config as C
 from app.etl.formulary import excel as X
 from app.etl.formulary.build import _check_columns
-from app.etl.formulary.discover import BuildError
+from app.etl.formulary.discover import BuildError, SkippedFile, _excel_files, not_read
 
 UNIT_RE = re.compile(r"^[A-Z]{2}\d{2}$")
 SEGMENTS = ("onco", "non-onco")
@@ -66,6 +72,9 @@ MEASURES = ("formulary", "out_of_formulary", "non_formulary", "total", "restrict
 SAME_RATIO = 1e-6
 # Rupee values agree when they differ by less than this.
 SAME_RUPEES = 0.5
+# Why a workbook in the HCG MIS folder whose name is not like HCG's MIS (config.MIS_FILE_RE) is
+# not read, in the build's warnings and in the abort when no MIS is found.
+NOT_MIS_REASON = "not named like HCG's MIS workbook ('... Formulary Compliance <Mon YY> - MIS.xlsx')"
 
 # History-sheet column headers (letters and digits only, upper case) -> measure.
 _HISTORY_COLUMNS = {
@@ -155,17 +164,20 @@ class MisFile:
     period: str                       # the month in the file name
 
 
-def find_mis(raw=None) -> tuple:
-    """(the latest MIS workbook, every one found) under FORMULARY_RAW_DIR."""
+def find_mis(raw=None, skipped: Optional[list] = None) -> tuple:
+    """(the latest MIS workbook, every one found) under FORMULARY_RAW_DIR. The other files in the
+    HCG MIS folder, of another type or not named like HCG's MIS, and its sub-folders (whose files
+    are not read) go into `skipped` (discover.SkippedFile) when a list is given, for the build to
+    report."""
     root = C.raw_dir(raw)
     if not root.is_dir():
         raise BuildError(f"FORMULARY_RAW_DIR does not exist: {root}")
-    found, errors = [], []
+    found, errors, passed = [], [], []
     for d in sorted(p for p in root.rglob("*") if p.is_dir() and C.DASHBOARD_DIR_RE.match(p.name)):
         for sub in sorted(p for p in d.iterdir() if p.is_dir() and C.MIS_DIR_RE.match(p.name.strip())):
-            for f in sorted(sub.iterdir()):
-                if (not f.is_file() or f.name.startswith(("~$", ".~lock"))
-                        or f.suffix.lower() not in C.EXCEL_SUFFIXES or not C.MIS_FILE_RE.search(f.stem)):
+            for f in _excel_files(sub, passed, expected_folders=()):
+                if not C.MIS_FILE_RE.search(f.stem):
+                    passed.append(SkippedFile(sub.name, f.name, NOT_MIS_REASON))
                     continue
                 period = C.month_from_name(f.name)
                 if period is None:
@@ -177,11 +189,14 @@ def find_mis(raw=None) -> tuple:
         if m.period in by_period:
             errors.append(f"two MIS workbooks for {m.period}: {by_period[m.period].path.name!r} and {m.path.name!r}")
         by_period[m.period] = m
+    if skipped is not None:
+        skipped += passed
     if errors:
         raise BuildError("\n  ".join(["MIS discovery failed:"] + errors))
     if not found:
         raise BuildError(f"no MIS workbook found: put HCG's '... Formulary Compliance <Mon YY> - MIS.xlsx' in "
-                         f"'<{C.DASHBOARD_DIR_RE.pattern.lstrip('^')} ...>/HCG MIS/' under {root}")
+                         f"'<{C.DASHBOARD_DIR_RE.pattern.lstrip('^')} ...>/HCG MIS/' under {root}"
+                         + not_read(passed))
     ordered = sorted(found, key=lambda m: m.period)
     return ordered[-1], ordered
 
@@ -561,15 +576,18 @@ def publish(tables: dict, report: dict, data=None) -> dict:
 
 
 def build(*, raw=None, data=None, log=print) -> dict:
-    latest, every = find_mis(raw)
+    skipped: list = []
+    latest, every = find_mis(raw, skipped)
     log(f"MIS workbook: {latest.path.name} ({latest.period}); {len(every)} found")
+    for s in skipped:
+        log(f"note: {s}")
     tables, report = read_mis(latest.path)
     if latest.period not in report["fy_periods"]:
         report["notes"].append(f"the file name says {latest.period} but the FY sheet's last month is "
                                f"{report['fy_periods'][-1]}")
     report = {"built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "generator": "app.etl.formulary.hcg_mis", "source_file": latest.path.name,
-              "file_period": latest.period, **report}
+              "file_period": latest.period, "warnings": [str(s) for s in skipped], **report}
     sizes = publish(tables, report, data)
     pan = {p["period"]: p for p in report["pan"]}
     log(f"published {', '.join(f'{k} {v} rows' for k, v in sizes.items())}")
@@ -589,10 +607,13 @@ def main(argv=None) -> int:
     ap.add_argument("--data", help="override FORMULARY_DATA_DIR")
     a = ap.parse_args(argv)
     try:
-        latest, every = find_mis(a.raw)
+        skipped: list = []
+        latest, every = find_mis(a.raw, skipped)
         if a.list:
             for m in every:
                 print(f"{m.period}  {m.path}{'   <- read' if m is latest else ''}")
+            for s in skipped:
+                print(f"note: {s}")
             return 0
         build(raw=a.raw, data=a.data)
         return 0

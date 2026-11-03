@@ -1,5 +1,5 @@
 {
- "built_at": "2026-10-23T06:19:14+00:00",
+ "built_at": "2026-10-30T20:20:03+00:00",
  "generator": "python -m app.etl.purchase",
  "periods": [
   "2025-12",
@@ -81,7 +81,8 @@
     "no_alternative": "no suggested brand",
     "unpriced": "a suggested brand no price list prices: shown, not counted"
    },
-   "guard": "with HCG's worksheet of the month, every centre within Rs 1 of HCG's Summary and KR within Rs 1 of HCG's email, else nothing is published; a month HCG's email has figures for but whose workbook was not read is not published either, unless the build is run with --without-hcg-sheet"
+   "guard": "with HCG's worksheet of the month, every centre within Rs 1 of HCG's Summary and KR within Rs 1 of HCG's email, else nothing is published; a month HCG's email has figures for but whose workbook was not read is not published either, unless the build is run with --without-hcg-sheet",
+   "new_months": "a warning, never a stop: a GRN month from the first Item Master on without its own Item Master waits (no out-of-formulary rows; prices and generic are built; its month report has waiting_for_item_master); a month built without HCG's worksheet is published from sources 2-5 and marked estimated (hcg_working false)"
   },
   "oof_master": {
    "file": "Copy of Out of formualry vs suggested formualry brand master-2026-27.xlsb",
@@ -139,12 +140,12 @@
    },
    "other_unit": "with HCG's CASH&TPA MRP for the brand: the line's MRP more than 4x away from it; else the line's price and MRP both more than 4x away from the brand's month median (lower median)",
    "per_product": "over rows with price_status ok and a molecule_key: cheapest = the usual cheapest, the lowest row price (value / qty) at which at least 10% of the product's quantity was bought, counting up from the cheapest; lowest = min unit_price_min; dearest = max unit_price_max; value-weighted price = sum value / sum qty; extra paid = sum over rows of max(0, value - cheapest x qty)",
-   "unusually_low": "a row priced under 0.5 x its product's usual cheapest: still compared, listed for HCG to check",
-   "report": "a product varies when its dearest is at least 1% above its cheapest; extra paid per month over all centres"
+   "unusually_low": "a row priced under 0.5 x its product's usual cheapest: still compared, listed for HCG to check; rows = the hospital x brand x supplier groups with one (a supplier by name, all its SAP codes)",
+   "report": "a product varies when its dearest is at least 1% above its usual cheapest; extra paid per month over all centres"
   }
  },
  "generic": {
-  "definition": "Branded = a product of an originator (innovator) company; generic = every other product (Indian brands, biosimilars, Attis own label, Jan Aushadhi, MNC generic and hospital makers). Estimated definition until HCG confirms it.",
+  "definition": "Branded = a product of an originator (innovator) company; generic = every other product (Indian brands, biosimilars, Attis own label, Jan Aushadhi, MNC generic and hospital makers). Estimated definition: the app's own reading.",
   "estimated": true,
   "files": {
    "originators": "originator_manufacturers.csv",
@@ -2393,6 +2394,8 @@
      "total_pp": 5615236.5
     },
     "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "hcg_working": true,
+    "estimated": false,
     "pair_months": [],
     "formulary_pool_brands": 2515,
     "by_status": {
@@ -3343,6 +3346,8 @@
      "total_pp": 5278293.58
     },
     "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "hcg_working": true,
+    "estimated": false,
     "pair_months": [],
     "formulary_pool_brands": 2514,
     "by_status": {
@@ -4296,6 +4301,8 @@
      "total_pp": 6394871.95
     },
     "suggestions_from": "HCG's worksheet of the month (source 1)",
+    "hcg_working": true,
+    "estimated": false,
     "pair_months": [],
     "formulary_pool_brands": 2509,
     "by_status": {

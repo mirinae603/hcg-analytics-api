@@ -417,6 +417,10 @@ def test_cash_trend_ranking_splits_and_allowance(client, data):
     assert [(t["material"], t["margin_loss"], t["bifurcated"]) for t in d["top_items"]] == \
         [("101001", 2760.0, True), ("201002", 420.0, False)]
     assert d["cash_list"]["bifurcated_brands"] == 41
+    # the notes say how the figures are built, never what HCG is to confirm or send
+    notes = " ".join(d["notes"])
+    assert "cash_tpa_excluded.csv" in notes and "KR Aug-26 report" in notes
+    assert "confirm" not in notes and "until HCG" not in notes
 
 
 def test_cash_items(client, data):

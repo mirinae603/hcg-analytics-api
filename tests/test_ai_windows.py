@@ -89,6 +89,55 @@ def test_the_quoted_totals_come_from_the_tables(data, tmp_path):
     assert windows.fill("spend <<PROCUREMENT_TOTAL>>") == "spend ₹806.91 Cr"
 
 
+def test_the_turnover_recipe_annualises_each_part_over_its_own_months(data, tmp_path):
+    # A 31-Aug-26 count: issues in Mar, Apr, Jun, Jul and on the count day (5 months up to it, no
+    # May extract) and one in Sep, after it; billing Jan-Mar (3 months). One "x 2.0" would be wrong
+    # for both parts; the recipe takes 12/5 for the issues and 12/3 for the billing, as the
+    # dashboard's data_access.yearly_cogs does.
+    from app.ai import routing, semantics
+    data(sales=["2026-01", "2026-02", "2026-03"], snapshot="2026-08-31")
+    days = pd.to_datetime(["2026-03-10", "2026-04-15", "2026-06-01", "2026-07-20", "2026-08-31", "2026-09-05"])
+    pd.DataFrame({"posting_date": days}).to_parquet(tmp_path / "CURATED_DIR" / "fact_consumption.parquet")
+    assert windows.stock_months() == ("2026-03", "2026-04", "2026-06", "2026-07", "2026-08")
+    assert windows.values()["STOCK_MONTHS"] == "5"
+    recipe = windows.fill(semantics.EXAMPLES)
+    assert "(internal.c * 12.0 / 5 + billed.c * 12.0 / 3) / internal.inv AS portfolio_itr" in recipe
+    hint = windows.fill(" ".join(h for _, h in routing._CORPUS))
+    assert "internal × 12/5, billed × 12/3" in hint
+    assert not re.search(r"[×*] ?2\.0", recipe + hint)                 # no single fixed factor left
+
+
+def test_the_gotchas_name_each_sources_own_window(data, tmp_path):
+    # Billing Dec-May (6 months), receipts Dec-Aug, orders Dec-Sep, and a 31-Aug count over the
+    # issues of Mar, Apr, Jun, Jul and Aug (5 months, no May extract). The "no rows is not news"
+    # gotcha names each source's own months, the non-moving one the 5 months up to the count, and
+    # the table guide's sales_by_material the 6 months of billing — not one "6-month window".
+    from app.ai import semantics
+    data(sales=["2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"], snapshot="2026-08-31")
+    cur = tmp_path / "CURATED_DIR"
+    dates = lambda *ms: pd.to_datetime([f"{m}-15" for m in ms])
+    year = [f"2026-{m:02d}" for m in range(1, 10)]                        # Jan..Sep 2026
+    pd.DataFrame({"posting_date": dates("2025-12", *year[:8])}).to_parquet(cur / "fact_grn.parquet")
+    pd.DataFrame({"posting_date": dates("2025-12", *year)}).to_parquet(cur / "fact_po.parquet")
+    pd.DataFrame({"posting_date": dates("2026-03", "2026-04", "2026-06", "2026-07", "2026-08", "2026-09")}
+                 ).to_parquet(cur / "fact_consumption.parquet")
+    gotchas, guide = windows.fill(semantics.GOTCHAS), windows.fill(semantics.GUIDE)
+    assert ("the transaction tables only cover their own windows (billed sales Dec-2025…May-2026, purchase orders "
+            "Dec-2025…Sep-2026, goods receipts Dec-2025…Aug-2026, internal consumption Mar-2026…Sep-2026 (no "
+            "May-2026)") in gotchas
+    assert ('"Non-moving" means ZERO consumption in the 5 months of issues up to the stock count (2026-08-31)'
+            in gotchas)
+    assert "REVENUE / MARGIN (billed sales, 6mo):" in guide and "by product, 6-MONTH TOTAL" in guide
+    assert "6-month analytics window" not in gotchas and "-month window" not in gotchas
+
+
+def test_the_stock_window_without_a_count_or_without_issues(data, tmp_path):
+    assert windows.stock_months() == () and windows.values()["STOCK_MONTHS"] == "few"
+    days = pd.to_datetime(["2026-05-10", "2026-09-05"])
+    pd.DataFrame({"posting_date": days}).to_parquet(tmp_path / "CURATED_DIR" / "fact_consumption.parquet")
+    assert windows.stock_months() == ("2026-05", "2026-09")             # no stock count: every issue
+
+
 def test_a_window_across_years_and_one_month():
     assert windows.span(("2025-12", "2026-01", "2026-02")) == "Dec 2025–Feb 2026"
     assert windows.span(("2026-09",)) == "Sep 2026"

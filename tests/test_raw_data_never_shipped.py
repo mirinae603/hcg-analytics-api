@@ -44,6 +44,8 @@ MUST_SHIP = [
     "app/data/reference/brand_rules.csv",
     "app/data/formulary/formulary_rule_breach.parquet",
     "app/data/formulary/formulary_rules.parquet",
+    # revenue & margin and the sales export: /revenue/* answers 503 without it
+    "app/data/formulary/sales_items.parquet",
     "app/data/spend/brand_blocks.parquet",
     "app/data/reference/hospital_map.csv",
     "app/data/reference/payer_overrides.csv",
