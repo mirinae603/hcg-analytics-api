@@ -266,6 +266,20 @@ counted anywhere).
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+### Voice input in the AI chat
+
+The AI chat has a mic button. The browser records the question (up to a minute), the API sends
+the clip to an Azure OpenAI speech-to-text deployment (POST /ai/transcribe, login required,
+nothing stored), and the text appears in the chat box for the user to check and send. Turn it on:
+
+1. In the Azure OpenAI resource the chat uses, deploy **gpt-4o-mini-transcribe** (Deployments →
+   Deploy model). If that resource's region does not offer it, deploy it on a resource in a
+   region that does and set `AZURE_OPENAI_TRANSCRIBE_ENDPOINT` and `AZURE_OPENAI_TRANSCRIBE_API_KEY`
+   too (the key as a secret).
+2. On the Container App, add `AZURE_OPENAI_TRANSCRIBE_DEPLOYMENT` = the deployment's name.
+3. Check: `python -m app.ai.check_connection` prints a `voice ... OK` line. GET /ai/status then
+   says `"voice": true` and the mic appears in the chat.
+
 ### Keep AI chats and users across deploys
 
 Users and AI Analyst chat sessions live in the database named by `DATABASE_URL`. Its default

@@ -3,16 +3,19 @@
     .venv/bin/python -m app.ai.check_connection
 
 Reads the same settings the app reads (.env in the current folder, then the environment) and
-makes one tiny call to each deployment: the main model, the mini model and the embeddings
-model. Prints OK or the exact reason it failed (wrong key or endpoint, missing deployment,
+makes one tiny call to each deployment: the main model, the mini model, the embeddings
+model and, when it is set up, the voice (speech-to-text) model, which is sent one second of
+silence. Prints OK or the exact reason it failed (wrong key or endpoint, missing deployment,
 unsupported API version). The key is never printed; only its length, because a key pasted
 together with the text around it is the commonest mistake (an Azure key is 32 or 84
 characters with no spaces).
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
+import wave
 
 
 def _reason(e: Exception) -> str:
@@ -67,7 +70,43 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         # optional: routing falls back to keyword rules without it
         print(f"embeddings  {embed_d}: FAILED (optional, the chat still works) — {_reason(e)}")
-    return 0 if ok else 1
+    return 0 if (_check_voice() and ok) else 1
+
+
+def _silence_wav(seconds: float = 1.0, rate: int = 16000) -> bytes:
+    """A short silent mono WAV: enough for the transcribe deployment to answer, no speech."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+    return buf.getvalue()
+
+
+def _check_voice() -> bool:
+    """The voice model, read the way POST /ai/transcribe reads it (app/ai/transcribe.py).
+    Not set up is not a failure: the chat just shows no mic."""
+    from openai import AzureOpenAI
+    from app.ai import transcribe
+    cfg = transcribe.settings()
+    if cfg is None:
+        print("voice       not set up (AZURE_OPENAI_TRANSCRIBE_DEPLOYMENT is empty): the chat shows no mic")
+        return True
+    if cfg.endpoint != os.getenv("AZURE_OPENAI_ENDPOINT", cfg.endpoint):
+        print(f"voice       on its own resource {cfg.endpoint}")
+    client = AzureOpenAI(azure_endpoint=cfg.endpoint, api_key=cfg.key, api_version=cfg.api_version,
+                         timeout=30, max_retries=0)
+    try:
+        r = client.audio.transcriptions.create(model=cfg.deployment, file=("check.wav", _silence_wav(), "audio/wav"),
+                                               response_format="json")
+        heard = (getattr(r, "text", "") or "").strip()
+        print(f"voice       {cfg.deployment}: OK (api version {cfg.api_version}"
+              + (f"; heard {heard!r} in silence" if heard else "") + ")")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"voice       {cfg.deployment}: FAILED — {_reason(e)}")
+        return False
 
 
 if __name__ == "__main__":
