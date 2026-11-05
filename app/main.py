@@ -25,6 +25,12 @@ async def lifespan(_app: FastAPI):
     # actually starts (a real uvicorn boot, or `with TestClient(app) as c:`).
     from app.core.seed import seed_and_migrate
     seed_and_migrate()
+    # The executive overview (and each section's default view it calls) is computed in a
+    # background thread, so the first visitor does not wait about a second for it; never blocks
+    # the start, and skipped when the memory for it is not free (app/api/warmup.py).
+    from app.api import warmup
+    warmup.serving()
+    warmup.start("startup")
     yield
 
 
@@ -43,10 +49,13 @@ app.add_middleware(
 
 app.include_router(api_router)
 
-# NOTE: NO startup cache-warming. On the 512 MB free tier, eagerly loading fact_grn +
-# fact_po (168 MB) plus every summary at boot spikes RSS past the limit → OOM crash-loop.
-# Tables load lazily per request; the per-endpoint result caches keep warm navigation
-# instant, and the big fact tables are not held resident (see data_access.load).
+# NOTE: NO eager loading of every table at boot. On the 512 MB free tier, eagerly loading
+# fact_grn + fact_po (168 MB) plus every summary at boot spikes RSS past the limit → OOM
+# crash-loop. Tables load lazily per request; the per-endpoint result caches keep warm
+# navigation instant, and the big fact tables are not held resident (see data_access.load).
+# The one warm-up the lifespan starts (app/api/warmup.py) reads only the executive overview's
+# tables, never fact_grn / fact_po, in a background thread, and only when the memory they
+# take is free.
 
 # After each request, hand the memory freed by transient big-table loads back to the OS.
 # glibc keeps freed heap by default (RSS stays high on a 512 MB box); malloc_trim(0)

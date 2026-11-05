@@ -52,6 +52,14 @@ def _months(df: pd.DataFrame) -> set:
     return set(zip(df["year"], df["month"]))
 
 
+def no_consumption_reason(months: int) -> str:
+    """The non-moving reason for stock with no use in the window looked at: 'No consumption in
+    6mo', the months counted from the data the classification used (a new stock count, or a new
+    month of billing, moves them), never written in. With no months of data at all there is no
+    window to name: 'No consumption recorded'. data_access.nonmoving_scoped words it the same way."""
+    return f"No consumption in {months}mo" if months > 0 else "No consumption recorded"
+
+
 # --------------------------------------------------------------------------- #
 # INVENTORY
 # --------------------------------------------------------------------------- #
@@ -125,7 +133,9 @@ def build_inventory_kpis(inv: pd.DataFrame, cons: pd.DataFrame, dim_material: pd
     consumed_materials = set(cons["material"].unique())
     a9["consumed_in_window"] = a9["material"].isin(consumed_materials)
     a9 = a9[(~a9["consumed_in_window"]) | (a9["aging_days"] > 180)].copy()
-    a9["reason"] = np.where(~a9["consumed_in_window"], "No consumption in 6mo", "Aging > 180d")
+    # the months holding issues up to the stock count (data_access.stock_months reads them the same way)
+    issue_months = pd.to_datetime(cons["posting_date"], errors="coerce").dropna().dt.strftime("%Y-%m").nunique()
+    a9["reason"] = np.where(~a9["consumed_in_window"], no_consumption_reason(issue_months), "Aging > 180d")
     a9 = a9[["plant", "material", "material_desc", "material_group",
              "closing_stock_quantity", "closing_stock_value", "aging_days",
              "last_sale_date", "reason"]]

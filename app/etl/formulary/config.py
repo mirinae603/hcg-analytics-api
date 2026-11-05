@@ -34,8 +34,30 @@ SALES_DIR_RE = re.compile(r"^ip\s*(and|&)\s*op\s+sales$", re.I)
 ITEM_MASTER_DIR_RE = re.compile(r"^item master", re.I)
 PAYER_MASTER_FILE_RE = re.compile(r"payer master", re.I)
 EXCEL_SUFFIXES = (".xlsx", ".xlsb")
+# Any other file in a source folder is not read: the formulary, spend and purchase builds list it
+# with its reason in their log and validation report and carry on (HCG to send it as .xlsx or
+# .xlsb). The reason says what to do about the types HCG is likely to send.
+SKIPPED_SUFFIX_REASONS = {
+    ".xls": "an Excel 97-2003 workbook (.xls), which the build does not read: open it and save it as .xlsx",
+    ".xlsm": "a macro-enabled workbook (.xlsm), which the build does not read: save it as .xlsx",
+    ".csv": "a CSV file, which the build does not read: it needs HCG's workbook as .xlsx or .xlsb",
+}
+SKIPPED_OTHER_REASON = "not an Excel workbook ({suffix}): only .xlsx and .xlsb files are read"
+# A sub-folder of a folder that holds its files directly (the sales, Item Master, GRN, OOF master
+# and HCG MIS folders): nothing inside it is read, so it is named like a file of the wrong type,
+# e.g. an Item Master moved into 'Item Master Sheet/Sep 26/'.
+SKIPPED_FOLDER_REASON = ("a sub-folder (the build reads only the files directly in '{folder}'): "
+                         "move its files up into '{folder}'")
+# Not HCG's files, passed over without a word: hidden files (LibreOffice's '.~lock.<name>#' while
+# a workbook is open, macOS '._*' and '.DS_Store'), Office's lock and save-temp files ('~$<name>',
+# '~WRL0001.tmp', any '*.tmp'), Windows' thumbnails and the '__MACOSX' folder of a zip made on a
+# Mac. Excel's extension-less save-temp names ('A1B2C3D4') are left to be named "not an Excel
+# workbook": a pattern for them could also hide a real file, and naming one is harmless.
+IGNORED_FILE_RE = re.compile(r"^(\.|~)|\.tmp$|^(thumbs\.db|desktop\.ini|__macosx)$", re.I)
 
-# Month in a file name: 'June 26', 'July 2026', 'JUne-26', 'August -26'.
+# Month in a file name: 'June 26', 'July 2026', 'JUne-26', 'August -26', 'Sept-26', 'Sep26',
+# 'September 2026_Updated'. "SEP'26", '30.09.2026', a month without its year or two months
+# ('Aug-26 to Sep-26') read as no month, and the build stops and names the file (RUNBOOK_HCG.md).
 MONTHS = {m: i + 1 for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
 MONTH_IN_NAME_RE = re.compile(
@@ -86,7 +108,11 @@ BY_ITEM = "formulary_by_item"
 DOCTOR_ITEM = "formulary_doctor_item"
 RULE_BREACH = "formulary_rule_breach"     # Task 4: brand-rule measures per doctor x material
 RULE_BOOK = "formulary_rules"             # Task 4: every formulary item of each month's master
-TABLES = (SUMMARY, BY_DOCTOR, BY_ITEM, DOCTOR_ITEM, RULE_BREACH, RULE_BOOK)
+# Revenue & margin and the sales export: every category (consumables too) per item, with MRP
+# and the lines whose cost price was blank. formulary_by_item stays drugs-only and cost-only:
+# the compliance views and their tests are built on exactly that grain.
+SALES_ITEMS = "sales_items"
+TABLES = (SUMMARY, BY_DOCTOR, BY_ITEM, DOCTOR_ITEM, RULE_BREACH, RULE_BOOK, SALES_ITEMS)
 VALIDATION_FILE = "formulary_validation.json"
 
 # --- HCG's monthly PAN formulary-compliance MIS (app/etl/formulary/hcg_mis.py) ----------

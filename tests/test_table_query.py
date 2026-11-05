@@ -97,6 +97,33 @@ def test_a_field_the_table_does_not_offer_is_a_400(lines):
     assert "payer, kind, when" in e.value.detail
 
 
+def test_page_and_page_size_are_bounded(lines):
+    # 4 rows. A negative size would slice from the far end (page_size=-1 handed back all but the
+    # last row), a size past the ceiling would page a whole big table into memory: both are a 400,
+    # like a page that is not a number. No page_size is the default 25.
+    for q in ("page_size=-5", "page_size=-1", "page_size=0", "page=-1",
+              f"page_size={tq.MAX_PAGE_SIZE + 1}"):
+        with pytest.raises(HTTPException) as e:
+            page(lines, q)
+        assert e.value.status_code == 400, q
+    assert f"page_size must be from 1 to {tq.MAX_PAGE_SIZE:,} rows, not -5" in _raised(
+        lambda: page(lines, "page_size=-5")).detail
+    assert len(page(lines, f"page_size={tq.MAX_PAGE_SIZE}")["data"]) == 4
+    assert len(page(lines, "")["data"]) == 4 and tq.DEFAULT_PAGE_SIZE == 25
+    assert [len(page(lines, f"page={p}&page_size=3")["data"]) for p in (0, 1, 2)] == [3, 1, 0]
+    # a list the Export CSV pages through takes its own, lower ceiling
+    assert len(page(lines, "page_size=3", max_page_size=3)["data"]) == 3
+    with pytest.raises(HTTPException) as e:
+        page(lines, "page_size=4", max_page_size=3)
+    assert e.value.status_code == 400 and "from 1 to 3 rows" in e.value.detail
+
+
+def _raised(fn) -> HTTPException:
+    with pytest.raises(HTTPException) as e:
+        fn()
+    return e.value
+
+
 def test_range_is_inclusive_and_a_plain_date_keeps_its_whole_day(lines):
     body = page(lines, "f.when.from=2026-08-01&f.when.to=2026-08-31&facets=1")
     assert body["total"] == 2                                               # 1 Aug and 31 Aug 15:00

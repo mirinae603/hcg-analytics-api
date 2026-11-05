@@ -5,7 +5,9 @@
 # free stock and a Rs 0.01 placeholder) and 8 invented generic vs branded rows (an originator
 # brand, its generic, an override, a branded brand cheaper than its generic, a month without an
 # Item Master). Every expected number below was worked out by hand from them (comments show the
-# arithmetic). The last tests read the COMMITTED tables (skipped until python -m
+# arithmetic). A second, separate set of 10 price rows (CHECK_ROWS) gives each flag a product's
+# purchases carry a case of its own: the unusually low list, the dots, the purchases that set the
+# usual cheapest. The last tests read the COMMITTED tables (skipped until python -m
 # app.etl.purchase has published) and set the API beside the build's own report and the
 # figures read when the definitions were chosen.
 from __future__ import annotations
@@ -93,19 +95,25 @@ def _category(material: str) -> tuple:
     return ("Onco Drugs", "onco") if material.startswith("1") else ("Other Drugs", "non-onco")
 
 
-def write_tables(folder: Path) -> None:
+def write_prices(folder: Path, price_rows: list, brands: dict, vendors: dict) -> None:
+    """purchase_prices from (period, plant, material, supplier code, status, qty, value) rows,
+    one GRN line each."""
     folder.mkdir(parents=True, exist_ok=True)
     rows = []
-    for period, plant, mat, code, status, qty, value in PRICE_ROWS:
-        desc, group, maker, (key, molecule, strength, form) = BRANDS[mat]
+    for period, plant, mat, code, status, qty, value in price_rows:
+        desc, group, maker, (key, molecule, strength, form) = brands[mat]
         cat, seg = _category(mat)
         price = np.nan if status == P.NO_PRICE else value / qty
         rows.append({"period": period, "plant": plant, "category": cat, "segment": seg, "material": mat,
                      "material_desc": desc, "minor_group": group, "manufacturer": maker, "vendor_code": code,
-                     "vendor_name": VENDORS[code], "price_status": status, "molecule_key": key,
+                     "vendor_name": vendors[code], "price_status": status, "molecule_key": key,
                      "molecule": molecule, "strength": strength, "form": form, "kind": None, "lines": 1,
                      "qty": float(qty), "value": value, "unit_price_min": price, "unit_price_max": price})
     pd.DataFrame(rows)[P.PRICES_COLUMNS].to_parquet(folder / f"{C.PRICES}.parquet", index=False)
+
+
+def write_tables(folder: Path) -> None:
+    write_prices(folder, PRICE_ROWS, BRANDS, VENDORS)
 
     rows = []
     for period, plant, mat, flag, tier, qty, value, generic in GENERIC_ROWS:
@@ -246,6 +254,7 @@ def test_one_odd_purchase_is_listed_not_used_as_the_cheapest(client, data):
     h = d["headline"]
     assert (h["extra_paid_vs_cheapest"], h["low_rows"], h["low_value"]) == (192050.0, 1, 1000.0)
     c = by_key(d["molecules"])[CETUX[0]]
+    # low_rows: hospital x brand x supplier groups with a low row (one here: DR CETUXA SDH)
     assert (c["cheapest_price"], c["min_price"], c["low_rows"], c["extra_paid"]) == (5000.0, 1000.0, 1, 192000.0)
     low = d["low_prices"]
     assert (low["rows"], low["products"], len(low["items"])) == (1, 1, 1)
@@ -275,9 +284,13 @@ def test_the_chosen_product_shows_its_purchases_and_vendors(client, data):
     assert [(p["plant"], p["material"], p["vendor_name"], p["unit_price"], p["qty"], p["value"]) for p in m["points"]] == [
         (KR, "101002", SDH, 5000.0, 4.0, 20000.0), (DR, "101002", VARDHMAN, 6000.0, 2.0, 12000.0),
         (DR, "101001", VARDHMAN, 17000.0, 5.0, 85000.0), (KR, "101001", VARDHMAN, 18000.0, 10.0, 180000.0)]
+    # p3 (KR CETUXA Speciality Drug House at 5,000) set August's cheapest: its dot and supplier are marked
+    assert [p["sets_cheapest"] for p in m["points"]] == [True, False, False, False]
+    assert not any(p["unusually_low"] for p in m["points"])
     assert m["vendors"] == 2                               # the count; by_vendor lists them
     v = by_key(m["by_vendor"], "vendor_name")
     assert (v[VARDHMAN]["value"], v[VARDHMAN]["extra_paid"], v[VARDHMAN]["qty"]) == (277000.0, 192000.0, 17.0)
+    assert (v[VARDHMAN]["sets_cheapest"], v[SDH]["sets_cheapest"]) == (False, True)
     assert v[VARDHMAN]["wavg_price"] == pytest.approx(277000 / 17, abs=1e-4)
     assert (v[SDH]["wavg_price"], v[SDH]["price_index"]) == (5000.0, 1.0)
     d = prices(client, Month=AUG, Molecule="paracetamol|500mg|tab|")      # any case
@@ -295,7 +308,7 @@ def test_vendor_and_brand_drills_keep_the_selections_cheapest(client, data):
     # p3 and p6 were the cheapest: nothing above it; p9's 0.01 is in the value only
     assert (d["headline"]["extra_paid_vs_cheapest"], d["headline"]["molecules_with_spread"]) == (0.0, 0)
     assert (d["headline"]["value"], d["headline"]["vendors"]) == (20150.01, 1)
-    assert any("vendor or brand is selected" in n for n in d["notes"])
+    assert any("vendor or brand is selected" in n and "usual cheapest" in n for n in d["notes"])
     # one SAP code: p2 + p4 = 97,000 for 7 vials at 5,000 -> 62,000
     assert prices(client, Month=AUG, Vendor="50990.0")["headline"]["extra_paid_vs_cheapest"] == 62000.0
     # the supplier's name, spacing and case aside, takes both codes
@@ -332,6 +345,8 @@ def test_molecules_list_is_contract_a(client, data):
     assert d["total"] == 1 and d["sums"] == {"value": 350.0, "extra_paid": 50.0, "lines": 2}
     d = get(client, "/spend/prices/molecules", Month=AUG, Vendor=SDH, facets="only")
     assert {f["field"] for f in d["facets"]} >= {"category", "form", "varies"}
+    # varies = the dearest at least 1% above the USUAL cheapest, so not 'bought at more than one price'
+    assert next(f["label"] for f in d["facets"] if f["field"] == "varies") == "Dearest above the usual cheapest"
     assert [(c["param"], c["value_label"]) for c in d["scope"]] == \
         [("Plant", "All hospitals"), ("Month", "Aug-26"), ("Vendor", SDH)]
 
@@ -358,6 +373,245 @@ def test_type_and_payer_do_not_apply_and_say_so(client, data):
         assert any("no patient type or payer" in n for n in d["notes"]), path
         assert "ignored" not in get(client, path, Month=AUG, Type="ALL")["scope"], path
     assert prices(client, Month=AUG, Payer="GOV")["headline"]["extra_paid_vs_cheapest"] == 192050.0
+
+
+# ---------- price variation: the low list, a product's dots, the purchases that set the cheapest ----------
+# A SEPARATE set of invented rows (PRICE_ROWS above is left as it is): one injection bought in July
+# and August from three suppliers at both hospitals, and one tablet bought in August.
+TRAS = ("TRASTUZUMAB|440MG|INJ|", "TRASTUZUMAB", "440MG", "INJ")
+ONDA = ("ONDANSETRON|4MG|TAB|", "ONDANSETRON", "4MG", "TAB")
+CITY = "City Pharma"
+CHECK_VENDORS = {**VENDORS, "53000": CITY}
+CHECK_BRANDS = {
+    "105001": ("HERCLON 440MG INJ VIAL", "TRASTUZUMAB", "ROCHE", TRAS),
+    "105002": ("VIVITRA 440MG INJ VIAL", "TRASTUZUMAB", "ZYDUS", TRAS),
+    "205001": ("EMESET 4MG TAB", "ONDANSETRON", "CIPLA", ONDA),
+}
+CHECK_ROWS = [
+    (JUL, KR, "105002", "52366", "ok", 1, 4000.0),       # c1   4,000  KR VIVITRA SDH in July
+    (AUG, KR, "105002", "52366", "ok", 9, 108000.0),     # c2  12,000  ... the same group in August
+    (AUG, DR, "105002", "50790", "ok", 1, 3000.0),       # c3   3,000  Vardhman's two SAP codes: one
+    (AUG, DR, "105002", "50990", "ok", 1, 3000.0),       # c4   3,000  group, DR VIVITRA Vardhman
+    (JUL, DR, "105002", "53000", "ok", 1, 8000.0),       # c5   8,000  City Pharma's only purchase
+    (AUG, DR, "105001", "52366", "ok", 5, 50000.0),      # c6  10,000
+    (AUG, KR, "105001", "50790", "ok", 20, 300000.0),    # c7  15,000
+    (JUL, KR, "105001", "50790", "ok", 10, 140000.0),    # c8  14,000
+    (AUG, KR, "205001", "50790", "ok", 100, 50000.0),    # c9     500
+    (AUG, DR, "205001", "52366", "ok", 10, 2000.0),      # c10    200
+]
+BOTH = f"{JUL},{AUG}"
+# July + August, every hospital:
+#   trastuzumab, 48 vials, cheapest first: c3 1, c4 2, c1 3, c5 4, c6 9 >= 4.8 (10%) -> usual
+#   cheapest 10,000, set by c6 (DR HERCLON Speciality Drug House); unusually low = under 5,000:
+#   c1, c3, c4. c5 (8,000) is under the cheapest but not under half of it.
+#   ondansetron, 110 tablets: c10 10 < 11, then c9 -> 500, set by c9; under 250: c10.
+# Extra paid: c2 1,08,000 - 90,000 = 18,000; c7 3,00,000 - 2,00,000 = 1,00,000; c8 1,40,000 -
+#   1,00,000 = 40,000 -> 1,58,000. c1, c3, c4, c5 and c10 are under their cheapest and add 0
+#   (netted off they would take 6,000 + 7,000 + 7,000 + 2,000 + 3,000 away: 1,33,000).
+# Low groups, hospital x brand x supplier, each with its low rows only: DR VIVITRA Vardhman (c3 + c4:
+#   2 vials, 6,000; 20,000 - 6,000 = 14,000 under), KR VIVITRA SDH (c1: 4,000; 6,000 under), DR
+#   EMESET SDH (c10: 2,000; 5,000 - 2,000 = 3,000 under) -> 3 groups, Rs 12,000. Trastuzumab has 2
+#   of them, from 3 table rows; KR VIVITRA SDH's two months average 1,12,000 / 10 = 11,200, far
+#   above half the cheapest, yet its July vial is low.
+
+
+@pytest.fixture()
+def checks(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "PURCHASE_DATA_DIR", str(tmp_path / "purchase"))
+    monkeypatch.setattr(settings, "REFERENCE_DIR", str(tmp_path / "reference"))
+    write_prices(tmp_path / "purchase", CHECK_ROWS, CHECK_BRANDS, CHECK_VENDORS)   # the prices table only
+    write_hospital_map(tmp_path / "reference")
+    PI.clear_caches()
+    yield tmp_path
+    PI.clear_caches()
+
+
+def test_the_low_list_counts_hospital_brand_supplier_groups(client, checks):
+    d = prices(client, Month=BOTH)
+    low = d["low_prices"]
+    assert (low["rows"], low["value"], low["products"]) == (3, 12000.0, 2)
+    assert [(i["molecule_key"], i["plant"], i["material"], i["vendor_name"], i["qty"], i["value"], i["unit_price"],
+             i["cheapest_price"], i["below_cheapest"], i["lines"]) for i in low["items"]] == [
+        (TRAS[0], DR, "105002", VARDHMAN, 2.0, 6000.0, 3000.0, 10000.0, 14000.0, 2),
+        (TRAS[0], KR, "105002", SDH, 1.0, 4000.0, 4000.0, 10000.0, 6000.0, 1),
+        (ONDA[0], DR, "205001", SDH, 10.0, 2000.0, 200.0, 500.0, 3000.0, 1)]
+    assert (d["headline"]["low_rows"], d["headline"]["low_value"]) == (3, 12000.0)
+    t, o = by_key(d["molecules"])[TRAS[0]], by_key(d["molecules"])[ONDA[0]]
+    assert (t["low_rows"], o["low_rows"]) == (2, 1)                         # groups, not table rows (3 + 1)
+    listed = by_key(get(client, "/spend/prices/molecules", Month=BOTH)["data"])
+    assert (listed[TRAS[0]]["low_value"], listed[ONDA[0]]["low_value"]) == (10000.0, 2000.0)
+
+
+@pytest.mark.parametrize("params, groups", [
+    ({"Month": BOTH}, 3),
+    ({"Month": AUG}, 2),            # August's own cheapest is 10,000 too (c3 1, c4 2, c6 7 >= 3.6): c3 + c4, c10
+    ({"Month": JUL}, 0),            # July's cheapest is 8,000 (c1 1 < 1.2, c5 2): c1 is exactly half, not under it
+    ({"Month": "ALL", "Plant": KR}, 1),        # KR's own cheapest 12,000 (c1 1 < 4, c2 10): c1 under 6,000
+    ({"Month": "ALL", "Vendor": VARDHMAN}, 1),  # set against everyone's 10,000: c3 + c4
+    ({"Month": "ALL", "Segment": "onco"}, 2),   # trastuzumab only
+])
+def test_the_products_low_rows_add_up_to_the_headline(client, checks, params, groups):
+    d = prices(client, **params)
+    listed = get(client, "/spend/prices/molecules", **params)["data"]
+    assert d["headline"]["low_rows"] == d["low_prices"]["rows"] == groups, params
+    assert sum(m["low_rows"] for m in d["molecules"]) == sum(m["low_rows"] for m in listed) == groups, params
+    assert sum(m["low_value"] for m in listed) == pytest.approx(d["headline"]["low_value"]), params
+
+
+def test_a_products_dots_flag_the_groups_the_low_list_lists(client, checks):
+    d = prices(client, Month=BOTH, Molecule=TRAS[0])
+    pts = d["molecule"]["points"]
+    assert [(p["plant"], p["material"], p["vendor_name"], p["qty"], p["unit_price"], p["unusually_low"],
+             p["sets_cheapest"]) for p in pts] == [
+        (DR, "105002", VARDHMAN, 2.0, 3000.0, True, False),
+        (DR, "105002", CITY, 1.0, 8000.0, False, False),          # under the cheapest, not under half of it
+        (DR, "105001", SDH, 5.0, 10000.0, False, True),           # c6 set the usual cheapest
+        (KR, "105002", SDH, 10.0, 11200.0, True, False),          # its average is not low; July's vial was
+        (KR, "105001", VARDHMAN, 30.0, 14666.6667, False, False)]
+    listed = {(i["plant"], i["material"], i["vendor_name"]) for i in d["low_prices"]["items"]
+              if i["molecule_key"] == TRAS[0]}
+    assert {(p["plant"], p["material"], p["vendor_name"]) for p in pts if p["unusually_low"]} == listed
+    assert d["molecule"]["low_rows"] == len(listed) == 2
+
+
+def test_the_purchases_that_set_the_usual_cheapest_are_marked(client, checks):
+    m = prices(client, Month=BOTH, Molecule=TRAS[0])["molecule"]
+    assert (m["cheapest_price"], m["cheapest_brand"], m["cheapest_vendor"], m["cheapest_plant"]) == \
+        (10000.0, "HERCLON 440MG INJ VIAL", SDH, DR)
+    assert [(v["vendor_name"], v["value"], v["at_cheapest"], v["extra_paid"], v["sets_cheapest"]) for v in m["by_vendor"]] == [
+        (VARDHMAN, 446000.0, 320000.0, 140000.0, False),          # c3, c4, c7, c8
+        (SDH, 162000.0, 150000.0, 18000.0, True),                 # c1, c2, c6
+        (CITY, 8000.0, 10000.0, 0.0, False)]                      # c5
+    # July alone: its own cheapest is 8,000, set by c5 — the mark moves with the selection
+    m = prices(client, Month=JUL, Molecule=TRAS[0])["molecule"]
+    assert m["cheapest_price"] == 8000.0
+    assert [(p["vendor_name"], p["sets_cheapest"]) for p in m["points"] if p["sets_cheapest"]] == [(CITY, True)]
+    assert [v["vendor_name"] for v in m["by_vendor"] if v["sets_cheapest"]] == [CITY]
+    assert not any(p["unusually_low"] for p in m["points"])            # c1 at 4,000 is exactly half
+    # KR alone: KR's cheapest is 12,000 (c2), and the same dot holds c1, under half of it
+    kr = by_key(prices(client, Month="ALL", Plant=KR, Molecule=TRAS[0])["molecule"]["points"], "material")["105002"]
+    assert (kr["unit_price"], kr["unusually_low"], kr["sets_cheapest"]) == (11200.0, True, True)
+    # a supplier that never paid the cheapest: none of its dots is marked
+    m = prices(client, Month=BOTH, Vendor=VARDHMAN, Molecule=TRAS[0])["molecule"]
+    assert m["cheapest_price"] == 10000.0 and not any(p["sets_cheapest"] for p in m["points"])
+    assert not any(v["sets_cheapest"] for v in m["by_vendor"])
+
+
+def test_purchases_under_the_usual_cheapest_add_nothing(client, checks):
+    d = prices(client, Month=BOTH)
+    h = d["headline"]
+    assert (h["extra_paid_vs_cheapest"], h["compared_value"], h["value"]) == (158000.0, 668000.0, 668000.0)
+    assert [(m["molecule_key"], m["extra_paid"], m["varies"]) for m in d["molecules"]] == \
+        [(TRAS[0], 158000.0, True), (ONDA[0], 0.0, False)]            # one low tablet, the rest at one price
+    # a supplier or hospital that bought under the usual cheapest: nothing extra, a price index under 1
+    city = by_key(prices(client, Month=BOTH, Molecule=TRAS[0])["molecule"]["by_vendor"], "vendor_name")[CITY]
+    assert (city["extra_paid"], city["price_index"]) == (0.0, 0.8)
+    assert prices(client, Month=BOTH, Vendor=CITY)["headline"]["extra_paid_vs_cheapest"] == 0.0
+    hb = by_key(d["by_hospital"], "plant")
+    # DR: 66,000 paid for what costs 85,000 at the cheapest (c3, c4, c5 10,000 each, c6 50,000, c10 5,000)
+    assert (hb[DR]["extra_paid"], hb[DR]["value"], hb[DR]["at_cheapest"]) == (0.0, 66000.0, 85000.0)
+    assert hb[DR]["price_index"] == pytest.approx(66000 / 85000, abs=1e-4)
+    assert hb[KR]["extra_paid"] == h["extra_paid_vs_cheapest"]
+    assert any("under 1.00" in n for n in d["notes"])
+
+
+def test_the_rule_block_carries_the_benchmarks_thresholds(client, data):
+    # the page words '10%', 'half' and '1%' from here (app/etl/purchase/prices.py), never its own copy
+    want = {"usual_share_pct": 10.0, "low_ratio_pct": 50.0, "spread_min_pct": 1.0}
+    assert want == pytest.approx({"usual_share_pct": P.USUAL_SHARE * 100, "low_ratio_pct": P.LOW_RATIO * 100,
+                                  "spread_min_pct": P.SPREAD_MIN * 100})
+    assert prices(client, Month=AUG)["rule"] == want
+    assert prices(client, Month="ALL", Plant="HS01")["rule"] == want      # a hospital without purchases too
+    # the Products tab's list carries the same block on every page, with its facets and on an empty cut
+    for params in ({"Month": AUG}, {"Month": AUG, "page": 1, "page_size": 1}, {"Month": AUG, "facets": "1"},
+                   {"Month": AUG, "Vendor": SDH}, {"Month": "ALL", "Plant": "HS01"}):
+        d = get(client, "/spend/prices/molecules", **params)
+        assert d["rule"] == want, params
+    assert get(client, "/spend/prices/molecules", Month="ALL", Plant="HS01")["total"] == 0
+    # the usual cheapest generic: no purchase is flagged low and no spread is reported there
+    want_generic = {"usual_share_pct": 10.0, "low_ratio_pct": None, "spread_min_pct": None}
+    assert generic(client, Month=AUG)["rule"] == want_generic
+    assert generic(client, Month=AUG, Plant="HS01")["rule"] == want_generic
+
+
+def test_the_notes_word_the_usual_cheapest_as_the_pages_method_does(client, data):
+    # Counted up from the cheapest purchase (prices.usual_cheapest), so the price named can itself
+    # hold under the share: never "the lowest price at which 10% was bought" (spend insights.tsx
+    # usualCheapestRule). The share is the build's own constant, printed as the rule block gives it.
+    share = f"{P.USUAL_SHARE * 100:g}%"
+    assert PI.USUAL_SHARE_TEXT == share == "10%"
+    rule = (f"the unit price reached once at least {share} of the product's units have been counted, cheapest "
+            f"purchase first, so one odd cheap purchase cannot set it.")
+    generic_rule = (f"the usual cheapest generic price (the generic price reached once at least {share} of that "
+                    f"month's generic units have been counted, cheapest purchase first)")
+    assert PI.NOTE_PRICE_VALUES in prices(client, Month=AUG)["notes"] and rule in PI.NOTE_PRICE_VALUES
+    assert PI.NOTE_GENERIC_VALUES in generic(client, Month=AUG)["notes"] and generic_rule in PI.NOTE_GENERIC_VALUES
+    assert all("at which at least" not in n for n in (PI.NOTE_PRICE_VALUES, PI.NOTE_GENERIC_VALUES))
+
+
+def test_a_hospital_without_purchases_has_an_empty_low_list(client, checks):
+    d = prices(client, Month=BOTH, Plant="HS01")
+    assert d["low_prices"] == {"rows": 0, "value": 0.0, "products": 0, "items": []}
+    assert (d["headline"]["low_rows"], d["headline"]["low_value"], d["molecule"], d["molecules"]) == (0, 0.0, None, [])
+
+
+def test_every_purchase_to_check_is_in_the_paged_list(client, checks, monkeypatch):
+    # The overview lists the first TOP_N groups; /spend/prices/low pages through every one, in the
+    # same order with the same figures: the three groups of the low-list test above. Sums: qty
+    # 2 + 1 + 10 = 13, value 6,000 + 4,000 + 2,000 = 12,000, under the cheapest 14,000 + 6,000 +
+    # 3,000 = 23,000, lines 2 + 1 + 1 = 4.
+    monkeypatch.setattr(PI, "TOP_N", 2)
+    PI.clear_caches()
+    d = prices(client, Month=BOTH)
+    full = get(client, "/spend/prices/low", Month=BOTH)
+    assert (d["low_prices"]["rows"], full["total"]) == (3, 3)
+    assert full["data"][:2] == d["low_prices"]["items"] and len(d["low_prices"]["items"]) == 2
+    assert [(r["plant"], r["material"], r["vendor_name"], r["below_cheapest"]) for r in full["data"]] == [
+        (DR, "105002", VARDHMAN, 14000.0), (KR, "105002", SDH, 6000.0), (DR, "205001", SDH, 3000.0)]
+    assert list(full["data"][0]) == PI.LOW_COLUMNS
+    assert full["sums"] == {"qty": 13.0, "value": 12000.0, "below_cheapest": 23000.0, "lines": 4}
+    assert full["rule"] == d["rule"]
+    # paged, filtered by its facets, and exported 5,000 rows a page at most
+    assert get(client, "/spend/prices/low", Month=BOTH, page=1, page_size=1)["data"][0]["plant"] == KR
+    f = get(client, "/spend/prices/low", Month=BOTH, facets="1")
+    assert {x["field"] for x in f["facets"]} >= {"plant", "minor_group", "vendor_name"}
+    one = get(client, "/spend/prices/low", **{"Month": BOTH, "f.minor_group": "ONDANSETRON"})
+    assert (one["total"], one["sums"]["value"]) == (1, 2000.0)
+    assert client.get("/spend/prices/low", params={"Month": BOTH, "page_size": 5001}).status_code == 400
+    # the page filters cut it as they cut the overview: August's own cheapest, KR's own
+    assert get(client, "/spend/prices/low", Month=AUG)["total"] == prices(client, Month=AUG)["low_prices"]["rows"] == 2
+    assert get(client, "/spend/prices/low", Month="ALL", Plant=KR)["total"] == 1
+    # nothing to check: an empty list with zero sums, never an error
+    empty = get(client, "/spend/prices/low", Month=JUL)
+    assert (empty["total"], empty["data"], empty["sums"]["value"]) == (0, [], 0.0)
+    assert get(client, "/spend/prices/low", Month=BOTH, Plant="HS01")["total"] == 0
+    assert client.get("/spend/prices/low", params={"Plant": "NOWHERE"}).status_code == 404
+    assert client.get("/spend/prices/low", params={"Month": "2025-01"}).status_code == 400
+
+
+# A product whose strength the purchase build writes in its own number form, '4.5e+06IU' (the
+# key keeps that spelling, lower-case 'e' included), bought by KR at 2,000 and DR at 3,000 a vial.
+COLI = ("COLISTIMETHATE|4.5e+06IU|INJ|", "COLISTIMETHATE", "4.5e+06IU", "INJ")
+COLI_BRANDS = {"106001": ("COLISTIN 4.5MIU INJ VIAL", "COLISTIMETHATE", "CIPLA", COLI)}
+COLI_ROWS = [(AUG, KR, "106001", "50790", "ok", 10, 20000.0), (AUG, DR, "106001", "52366", "ok", 10, 30000.0)]
+
+
+def test_a_product_key_is_found_as_the_build_spells_it(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "PURCHASE_DATA_DIR", str(tmp_path / "purchase"))
+    monkeypatch.setattr(settings, "REFERENCE_DIR", str(tmp_path / "reference"))
+    write_prices(tmp_path / "purchase", COLI_ROWS, COLI_BRANDS, VENDORS)
+    write_hospital_map(tmp_path / "reference")
+    PI.clear_caches()
+    # 20 vials; the usual cheapest is KR's 2,000 (10 >= 2); DR paid 30,000 - 20,000 = 10,000 above it
+    for sent in (COLI[0], COLI[0].upper(), COLI[0].lower()):
+        d = prices(client, Month=AUG, Molecule=sent)
+        assert d["molecule"]["molecule_key"] == d["scope"]["molecule"] == COLI[0], sent
+        assert (d["molecule"]["cheapest_price"], d["molecule"]["extra_paid"]) == (2000.0, 10000.0), sent
+        assert not any("was not bought" in n for n in d["notes"]), sent
+    d = prices(client, Month=AUG, Molecule="COLISTIMETHATE|9e+06IU|INJ|")
+    assert d["molecule"] is None and "COLISTIMETHATE|9e+06IU|INJ| was not bought at a comparable price" in \
+        " ".join(d["notes"])
+    PI.clear_caches()
 
 
 # ---------- generic vs branded ----------
@@ -435,6 +689,8 @@ def test_generic_definition_is_estimated(client, data):
     (data / "purchase" / C.VALIDATION_FILE).unlink()
     PI.clear_caches()
     assert generic(client, Month=AUG)["definition"]["text"] == Gn.DEFINITION
+    # Estimated: the app's own reading, with nothing for HCG to confirm
+    assert "Estimated definition" in Gn.DEFINITION and "until HCG" not in Gn.DEFINITION
 
 
 def test_generic_brand_filter_and_a_hospital_without_purchases(client, data):

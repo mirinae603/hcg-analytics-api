@@ -40,6 +40,15 @@ _MONTH_NUM = {m: i + 1 for i, m in enumerate(da.MONTH_ORDER)}
 _PLAIN_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
+# The most rows one page may hold. Without a ceiling one request could page a whole table into
+# memory (the GRN export's ~3.8 lakh lines are ~2 GB as JSON) on the 512 MB host. MAX_PAGE_SIZE
+# is the largest page any caller sends today (the legacy tables' page_size=100000); the lists
+# built for the Export CSV take EXPORT_MAX_PAGE, its page (hcg-analytics-ui table/exportCsv.ts
+# EXPORT_PAGE), which is also the AI's ALL_ROWS (app/ai/hcg_reports.py): change them together.
+MAX_PAGE_SIZE = 100_000
+EXPORT_MAX_PAGE = 5_000
+DEFAULT_PAGE_SIZE = 25
+
 
 @dataclass(frozen=True)
 class Facet:
@@ -174,6 +183,19 @@ def _int(params: Mapping, key: str, default: int) -> int:
         return int(v or default)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"{key} must be a whole number, not '{v}'")
+
+
+def _paging(params: Mapping, max_page_size: int) -> tuple:
+    """(page, page_size) as asked: page from 0, page_size from 1 to `max_page_size`; 400 for
+    anything else. A negative size would slice from the far end and hand back almost the whole
+    table, so it is refused like any other bad value, never read as a smaller page."""
+    page, size = _int(params, "page", 0), _int(params, "page_size", DEFAULT_PAGE_SIZE)
+    if page < 0:
+        raise HTTPException(status_code=400, detail=f"page must be 0 or more, not {page}")
+    if not 1 <= size <= max_page_size:
+        raise HTTPException(status_code=400, detail=(
+            f"page_size must be from 1 to {max_page_size:,} rows, not {size:,}; page through a longer list"))
+    return page, size
 
 
 def _mode(params: Mapping) -> Optional[str]:
@@ -454,15 +476,18 @@ def _merge(standard: list, declared: Sequence[Facet], df: pd.DataFrame) -> list:
 def table_page(df: pd.DataFrame, params: Mapping, *, facets: Sequence[Facet] = (),
                scope: Sequence[Optional[ScopeChip]] = (), columns: Optional[Sequence[str]] = None,
                rename: Optional[Mapping] = None, sum_cols: Optional[Sequence[str]] = None,
-               col_map: Optional[Mapping] = None) -> dict:
+               col_map: Optional[Mapping] = None, max_page_size: int = MAX_PAGE_SIZE) -> dict:
     """Filter, search, sort and page `df` (already cut to the page's scope).
 
     `columns` / `rename` pick and rename what the rows carry; `col_map` maps a requested field
     name to its column (default: the reverse of `rename`). `sum_cols` adds `sums` over the
     filtered rows. `facets` are the table's own filters beside the standard ones; `scope` the
-    upstream filters echoed with facets=1 (None entries are skipped)."""
+    upstream filters echoed with facets=1 (None entries are skipped). `max_page_size` is the
+    most rows one page may ask for (MAX_PAGE_SIZE, or EXPORT_MAX_PAGE for a list the Export
+    CSV pages through); page and page_size are checked before any work is done."""
     rename = dict(rename or {})
     names = {**{v: k for k, v in rename.items()}, **(col_map or {})}
+    page, size = _paging(params, max_page_size)
     mode = _mode(params)
 
     df = legacy_filters(df, params, names)
@@ -500,7 +525,6 @@ def table_page(df: pd.DataFrame, params: Mapping, *, facets: Sequence[Facet] = (
     elif {"year", "month"} <= set(rows.columns):
         rows = rows.assign(_mk=da._month_sort_key(rows)).sort_values(["year", "_mk"]).drop(columns="_mk")
 
-    page, size = _int(params, "page", 0), _int(params, "page_size", 25) or 25
     rows = rows.iloc[page * size: page * size + size]
     rows = rows[[c for c in (columns or own_cols) if c in rows.columns]].rename(columns=rename)
     fields = _csv(params, "fields")

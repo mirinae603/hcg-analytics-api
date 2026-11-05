@@ -21,6 +21,10 @@ exist. The texts now carry tokens, and fill() puts in what the data says today:
                      is named, so a trend is not read through it
   <<SNAPSHOT>>       the inventory snapshot date: 2026-05-31   (fact_inventory.snapshot_date)
   <<SNAPSHOT_SQL>>   the same as a SQL value: DATE '2026-05-31'
+  <<STOCK_MONTHS>>   how many months of internal issues lead up to that stock count: "6"
+                     (fact_consumption up to the snapshot, as data_access.stock_months reads them).
+                     The turnover recipe annualises its internal part by 12 / this and its billed
+                     part by 12 / <<SALES_MONTHS>>, the dashboard's own per-part factors.
 
 The sources end in different months (billing before the receipts, the receipts before the
 orders), so each has its own window (SOURCES; transaction_windows()). The procurement totals
@@ -126,6 +130,30 @@ def snapshot_date() -> str | None:
     return _max_date_at(*k, "snapshot_date") if k else None
 
 
+@lru_cache(maxsize=4)
+def _months_to_count_at(issues: tuple, stock: tuple | None) -> tuple[str, ...]:
+    try:
+        import pandas as pd
+        from app.etl.transforms import consumption_until
+        snap = pd.read_parquet(stock[0], columns=["snapshot_date"])["snapshot_date"].max() if stock else pd.NaT
+        dates = consumption_until(pd.read_parquet(issues[0], columns=["posting_date"]), snap)["posting_date"]
+    except Exception:  # unreadable or wrong schema: the window is unknown
+        return ()
+    dates = pd.to_datetime(dates, errors="coerce").dropna()
+    return tuple(sorted(dates.dt.strftime("%Y-%m").unique()))
+
+
+def stock_months() -> tuple[str, ...]:
+    """The months holding internal issues up to the stock count ('2025-12', ...): the window the
+    dashboard's turnover and days on hand set the counted stock against, read by the same rule
+    (transforms.consumption_until, as data_access.stock_months does), so the assistant annualises
+    with the dashboard's factor. No stock count: every month of issues. () when unreadable."""
+    issues = _key(Path(settings.CURATED_DIR) / "fact_consumption.parquet")
+    if not issues:
+        return ()
+    return _months_to_count_at(issues, _key(Path(settings.CURATED_DIR) / "fact_inventory.parquet"))
+
+
 # ---------- wording ----------
 
 def _abbr(ym: str) -> str:
@@ -196,7 +224,7 @@ def values() -> dict[str, str]:
     """Every token's text for the data as it is now (the months here, and the totals of
     app/ai/figures.py)."""
     from app.ai import figures
-    r, s, snap = report_months(), sales_months(), snapshot_date()
+    r, s, snap, st = report_months(), sales_months(), snapshot_date(), stock_months()
     return {
         **{src.token: window(months_of(src)) or f"the {src.label} months" for src in SOURCES[1:]},
         **figures.values(),
@@ -211,6 +239,7 @@ def values() -> dict[str, str]:
         "SALES_YEARS": _years(s) if s else "check which months each year holds",
         "SNAPSHOT": snap or "the inventory snapshot date",
         "SNAPSHOT_SQL": f"DATE '{snap}'" if snap else "(SELECT MAX(snapshot_date)::DATE FROM fact_inventory)",
+        "STOCK_MONTHS": str(len(st)) if st else "few",
     }
 
 

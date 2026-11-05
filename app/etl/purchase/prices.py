@@ -37,7 +37,8 @@ price_status 'ok' and a molecule_key:
   extra paid    what each row paid above the cheapest: sum of max(0, value - cheapest x qty),
                 a row at the row's own average price; a row under the cheapest adds nothing
   unusually low a row priced under LOW_RATIO x the cheapest: still compared, and listed for HCG
-                to check (a one-off deal or a keying slip)
+                to check (a one-off deal or a keying slip); counted per hospital x brand x
+                supplier (LOW_GROUP), as the API counts them, whatever the months or SAP codes
 No GR, PO or invoice number and no line-level row is published.
 """
 from __future__ import annotations
@@ -66,6 +67,10 @@ SPREAD_MIN = 0.01                # report: a product varies when its dearest is 
 USUAL_SHARE = 0.10               # the usual cheapest: the lowest price at which >= 10% of the quantity was bought
 LOW_RATIO = 0.5                  # a purchase under half the usual cheapest is unusually low (listed to check)
 TOP_PRODUCTS = 10                # report: products listed per month
+# Unusually low purchases are counted per hospital x brand x supplier: a supplier by name
+# (vendor_keys: all its SAP codes) and every month of the cut together, so the report's
+# low_rows and the API's (headline, products, the to-check list) count the same groups.
+LOW_GROUP = ("plant", "material", "vendor")
 
 # --- The published table: purchase_prices ---------------------------------------------------
 PRODUCT_COLUMNS = ["molecule_key", "molecule", "strength", "form", "kind"]
@@ -251,28 +256,46 @@ def vendor_keys(names: pd.Series) -> pd.Series:
     return names.map({n: K.norm_text(n) for n in names.unique()})
 
 
+def most_common(df: pd.DataFrame, by: str, column: str) -> pd.Series:
+    """Per group `by` (index): the `column` value written on most of its rows, of equal counts
+    the one written first (row order); a group with none written is left out. What
+    `s.value_counts().index[0]` gives per group, without a Python call per group: one per
+    product took 0.8 s of the prices overview's 1.5 s (1,819 products in a month)."""
+    d = df.loc[df[column].notna(), [by, column]]
+    # sort=False lists each group's values in the order they are first written, and the
+    # stable sort by count keeps that order between equal counts.
+    n = d.groupby([by, column], sort=False, observed=True).size().rename("_n").reset_index()
+    n = n.sort_values("_n", ascending=False, kind="mergesort")
+    return n.drop_duplicates(by).set_index(by)[column]
+
+
 def products(table: pd.DataFrame) -> pd.DataFrame:
     """purchase_prices rows (any cut) -> one row per molecule_key of the comparable rows
     (PRODUCT_VIEW_COLUMNS): the usual cheapest, lowest and dearest unit price, the
-    value-weighted price, the spread, the extra paid above the usual cheapest, the rows priced
-    unusually low, and how many brands, vendors (suppliers by name, vendor_keys) and centres;
+    value-weighted price, the spread, the extra paid above the usual cheapest, the hospital x
+    brand x supplier groups (LOW_GROUP) with a purchase priced unusually low and what those
+    purchases cost, and how many brands, vendors (suppliers by name, vendor_keys) and centres;
     most extra paid first. minor_group is the one on most rows (HCG's spelling)."""
     ok = table[table["price_status"].eq(OK) & table["molecule_key"].notna()]
     if ok.empty:
         return pd.DataFrame(columns=PRODUCT_VIEW_COLUMNS)
-    ok = ok.assign(_vendor=vendor_keys(ok["vendor_name"]), _price=row_prices(ok))
+    ok = ok.assign(vendor=vendor_keys(ok["vendor_name"]), _price=row_prices(ok))
     cheapest = usual_cheapest(ok, "molecule_key", "_price")["_price"]
     per_row = ok["molecule_key"].map(cheapest)
     low = unusually_low(ok, per_row)
-    ok = ok.assign(_extra=extra_paid(ok, per_row), _low_rows=low.astype(int),
-                   _low_value=ok["value"].where(low, 0.0))
+    ok = ok.assign(_extra=extra_paid(ok, per_row), _low_value=ok["value"].where(low, 0.0))
     out = ok.groupby("molecule_key").agg(
-        minor_group=("minor_group", lambda s: s.value_counts().index[0] if s.notna().any() else None),
         strength=("strength", "first"), form=("form", "first"),
         min_price=("unit_price_min", "min"), max_price=("unit_price_max", "max"),
         qty=("qty", "sum"), value=("value", "sum"), extra_paid=("_extra", "sum"),
-        low_rows=("_low_rows", "sum"), low_value=("_low_value", "sum"), brands=("material", "nunique"),
-        vendors=("_vendor", "nunique"), plants=("plant", "nunique"))
+        low_value=("_low_value", "sum"), brands=("material", "nunique"),
+        vendors=("vendor", "nunique"), plants=("plant", "nunique"))
+    groups = ok.loc[low, ["molecule_key", *LOW_GROUP]].drop_duplicates()
+    out["low_rows"] = groups["molecule_key"].value_counts().reindex(out.index, fill_value=0).astype("int64")
+    # in the column's own dtype; a product with no minor group written gets None (NaN in a
+    # string column), as the per-product value_counts() call this replaces gave
+    mode = most_common(ok, "molecule_key", "minor_group").reindex(out.index)
+    out["minor_group"] = mode.where(mode.notna(), None)
     out["cheapest_price"] = cheapest.reindex(out.index)
     out["wavg_price"] = out["value"] / out["qty"]
     out["spread_ratio"] = out["max_price"] / out["cheapest_price"]
@@ -320,9 +343,9 @@ def summary_line(months: dict) -> str:
     rep = months[p]
     off = {s: rep["by_status"].get(s, {}).get("lines", 0) for s in (TOKEN, OTHER_UNIT, NO_PRICE)}
     return (f"[purchase] prices: {len(months)} months; {p}: {rep['products']:,} products, "
-            f"{rep['products_with_spread']:,} bought at more than one price, "
-            f"{rep['extra_paid_vs_cheapest']:,.2f} paid above the cheapest; not compared: "
-            + ", ".join(f"{n:,} {s}" for s, n in off.items()) + " lines")
+            f"{rep['products_with_spread']:,} with the dearest at least {SPREAD_MIN:.0%} above the "
+            f"usual cheapest, {rep['extra_paid_vs_cheapest']:,.2f} paid above the usual cheapest; "
+            f"not compared: " + ", ".join(f"{n:,} {s}" for s, n in off.items()) + " lines")
 
 
 def report_section() -> dict:
@@ -345,9 +368,10 @@ def report_section() -> dict:
                            f"value-weighted price = sum value / sum qty; extra paid = sum over rows of "
                            f"max(0, value - cheapest x qty)",
             "unusually_low": f"a row priced under {LOW_RATIO:g} x its product's usual cheapest: "
-                             f"still compared, listed for HCG to check",
+                             f"still compared, listed for HCG to check; rows = the hospital x brand "
+                             f"x supplier groups with one (a supplier by name, all its SAP codes)",
             "report": f"a product varies when its dearest is at least {SPREAD_MIN:.0%} above its "
-                      f"cheapest; extra paid per month over all centres",
+                      f"usual cheapest; extra paid per month over all centres",
         },
     }
 

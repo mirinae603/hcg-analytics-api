@@ -37,7 +37,7 @@ import pandas as pd
 from app.etl.formulary import classify as K
 from app.etl.formulary import config as FC
 from app.etl.formulary import excel as X
-from app.etl.formulary.discover import BuildError, _excel_files, discover
+from app.etl.formulary.discover import BuildError, _excel_files, discover, not_read
 from app.etl.formulary.masters import ItemMaster, load_item_master
 from app.etl.purchase import config as C
 from app.etl.purchase.grn import clean_code, parse_gr_date, single_period
@@ -82,21 +82,28 @@ def find_oof_dir(raw=None) -> Path:
     return found[0]
 
 
-def find_oof_master(raw=None) -> Path:
-    """The one workbook in the OOF folder's 'Out Of formulary Master Sheet' sub-folder."""
+def find_oof_master(raw=None, skipped: Optional[list] = None) -> Path:
+    """The one workbook in the OOF folder's 'Out Of formulary Master Sheet' sub-folder. The
+    sub-folder's files that are not read and its own sub-folders (discover.SkippedFile) go into
+    `skipped`."""
     d = find_oof_dir(raw)
+    passed: list = []
     found = [p for sub in sorted(d.iterdir())
              if sub.is_dir() and C.OOF_MASTER_DIR_RE.match(sub.name.strip())
-             for p in _excel_files(sub)]
+             for p in _excel_files(sub, passed, expected_folders=())]
+    if skipped is not None:
+        skipped += passed
     if len(found) != 1:
-        raise BuildError(f"expected one OOF master workbook in {d.name}/'Out Of formulary Master "
-                         f"Sheet ...', found {len(found)}")
+        raise BuildError(f"expected one OOF master workbook (.xlsx or .xlsb) in {d.name}/'Out Of "
+                         f"formulary Master Sheet ...', found {len(found)}{not_read(passed)}")
     return found[0]
 
 
-def find_hcg_workbooks(raw=None) -> list:
-    """HCG's monthly OOF workbooks: every Excel file directly in the OOF folder."""
-    return _excel_files(find_oof_dir(raw))
+def find_hcg_workbooks(raw=None, skipped: Optional[list] = None) -> list:
+    """HCG's monthly OOF workbooks: every Excel file directly in the OOF folder. Its other files
+    and every sub-folder but the OOF master's go into `skipped` (discover.SkippedFile): a month's
+    workbook sent as .xls, or put in a sub-folder of its own, is named, not lost."""
+    return _excel_files(find_oof_dir(raw), skipped, expected_folders=(C.OOF_MASTER_DIR_RE,))
 
 
 # --------------------------------------------------------------------------- #
@@ -451,10 +458,14 @@ ITEM_MASTER_COLUMNS = ["material", "formulary_class", "formulary_flag", "tier", 
                        "minor_group", "manufacturer"]
 
 
-def item_master_paths(raw=None) -> dict:
+def item_master_paths(raw=None, skipped: Optional[list] = None) -> dict:
     """{period: Item Master path} as the formulary build discovers them (month from the
-    file name; one master per month)."""
-    return dict(discover(raw).item_masters)
+    file name; one master per month). The Item Master folder's files that are not read
+    (discover.SkippedFile) go into `skipped`."""
+    m = discover(raw)
+    if skipped is not None:
+        skipped += m.skipped_item_masters
+    return dict(m.item_masters)
 
 
 def load_month_item_master(period: str, raw=None, paths: Optional[dict] = None) -> ItemMaster:

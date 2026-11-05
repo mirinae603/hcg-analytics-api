@@ -37,6 +37,18 @@ The golden guard (abort_reasons): with HCG's worksheet of a month, every centre 
 Summary and KR HCG's email within a rupee. A month HCG's email has figures for but whose
 workbook was not read aborts as well, unless the build is told to publish it from sources 2-5.
 
+A new month warns, never stops (decisions of 31-10-2026):
+  waiting     a GRN month from the first Item Master on that has no Item Master of its own: its
+              out-of-formulary rows wait (another month's flags give wrong numbers) while price
+              variation and generic vs branded, which need none, are built (WAITING_NOTE).
+              GRN months before the first Item Master are HCG's purchase history: prices and
+              generic only, no warning.
+  estimated   a month built without HCG's worksheet (sources 2-5): published, its month report
+              and the API say so (ESTIMATED_NOTE); hcg_working_months reads it off the table.
+A month already published whose Item Master is no longer in the folder is not a new month: built
+on, it would keep its published rows while losing their report, and its prices and generic would
+be rebuilt on another month's master. The build stops and names the file (lost_item_masters).
+
 Line-level frames stay in memory: the published table (OOF_COLUMNS) is aggregated to period
 x plant x material x vendor x suggestion, and carries no GR, PO or invoice number.
 """
@@ -51,6 +63,7 @@ from typing import Callable, Collection, Iterable, Mapping, Optional, Sequence
 import pandas as pd
 
 from app.etl.formulary import classify as K
+from app.etl.formulary import config as FC
 from app.etl.formulary.discover import BuildError
 from app.etl.purchase import config as C
 from app.etl.purchase import molecule as Mo
@@ -90,6 +103,17 @@ NO_PACK_DISTANCE = 9.0           # tie-break distance when a pack size is not wr
 # HCG's emailed figures the build checks KR against (rounded rupees), and the guard.
 EMAIL_FILE = "oof_email_figures.csv"
 MAX_HCG_DIFF = 1.0               # rupees: a centre (or KR vs the email) further off aborts
+
+# A new month's notices, in the words the build log, purchase_validation.json and the API share.
+WAITING_NOTE = "Out of formulary for {label} waits for its Item Master; prices and generic are built"
+ESTIMATED_NOTE = ("Estimated: HCG's working for {label} was not received; suggestions come from HCG's "
+                  "other months and lists, then the app's match (Estimated)")
+# A published month whose Item Master has left the folder (deleted, renamed, moved into a
+# sub-folder): the build stops, so the operator puts the file back (lost_item_masters).
+LOST_ITEM_MASTER_NOTE = ("{period}: out of formulary for {label} is published, built on {built_on}, "
+                         "which is no longer in the Item Master folder; put it back (a published "
+                         "month is rebuilt only on its own Item Master), or rebuild only the other "
+                         "months with --months")
 
 # --- The published table: oof_purchase ----------------------------------------------------
 GROUP_KEYS = ["period", "plant", "material", "vendor_code", "status", "suggestion_source",
@@ -394,6 +418,47 @@ class Chain:
 
 
 # --------------------------------------------------------------------------- #
+# New months: waiting for an Item Master, estimated without HCG's worksheet
+# --------------------------------------------------------------------------- #
+def waiting_note(period: str) -> str:
+    return WAITING_NOTE.format(label=FC.period_label(period))
+
+
+def estimated_note(period: str) -> str:
+    return ESTIMATED_NOTE.format(label=FC.period_label(period))
+
+
+def waiting_for_item_master(periods: Iterable[str], item_masters: Collection[str]) -> list:
+    """The GRN months whose out-of-formulary rows wait for an Item Master: every month from the
+    first Item Master on without one of its own (every month when there is no Item Master at
+    all). A month before the first Item Master is HCG's purchase history, never waiting."""
+    first = min(item_masters, default=None)
+    return [p for p in sorted(periods) if p not in item_masters and (first is None or p > first)]
+
+
+def lost_item_masters(periods: Iterable[str], item_masters: Collection[str],
+                      published: Mapping[str, Optional[str]]) -> list:
+    """The abort reasons for the months being built whose out-of-formulary rows are published
+    but whose Item Master is no longer in the folder. published: period -> the Item Master file
+    the published rows of that month were built on (None when the published report does not
+    name it), for every month the published oof_purchase holds. Such a month does not wait (it is
+    not new) and is not history (it was built): its own master is missing."""
+    out = []
+    for p in sorted((set(periods) & set(published)) - set(item_masters)):
+        built_on = f"the Item Master {published[p]!r}" if published[p] else "its own Item Master"
+        out.append(LOST_ITEM_MASTER_NOTE.format(period=p, label=FC.period_label(p), built_on=built_on))
+    return out
+
+
+def hcg_working_months(table: pd.DataFrame) -> set:
+    """The months of oof_purchase built from HCG's own worksheet of the month. Such a month's
+    rows are source 1 (hcg_sheet, counted or parked) or none, a month built without it sources
+    2-5 only, so a month is HCG's when any of its rows is hcg_sheet; every other month is
+    estimated (ESTIMATED_NOTE)."""
+    return set(table.loc[table["suggestion_source"].astype(str).eq(HCG_SHEET), "period"].astype(str))
+
+
+# --------------------------------------------------------------------------- #
 # Lines and values
 # --------------------------------------------------------------------------- #
 def out_of_formulary(lines: pd.DataFrame, item_master: pd.DataFrame) -> pd.DataFrame:
@@ -646,6 +711,8 @@ def month_report(period: str, valued: pd.DataFrame, *, item_master_file: Optiona
                         "total_pp": _r(valued["total_pp"].sum())},
         "suggestions_from": "HCG's worksheet of the month (source 1)" if wb is not None else
                             "sources 2-5: HCG's pairs from other worksheets, HCG's master, our rule",
+        "hcg_working": wb is not None,
+        "estimated": wb is None,
         "pair_months": pair_months_used,
         "formulary_pool_brands": pool_size,
         "by_status": _counts(valued, "status"),
@@ -660,9 +727,11 @@ def month_report(period: str, valued: pd.DataFrame, *, item_master_file: Optiona
     if wb is not None:
         rep["hcg"] = {**wb.report(), **compare_centres(centres, wb.summary),
                       "pair_check": pair_check(valued, wb)}
-    if email is not None and wb is None:
-        rep["warnings"].append(f"{period}: HCG's email has KR figures but HCG's worksheet is "
-                               f"missing; our figures come from sources 2-5")
+    if wb is None:
+        rep["warnings"].append(estimated_note(period))
+        if email is not None:
+            rep["warnings"].append(f"{period}: HCG's email has KR figures but HCG's worksheet is "
+                                   f"missing; our figures come from sources 2-5")
     return rep
 
 
@@ -754,9 +823,17 @@ def build_tables(*, lines: pd.DataFrame, periods: Sequence[str], item_masters: M
     its own Item Master, with each month's report and the golden guard's abort reasons.
     without_sheet: months to publish from sources 2-5 although HCG's email has figures for
     them (their workbook is missing). HCG's own tables replace only the months whose workbook
-    was read: a month built without it keeps the HCG figures published before."""
+    was read: a month built without it keeps the HCG figures published before. A month
+    waiting for its Item Master (waiting_for_item_master) gets a report that says so and a
+    warning, never an abort; a month built without HCG's worksheet is warned of as estimated.
+    A month already published on an Item Master no longer in the folder never gets here:
+    build.run stops on lost_item_masters first."""
     oof_periods = [p for p in sorted(periods) if p in item_masters]
     out = OofBuild()
+    for p in waiting_for_item_master(periods, item_masters):
+        note = waiting_note(p)
+        out.months[p] = {"item_master": None, "waiting_for_item_master": True, "warnings": [note]}
+        log(f"[purchase] warning: {note}")
     if not oof_periods:
         return out
     _check_years(oof_periods, master, main)
@@ -788,6 +865,8 @@ def build_tables(*, lines: pd.DataFrame, periods: Sequence[str], item_masters: M
         out.months[p] = rep
         out.problems += abort_reasons(p, rep, sheet_waived=p in without_sheet)
         log(_summary_line(p, rep))
+        if wb is None:
+            log(f"[purchase] warning: {estimated_note(p)}")
     read = [p for p in oof_periods if p in hcg]
     out.tables = {C.OOF: pd.concat(parts, ignore_index=True), **hcg_tables(hcg, read)}
     out.replaces = {C.OOF: oof_periods, **{name: read for name in C.HCG_TABLES}}
@@ -863,6 +942,11 @@ def report_section(master: OofMaster, main: MainSheet, hcg: Mapping[str, HcgWork
                      f"HCG's Summary and KR within Rs {MAX_HCG_DIFF:g} of HCG's email, else nothing "
                      f"is published; a month HCG's email has figures for but whose workbook was not "
                      f"read is not published either, unless the build is run with --without-hcg-sheet",
+            "new_months": "a warning, never a stop: a GRN month from the first Item Master on without "
+                          "its own Item Master waits (no out-of-formulary rows; prices and generic are "
+                          "built; its month report has waiting_for_item_master); a month built without "
+                          "HCG's worksheet is published from sources 2-5 and marked estimated "
+                          "(hcg_working false)",
         },
         "oof_master": {"file": master.name, "sheet": master.sheet,
                        "financial_year": f"{master.fy[0]}-{str(master.fy[1])[2:]}" if master.fy else None,

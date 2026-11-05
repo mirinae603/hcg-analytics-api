@@ -2,7 +2,7 @@
 side splits by formulary class, and what the originator brands cost above the cheapest
 generic of the same product.
 
-The definition (decision D12; shown as an 'Estimated definition' until HCG confirms it):
+The definition (decision D12; shown as an 'Estimated definition', the app's own reading):
   branded   a product of an ORIGINATOR (innovator) company: the GRN 'Manufacturer' starts with
             the words of a pattern in app/data/reference/originator_manufacturers.csv
             (pattern, company, reason) — Roche, MSD, AstraZeneca, BMS, Pfizer, ...
@@ -57,7 +57,7 @@ ORIGINATOR_FILE = "originator_manufacturers.csv"
 OVERRIDES_FILE = "generic_overrides.csv"
 DEFINITION = ("Branded = a product of an originator (innovator) company; generic = every other "
               "product (Indian brands, biosimilars, Attis own label, Jan Aushadhi, MNC generic and "
-              "hospital makers). Estimated definition until HCG confirms it.")
+              "hospital makers). Estimated definition: the app's own reading.")
 # HCG's tier letters on a FORMULARY item (Item Master Category) in four groups.
 PREFERRED, SCHEME_ONLY, RESTRICTED, OTHER_TIER = "preferred", "scheme_only", "restricted", "other"
 TIER_GROUPS = {"P": PREFERRED, "P-SCH": PREFERRED, "P-OPD": PREFERRED, "SCH": SCHEME_ONLY,

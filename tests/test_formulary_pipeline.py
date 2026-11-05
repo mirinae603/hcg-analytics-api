@@ -18,7 +18,7 @@ from openpyxl import Workbook
 
 from app.etl.formulary import config as C
 from app.etl.formulary.build import build, main
-from app.etl.formulary.discover import BuildError
+from app.etl.formulary.discover import BuildError, discover, skip_reason
 
 DASH = "Formulary Compliance and Spend Analysis Dashboard data"
 LINE_COLS = ["Type", "LOCATIONNAME", "SALESINVOICENO", "SALESDATE", "UHID", "IP_OPNUMBER",
@@ -394,6 +394,132 @@ def test_a_month_without_its_own_item_master_aborts(env):
      "Copy of Item master for formulary complience August -26_Updated.xlsx").rename(
         env["dash"] / "Item Master Sheet" / "Copy of item master July 2026.xlsx")
     with pytest.raises(BuildError, match="no Item Master for 2026-08"):
+        run(env)
+    assert _nothing_published(env)
+
+
+# --- files the build does not read: named with the reason, never passed over in silence ---------
+def _touch(path: Path) -> None:
+    path.write_bytes(b"not a workbook")         # discovery never opens a file it does not read
+
+
+def test_files_of_other_types_are_named_and_the_build_goes_on(env):
+    dash = env["dash"]
+    _touch(dash / "IP and OP sales" / "IP & OP Consolidated File September 26.xls")
+    _touch(dash / "Item Master Sheet" / "Item Master Sep 26.csv")
+    _touch(dash / "Formulary notes.pdf")
+    for lock in (".~lock.IP & OP Consolidated File August 26.xlsx#", "~$IP & OP Consolidated File August 26.xlsx"):
+        _touch(dash / "IP and OP sales" / lock)                       # lock files: not HCG's, no word
+    m = discover(env["dirs"]["raw"])
+    assert list(m.sales) == list(m.item_masters) == ["2026-08"]
+    assert [(s.folder, s.name) for s in m.skipped] == [
+        ("IP and OP sales", "IP & OP Consolidated File September 26.xls"),
+        ("Item Master Sheet", "Item Master Sep 26.csv"), (DASH, "Formulary notes.pdf")]
+    assert m.warnings[:3] == [str(s) for s in m.skipped]
+    assert str(m.skipped[0]) == ("IP and OP sales/IP & OP Consolidated File September 26.xls is not read: an Excel "
+                                 "97-2003 workbook (.xls), which the build does not read: open it and save it as .xlsx")
+    logs: list = []
+    rep = build(log=logs.append, **env["dirs"])                        # Aug is built as before
+    assert f"[formulary] note: {m.skipped[1]}" in logs
+    assert abc(tables(env)[C.SUMMARY]) == (2750.0, 510.0, 360.0)
+    # ... and the published validation report lists them too, as the spend and purchase reports do
+    v = json.loads((env["dirs"]["data"] / C.VALIDATION_FILE).read_text())
+    assert v["warnings"] == rep["warnings"] == m.warnings and len(m.warnings) == 3
+
+
+def test_the_report_warnings_describe_the_raw_folder_as_it_is_now(env):
+    dash = env["dash"]
+    run(env)                                                           # a clean folder: no warning
+    path = env["dirs"]["data"] / C.VALIDATION_FILE
+    assert json.loads(path.read_text())["warnings"] == []
+    _touch(dash / "Item Master Sheet" / "Item Master Sep 26.xls")
+    write_master(dash / "Item Master Sheet" / "Item master for formulary complience July 26.xlsx")
+    rep = run(env, months=["2026-08"])
+    assert rep["warnings"] == [
+        "Item Master Sheet/Item Master Sep 26.xls is not read: " + C.SKIPPED_SUFFIX_REASONS[".xls"],
+        "Item Master for 2026-07 has no sales file (not used)"]
+    assert json.loads(path.read_text())["warnings"] == rep["warnings"]
+    # the files sent again as .xlsx (and the spare master taken away): the next report says nothing,
+    # it does not keep the last report's warnings
+    (dash / "Item Master Sheet" / "Item Master Sep 26.xls").unlink()
+    (dash / "Item Master Sheet" / "Item master for formulary complience July 26.xlsx").unlink()
+    assert run(env, from_cache=True)["warnings"] == []
+    assert json.loads(path.read_text())["warnings"] == []
+    # a dry run's report carries them too
+    _touch(dash / "Formulary notes.pdf")
+    run(env, dry_run=True)
+    dry = json.loads((env["dirs"]["cache"] / "formulary_validation.dry-run.json").read_text())
+    assert dry["warnings"] == [f"{DASH}/Formulary notes.pdf is not read: not an Excel workbook (.pdf): "
+                               "only .xlsx and .xlsb files are read"]
+
+
+def test_the_failing_report_lists_the_files_not_read(env):
+    _touch(env["dash"] / "IP and OP sales" / "IP & OP Consolidated File September 26.csv")
+    write_sales(env["dash"] / "IP and OP sales" / "IP & OP Consolidated File August 26.xlsx",
+                LINES, period="2026-07")
+    with pytest.raises(BuildError, match="SALESDATE outside 2026-08"):
+        run(env)
+    assert _nothing_published(env)
+    failed = json.loads((env["dirs"]["cache"] / "formulary_validation.failed.json").read_text())
+    assert failed["warnings"] == ["IP and OP sales/IP & OP Consolidated File September 26.csv is not read: "
+                                  + C.SKIPPED_SUFFIX_REASONS[".csv"]]
+
+
+@pytest.mark.parametrize("name, reason", [
+    ("a.xlsx", None), ("a.XLSB", None), (".~lock.a.xlsx#", None), ("~$a.xlsx", None), ("Thumbs.db", None),
+    ("~WRL0001.tmp", None), ("a.xlsx.tmp", None), ("A1B2C3D4.TMP", None),       # Office's save-temp files
+    ("A1B2C3D4", "not an Excel workbook (no file type): only .xlsx and .xlsb files are read"),   # named: harmless
+    ("a.xls", C.SKIPPED_SUFFIX_REASONS[".xls"]), ("a.XLSM", C.SKIPPED_SUFFIX_REASONS[".xlsm"]),
+    ("a.csv", C.SKIPPED_SUFFIX_REASONS[".csv"]),
+    ("a.pdf", "not an Excel workbook (.pdf): only .xlsx and .xlsb files are read"),
+    ("Item Master Sep 26", "not an Excel workbook (no file type): only .xlsx and .xlsb files are read"),
+])
+def test_why_a_file_is_not_read(name, reason):
+    assert skip_reason(Path(name)) == reason
+
+
+def test_a_sub_folder_of_the_sales_or_item_master_folder_is_named(env):
+    # an Item Master (and a sales file) moved into a sub-folder is not read: named like a file of the
+    # wrong type, so the stop for September says where it went. The dashboard folder's own
+    # sub-folders, the MIS folder and any other, are other lookups' business: no word. Hidden and
+    # macOS zip folders are not HCG's.
+    dash = env["dash"]
+    (dash / "Item Master Sheet" / "Sep 26").mkdir()
+    write_master(dash / "Item Master Sheet" / "Sep 26" / "Item master for formulary complience Sep 26.xlsx")
+    (dash / "IP and OP sales" / "Older").mkdir()
+    _touch(dash / "IP and OP sales" / "Older" / "IP & OP Consolidated File July 26.xlsx")
+    for hidden in (dash / "Item Master Sheet" / "__MACOSX", dash / "IP and OP sales" / ".git"):
+        hidden.mkdir()
+    (dash / "HCG MIS").mkdir()
+    (dash / "Old reports").mkdir()
+    m = discover(env["dirs"]["raw"])
+    assert [str(s) for s in m.skipped] == [
+        "IP and OP sales/Older is not read: a sub-folder (the build reads only the files directly in "
+        "'IP and OP sales'): move its files up into 'IP and OP sales'",
+        "Item Master Sheet/Sep 26 is not read: a sub-folder (the build reads only the files directly in "
+        "'Item Master Sheet'): move its files up into 'Item Master Sheet'"]
+    assert m.warnings == [str(s) for s in m.skipped] and list(m.item_masters) == ["2026-08"]
+    _touch(dash / "IP and OP sales" / "IP & OP Consolidated File September 26.xlsx")
+    with pytest.raises(BuildError, match=r"no Item Master for 2026-09: each sales month needs the same month's "
+                                         r"master; not read: 'Sep 26' \(a sub-folder \(the build reads only"):
+        run(env)
+    assert _nothing_published(env)
+
+
+def test_a_payer_master_in_the_wrong_format_is_named_in_the_abort(env):
+    pm = env["dash"] / "Copy of Copy of Payer Master Final Sheet.xlsx"
+    pm.rename(pm.with_suffix(".xls"))
+    with pytest.raises(BuildError, match=r"no Payer Master \('\*Payer Master\*' as .xlsx or .xlsb\).*not read: "
+                                         r"'Copy of Copy of Payer Master Final Sheet.xls' \(an Excel 97-2003"):
+        run(env)
+    assert _nothing_published(env)
+
+
+def test_a_sales_month_whose_item_master_is_not_read_names_the_file(env):
+    _touch(env["dash"] / "IP and OP sales" / "IP & OP Consolidated File September 26.xlsx")
+    _touch(env["dash"] / "Item Master Sheet" / "Item master for formulary complience Sept-26.xls")
+    with pytest.raises(BuildError, match=r"no Item Master for 2026-09: each sales month needs the same month's "
+                                         r"master; not read: 'Item master for formulary complience Sept-26.xls'"):
         run(env)
     assert _nothing_published(env)
 

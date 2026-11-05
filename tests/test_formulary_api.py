@@ -210,7 +210,9 @@ def test_filters_cut_the_headline(client, data):
 def test_scope_echoes_the_normalised_filters(client, data):
     s = overview(client, Plant="KABHK", Type="ip", Segment="Non-Onco", Payer="gov", Method="MEAN")["scope"]
     assert s == {"plant": "HC05", "plant_name": "HCG KR, Bangalore", "his_name": "HCG KR, Bangalore",
-                 "months": [AUG], "type": "IP", "segment": "non-onco", "payer": "GOV", "method": "mean"}
+                 "months": [AUG], "type": "IP", "segment": "non-onco", "payer": "GOV", "method": "mean",
+                 # Basis defaults to value, the only view set against HCG's budget
+                 "basis": "value", "budget_judged": True}
     s = overview(client)["scope"]
     assert s["plant"] == "ALL" and s["his_name"] is None and s["type"] == "ALL"
 

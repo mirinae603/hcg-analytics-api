@@ -1,5 +1,5 @@
 {
- "built_at": "2026-10-10T20:22:26+00:00",
+ "built_at": "2026-10-30T19:36:23+00:00",
  "generator": "python -m app.etl.formulary",
  "periods": [
   "2026-06",
@@ -99,7 +99,7 @@
     "P-SCH"
    ],
    "rule_ref": "guideline 3",
-   "note": "HCG's report: 'Restricted brand consumption for cash&TPA patients'; a figure HCG reports, breach status to confirm with HCG"
+   "note": "HCG's report: 'Restricted brand consumption for cash&TPA patients'; a figure HCG reports, not counted as a breach"
   },
   {
    "measure": "opd_brand_inpatient",
@@ -119,8 +119,8 @@
    "verdict": "info",
    "by_doctor": false,
    "alternatives": [],
-   "rule_ref": "to confirm",
-   "note": "Shown for information until HCG confirms what -OPD means"
+   "rule_ref": "",
+   "note": "Shown for information"
   },
   {
    "measure": "scheme_brand_cash_tpa",
@@ -142,8 +142,8 @@
     "P",
     "P-SCH"
    ],
-   "rule_ref": "guideline 2 (to confirm)",
-   "note": "Shown for information until HCG confirms"
+   "rule_ref": "guideline 2, as the app reads it",
+   "note": "Shown for information"
   }
  ],
  "payer_master": {
@@ -1147,9 +1147,23 @@
    },
    "warnings": [
     "39 payer names are in neither the Payer Master nor payer_overrides.csv (8,043 lines, cost 8,981,087.41); counted as CASH(TPA)",
-    "segment agrees with HCG's column on 99.9999% of lines / 99.9988% of cost (reported, not an error)"
+    "segment agrees with HCG's column on 99.9999% of lines / 99.9988% of cost (reported, not an error)",
+    "483 lines have a blank cost price (MRP 175,029.58); counted as cost 0, as HCG's sheet does"
    ],
-   "built_at": "2026-10-10T20:22:21+00:00"
+   "sales_items": {
+    "rows": 51615,
+    "lines": 839936,
+    "cost": 553541011.22,
+    "mrp": 914235339.79,
+    "qty": 4414298.0,
+    "cost_missing_lines": 483,
+    "mrp_cost_missing": 175029.58,
+    "cost_diff_vs_summary": 0.0,
+    "mrp_diff_vs_summary": 0.0,
+    "qty_diff_vs_summary": 0.0,
+    "rounding_allowance": 264.97
+   },
+   "built_at": "2026-10-30T19:36:16+00:00"
   },
   "2026-07": {
    "period": "2026-07",
@@ -1177,7 +1191,7 @@
     "cost": 581238298.38,
     "mrp": 970064133.51,
     "qty": 4576245.0,
-    "cost_diff": -0.0
+    "cost_diff": 0.0
    },
    "item_master": {
     "file": "Copy of item master for formulary complience July 2026.xlsb",
@@ -2133,9 +2147,23 @@
     "reconciliation": []
    },
    "warnings": [
-    "43 payer names are in neither the Payer Master nor payer_overrides.csv (10,486 lines, cost 15,019,106.41); counted as CASH(TPA)"
+    "43 payer names are in neither the Payer Master nor payer_overrides.csv (10,486 lines, cost 15,019,106.41); counted as CASH(TPA)",
+    "512 lines have a blank cost price (MRP 192,826.56); counted as cost 0, as HCG's sheet does"
    ],
-   "built_at": "2026-10-10T20:22:23+00:00"
+   "sales_items": {
+    "rows": 52610,
+    "lines": 880441,
+    "cost": 581238298.38,
+    "mrp": 970064133.51,
+    "qty": 4576245.0,
+    "cost_missing_lines": 512,
+    "mrp_cost_missing": 192826.56,
+    "cost_diff_vs_summary": 0.0,
+    "mrp_diff_vs_summary": 0.0,
+    "qty_diff_vs_summary": 0.0,
+    "rounding_allowance": 269.985
+   },
+   "built_at": "2026-10-30T19:36:19+00:00"
   },
   "2026-08": {
    "period": "2026-08",
@@ -3137,9 +3165,23 @@
    },
    "warnings": [
     "45 payer names are in neither the Payer Master nor payer_overrides.csv (9,531 lines, cost 9,006,507.83); counted as CASH(TPA)",
-    "segment agrees with HCG's column on 99.5078% of lines / 98.7576% of cost (reported, not an error)"
+    "segment agrees with HCG's column on 99.5078% of lines / 98.7576% of cost (reported, not an error)",
+    "560 lines have a blank cost price (MRP 357,062.56); counted as cost 0, as HCG's sheet does"
    ],
-   "built_at": "2026-10-10T20:22:26+00:00"
+   "sales_items": {
+    "rows": 52606,
+    "lines": 875717,
+    "cost": 556648532.4,
+    "mrp": 943122638.17,
+    "qty": 4490262.0,
+    "cost_missing_lines": 560,
+    "mrp_cost_missing": 357062.56,
+    "cost_diff_vs_summary": 0.0,
+    "mrp_diff_vs_summary": 0.0,
+    "qty_diff_vs_summary": 0.0,
+    "rounding_allowance": 269.725
+   },
+   "built_at": "2026-10-30T19:36:23+00:00"
   }
  },
  "tables": {
@@ -3166,6 +3208,10 @@
   "formulary_rules": {
    "rows": 8607,
    "kb": 84.1
+  },
+  "sales_items": {
+   "rows": 156831,
+   "kb": 2706.2
   }
  }
 }

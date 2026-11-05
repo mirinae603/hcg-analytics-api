@@ -1,17 +1,24 @@
-"""Executive-summary cards (original frontend contract) + admin refresh.
+"""Executive-summary cards (original frontend contract), the data windows + admin refresh.
 
 `/api/dashboard/all?region=<plant code | name>` returns the exact nested shape the
 original AnalyticsDashboardLayout expects (stockAging / kpiStockLevel / returnRate /
 daysOnHand / inventoryTurnover). Region that isn't a known plant code => all plants.
+
+`/meta/windows` says which months each source covers and the stock count's date, read from
+the data, so no page writes "6 months" or "31 May 2026" in.
 """
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from fastapi import APIRouter, Header, HTTPException, Query
 from typing import Optional
 import numpy as np
 import pandas as pd
 
+from app.ai import windows as W
 from app.core import data_access as da
 from app.core.config import settings
 
@@ -20,6 +27,13 @@ router = APIRouter()
 
 def _resolve_plant(region: Optional[str]) -> Optional[str]:
     return da.resolve_plant(region)
+
+
+def _count_label() -> Optional[str]:
+    """The stock count's date as the cards print it ('31 May 2026'), read from fact_inventory;
+    None when there is no count."""
+    snap = da.stock_snapshot_date()
+    return None if pd.isna(snap) else snap.strftime("%d %b %Y")
 
 
 AGING_BINS = [-1, 30, 90, 180, 365, float("inf")]
@@ -102,7 +116,6 @@ def dashboard_all(region: Optional[str] = Query(None),
     # 2.4x here vs 0.66x there for the same underlying data.
     _inv6 = float(health["closing_stock_value"].sum())
     _internal_cogs6 = float(health["consumption_cost"].sum())
-    ANN = 2.0  # 6 months of data -> annualized
 
     # Billed COGS folded in exactly like itr_insights' "both" branch: a material-grain,
     # DEDUPED sum from sales_by_material, added to `health`'s own RAW plant-grain sum --
@@ -123,16 +136,18 @@ def dashboard_all(region: Optional[str] = Query(None),
             cmap = da._material_category_map()
             sm = sm[sm["material"].astype(str).map(cmap).fillna(da.CATEGORY_UNCLASSIFIED) == cat]
         _billed_cogs6 = float(sm["cost"].sum())
-    _cogs6 = _internal_cogs6 + _billed_cogs6
-    avg_itr = (_cogs6 * ANN) / _inv6 if _inv6 else 0.0
+    # To a year with each part over its own window (internal: the months up to the stock count;
+    # billed: the billing months), x 2.0 for both on today's six-month windows.
+    avg_itr = da.yearly_cogs(_internal_cogs6, _billed_cogs6) / _inv6 if _inv6 else 0.0
 
     loc = "All Plants" if not plant else plant
+    as_of = _count_label()
 
     return {
         "stockAging": {
             "fresh": round(fresh, 2), "aging": round(aging, 2),
             "problem": round(problem, 2), "deadStock": round(dead, 2),
-            "lastUpdated": "31 May 2026",
+            "lastUpdated": as_of,
         },
         "kpiStockLevel": {
             "currentStock": round(stock_qty), "stockValue": round(stock_value, 2),
@@ -140,7 +155,7 @@ def dashboard_all(region: Optional[str] = Query(None),
             "monthlyRevenueTarget": round(revenue_proxy, 2), "margin": margin,
             "unit": "Units", "currency": "INR", "label": "Current Stock Value",
             "lowStockThreshold": 1000, "location": loc, "supplier": "—",
-            "lastUpdated": "31 May 2026",
+            "lastUpdated": as_of,
         },
         # "trend" is omitted (None) on all three cards below, not a fabricated 0% -- none
         # of kpi_doh / kpi_health_score / the return-rate proxy carry a month dimension in
@@ -160,7 +175,7 @@ def dashboard_all(region: Optional[str] = Query(None),
             "trend": None,
             "criticalThreshold": 15, "optimalRange": {"min": 30, "max": 90},
             "category": da.resolve_category(category) or "All",
-            "location": loc, "lastCalculated": "31 May 2026",
+            "location": loc, "lastCalculated": as_of,
         },
         "inventoryTurnover": {
             "currentITR": round(avg_itr, 2), "label": "Inventory Turnover",
@@ -190,11 +205,136 @@ def dashboard_all(region: Optional[str] = Query(None),
     }
 
 
+# ── Data windows (GET /meta/windows) ──────────────────────────────────────────
+# Every source covers its own months: the consumption extracts run past the stock count (with a
+# month missing), the receipts end before the orders, the legacy billed-sales tables keep
+# Dec-25..May-26 on purpose, and the HIS sales and purchase builds publish month by month. The
+# pages used to say "6 months", "31 May 2026" and fixed SKU / stock-value figures; they now read
+# them here, so a new stock count or a new month changes the words with no code change. A source
+# that is not built gives null, never an error (like /export/meta), so one missing table cannot
+# blank every label in the app.
+WINDOW_ABOUT = {
+    "consumption": "Internal goods-issue (SAP consumption extracts), every month received",
+    "consumption_to_snapshot": ("The internal issues up to the stock count: what days on hand, turnover, "
+                                "non-moving stock and the stock-out list set the counted stock against"),
+    "grn": "Goods receipts (SAP GRN): procurement cycle time, purchase value and the GRN export",
+    "po": "Purchase orders (SAP PO): the procurement pages",
+    "legacy_sales": ("Billed IP and OP sales in the older sales tables (revenue history, billable consumption, "
+                     "the billed part of days on hand and turnover), kept to these months on purpose"),
+    "sales": "HIS pharmacy sales, published month by month: formulary, spend, revenue and the sales export",
+    "purchases": "The purchase build's goods receipts: prices, generic vs branded and out-of-formulary spend",
+}
+
+
+def _window(months) -> Optional[dict]:
+    """{from, to, months, gaps} for the months ('YYYY-MM') a source holds; None when it holds none.
+    `months` counts the months WITH data and `gaps` names the missing ones inside the span (the
+    consumption extracts have no Aug-26), so a label never claims a month that is not there."""
+    ms = tuple(sorted(set(months or ())))
+    if not ms:
+        return None
+    return {"from": ms[0], "to": ms[-1], "months": len(ms), "gaps": list(W.missing_months(ms))}
+
+
+def _source_months(token: str) -> tuple:
+    """The months of one SAP transaction table, read exactly as the AI's texts read them
+    (app.ai.windows), so a page and the assistant always name the same months."""
+    return W.months_of(next(s for s in W.SOURCES if s.token == token))
+
+
+def _purchase_months() -> tuple:
+    """The months the purchase build published (purchase_prices); () while it is not built."""
+    from app.api import purchase_insights as PI
+    try:
+        return tuple(PI._periods(PI.C.PRICES))
+    except HTTPException:
+        return ()
+
+
+@lru_cache(maxsize=1)
+def _stock_figures() -> dict:
+    """The stock count's SKU and value figures, the ones the home screen used to carry as fixed
+    numbers. skus_total = materials held at the count or issued in the months up to it (the
+    universe the stock and replenishment pages track); skus_in_stock = materials held at the
+    count; stock_value = the count's book value at cost. Cleared by POST /admin/refresh-data."""
+    out = {"skus_total": None, "skus_in_stock": None, "stock_value": None}
+    try:
+        sv = da.load("kpi_stock_value")
+    except FileNotFoundError:
+        return out
+    held = set(sv["material"].astype(str))
+    try:
+        issued = set(da.stock_consumption()["material"].astype(str))
+    except FileNotFoundError:
+        issued = set()
+    out.update(skus_total=len(held | issued), skus_in_stock=len(held),
+               stock_value=round(float(sv["stock_value_cost"].sum()), 2))
+    return out
+
+
+def _hospitals() -> Optional[int]:
+    """Hospitals with any data: the plants GET /meta/plants lists for the hospital picker, so the
+    count and the picker never disagree."""
+    from app.api import kpi_generic
+    try:
+        return sum(1 for p in kpi_generic.meta_plants()["plants"] if p["code"] != "ALL")
+    except FileNotFoundError:
+        return None
+
+
+def _built(p: Path) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+    except FileNotFoundError:
+        return None
+
+
+def _data_as_of() -> Optional[str]:
+    """When the newest of the sources was built (UTC, ISO), like the other pages' data_as_of."""
+    from app.api import formulary as F, purchase_insights as PI
+    built = [_built(da.CURATED / f"{t}.parquet") for t in ("fact_inventory", "fact_consumption", "fact_grn", "fact_po")]
+    built += [_built(da.KPI / "sales_monthly.parquet"), F._built_at(), PI._built_at()]
+    built = [b for b in built if b]
+    return max(built) if built else None
+
+
+@router.get("/meta/windows")
+def meta_windows():
+    """The months each source covers and the stock count's date, all read from the data.
+
+    windows: {from, to, months, gaps} or null per source (see WINDOW_ABOUT). consumption is every
+    month of internal issues; consumption_to_snapshot only those up to the stock count, the window
+    the stock pages and the turnover / days-on-hand rates use. skus_total and stock_value are the
+    stock count's own figures, hospitals the plants with data (GET /meta/plants)."""
+    snap = da.stock_snapshot_date()
+    return {
+        "inventory_snapshot": None if pd.isna(snap) else snap.strftime("%Y-%m-%d"),
+        "windows": {
+            "consumption": _window(_source_months("CONSUMPTION")),
+            "consumption_to_snapshot": _window(da.stock_months()),
+            "grn": _window(_source_months("RECEIPTS")),
+            "po": _window(_source_months("ORDERS")),
+            "legacy_sales": _window(da.legacy_sales_months()),
+            "sales": _window(W.report_months()),
+            "purchases": _window(_purchase_months()),
+        },
+        **_stock_figures(),
+        "hospitals": _hospitals(),
+        "about": WINDOW_ABOUT,
+        "data_as_of": _data_as_of(),
+    }
+
+
+def clear_caches() -> None:
+    _stock_figures.cache_clear()
+
+
 @router.post("/admin/refresh-data")
 def refresh_data(x_admin_token: Optional[str] = Header(None)):
     if x_admin_token != settings.ADMIN_REFRESH_TOKEN:
         raise HTTPException(status_code=401, detail="invalid admin token")
     da.refresh_cache()
+    clear_caches()
     # Also drop the memoized portfolio-overview / summary results so they recompute
     # against the refreshed data (otherwise they'd serve the previous snapshot).
     try:
@@ -202,6 +342,9 @@ def refresh_data(x_admin_token: Optional[str] = Header(None)):
         legacy_kpi.clear_result_caches()
         kpi_generic._portfolio_summary_cached.cache_clear()
         kpi_generic.clear_kpi_caches()
+        # which plants have stock / consumption / receipts: a new stock count can change them,
+        # and both GET /meta/plants and the hospitals count of GET /meta/windows read it
+        kpi_generic._plant_domains.cache_clear()
         formulary.clear_caches()
         spend.clear_caches()
     except Exception:
@@ -216,4 +359,9 @@ def refresh_data(x_admin_token: Optional[str] = Header(None)):
             wh.reset_caches()
         except Exception:
             pass
+    # Refill the executive overview's caches (and each section's default view) in the background,
+    # so the first visitor after a refresh does not wait for them. It never blocks this answer,
+    # and does nothing outside a serving process, e.g. under the tests (app/api/warmup.py).
+    from app.api import warmup
+    warmup.start("refresh")
     return {"status": "cache cleared"}

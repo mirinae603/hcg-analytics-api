@@ -21,10 +21,10 @@ settings.SPEND_DATA_DIR (line-level sales never reach the repo or this process):
                                        & OUT OF FORMULARY' line (`with_oof`)
     GET /spend/cash/items           -> {data,total} per brand used; with Doctor=, one doctor's
     GET /spend/cash/doctors         -> {data,total} per doctor; with Material=, one brand's
-    GET /spend/oof/overview         -> out-of-formulary margin loss on PURCHASES: headline with
-                                       HCG's own figure beside it, trend, hospital ranking,
-                                       onco / non-onco, top switches, vendors, where each
-                                       suggestion came from, brands with no alternative
+    GET /spend/oof/overview         -> out-of-formulary margin loss on PURCHASES: headline,
+                                       trend, hospital ranking, onco / non-onco, top switches,
+                                       vendors, where each suggestion came from, brands with no
+                                       alternative
     GET /spend/oof/items            -> {data,total} per OOF brand x suggested brand; with
                                        Vendor=, one vendor's
     GET /spend/oof/vendors          -> {data,total} per vendor (goods supplier)
@@ -56,21 +56,25 @@ Out of formulary is HCG's PURCHASE method ('Out of Formulary Spend Analysis'), s
 tables `python -m app.etl.purchase` publishes into settings.PURCHASE_DATA_DIR: oof_purchase
 (every goods receipt in HCG's purchase scope of a drug the month's own Item Master flags OUT OF
 FORMULARY, set against the formulary brand HCG would have bought) and oof_hcg_summary (HCG's own
-per-centre Summary, shown beside ours). HCG's formulas, per GRN line: margin earned = qty x (MRP
-excl GST - Base Price); margin possible = qty x the suggested brand's (MRP excl GST - HCG Pharma
-price); margin missed = possible - earned, NET over the lines as HCG adds it (a brand earning
+per-centre Summary: the overview serves its figure, `hcg` and `hcg_loss`, for the tests' check of
+ours against it, and the page does not show it). HCG's formulas, per GRN line: margin earned =
+qty x (MRP excl GST - Base Price); margin possible = qty x the suggested brand's (MRP excl GST -
+HCG Pharma price); margin missed = possible - earned, NET over the lines as HCG adds it (a brand earning
 more than its suggestion lowers it: gain_loss + better_loss); % = missed / possible. Lines HCG
 parked and lines with no suggested brand are shown and add nothing. Purchases have no payer,
 patient type or doctor: Payer and Type are accepted and reported as not applied, and the
 vendor takes the doctor's place. The cash overview adds the two margins together the way HCG's
-email table does (`with_oof`).
+email table does (`with_oof`). A month built without HCG's own worksheet is estimated: the
+overview's headline says so (estimated, hcg_working, estimated_months) with a note, and so does
+each trend month. A GRN month whose Item Master has not come has no out-of-formulary rows yet:
+/spend/meta lists it (`oof_waiting`), the overview's notes name it, and asking for it is a 400
+that says it waits for its Item Master.
 
 Every figure is worked out from the published tables.
 """
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -122,7 +126,6 @@ HEALTHIUM_GROUPS = ("SUTURES", "ENDO")
 HEALTHIUM_PARTS = {"sutures": ("SUTURES", "Sutures"), "endo": ("ENDO", "Endo")}
 GROUPS = {"ATTIS": "attis", "HEALTHIUM": "healthium"}
 GROUP_LABELS = {"attis": "Attis brands", "healthium": "J&J & Covidien → Healthium"}
-_PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
 # ── Tables ────────────────────────────────────────────────────────────────────
@@ -216,23 +219,7 @@ def _periods() -> list:
 
 
 def _months_arg(month, periods: list, data: str = "spend") -> tuple:
-    s = F._str(month)
-    if s is None:
-        return tuple(periods[-1:])          # latest month, like HCG's monthly report
-    if s.upper() == "ALL":
-        return tuple(periods)
-    out = []
-    for m in (x.strip() for x in s.split(",")):
-        if not m:
-            continue
-        if not _PERIOD_RE.match(m):
-            F._bad(f"Invalid Month '{m}'. Use YYYY-MM, a comma list of them, or ALL")
-        if m not in periods:
-            F._bad(f"No {data} data for {m}. Available months: {', '.join(periods)}")
-        out.append(m)
-    if not out:
-        F._bad("Month is empty. Use YYYY-MM, a comma list of them, or ALL")
-    return tuple(sorted(set(out)))
+    return F._months_arg(month, periods, data)
 
 
 def _category_arg(segment, category) -> Optional[str]:
@@ -261,11 +248,24 @@ def _oof_scope(Plant, Month, Type, Segment, Category, Payer, Material=None) -> t
     months, material type and brand. Purchases carry no patient type and no payer, so Type and
     Payer are checked like everywhere else and then named in `not_applied` instead of cutting."""
     periods = _oof_periods()                # 503 first
+    _oof_not_waiting(Month, periods)
     ptype = F._choice(Type, {t: t for t in TYPES}, "Type")
     payer = F._choice(Payer, {p: p for p in PAYERS}, "Payer")
     sc = Scope(plant=F._plant_arg(Plant), months=_months_arg(Month, periods, "out-of-formulary purchase"),
                ptype=None, category=_oof_category_arg(Segment, Category), material=F._code(Material))
     return sc, tuple(name for name, given in (("Type", ptype), ("Payer", payer)) if given)
+
+
+def _oof_not_waiting(month, periods: list) -> None:
+    """A month whose out-of-formulary rows wait for its Item Master (the price and generic views
+    have it) is a 400 that says so, rather than 'no data'."""
+    s = F._str(month)
+    if s is None or s.upper() == "ALL":
+        return
+    waiting = set(_oof_waiting())
+    hit = [m for m in (x.strip() for x in s.split(",")) if m in waiting]
+    if hit:
+        F._bad(f"{'; '.join(PO.waiting_note(m) for m in hit)}. Available months: {', '.join(periods)}")
 
 
 def _oof_category_arg(segment, category) -> Optional[str]:
@@ -422,15 +422,14 @@ NOTE_CONSUMPTION = ("Attis consumption is every Attis product billed to any paye
                     "(TOTALCOSTPRICE), not list price.")
 NOTE_CASH_SCOPE = ("Cash & TPA patients are the CASH and CASH(TPA) payer buckets, IP and OP. Counted: brands for "
                    "which HCG's cash & TPA list suggests a brand that earns HCG more per unit — except the few "
-                   "list brands HCG's own report leaves out (app/data/reference/cash_tpa_excluded.csv, to "
-                   "confirm with HCG).")
+                   "list brands HCG's own report leaves out (app/data/reference/cash_tpa_excluded.csv).")
 NOTE_CASH_VALUES = ("Cash & TPA: unit margin = MRP ÷ (1 + GST%) − HCG Pharma price, from HCG's FY price list, for "
                     "the brand used and the suggested brand; margin lost = quantity × the difference; % = margin "
                     "lost ÷ the margin the suggested brands would have made (HCG's denominator, unlike the scheme "
                     "% which divides by spend).")
 NOTE_BIFURCATION = ("Bifurcated brands: HCG allows them a share (SHARING) of their molecule's volume at the hospital "
                     "in the month, and only the use above that allowance counts. Which brands are bifurcated, and "
-                    "their molecule groups, come from HCG's KR Aug-26 report until HCG sends the full rules.")
+                    "their molecule groups, come from HCG's KR Aug-26 report.")
 
 
 NOTE_BIFURCATION_COLUMNS = ("Brands table: SHARING, Group qty, Allowed qty and Excess qty are HCG's allowance for the "
@@ -450,10 +449,6 @@ NOTE_OOF_SOURCES = ("Suggested brand: HCG's own worksheet of the month; for a mo
                     "brand from its nearest worksheet, then HCG's out-of-formulary list, then the app's match on "
                     "molecule, strength and form in HCG's CASH&TPA list (marked Estimated). Lines HCG parked and "
                     "lines with no suggested brand are shown but add nothing to the margins.")
-NOTE_OOF_HCG = ("HCG's figure is the 'Margin Value Difference' of HCG's own Summary sheet for the same hospitals "
-                "and months.")
-NOTE_OOF_HCG_CUT = ("HCG's Summary is per hospital and month only, so HCG's figure is not shown under a material "
-                    "type or brand filter.")
 NOTE_WITH_OOF = ("Cash & TPA and out of formulary together, as in HCG's 'CASH(TPA) & OUT OF FORMULARY' table: "
                  "each margin added up, and the % taken on the totals (loss ÷ proposed). The out-of-formulary part "
                  "is HCG's purchase (GRN) method for the same hospitals and months; purchases have no payer or "
@@ -543,6 +538,10 @@ def _meta_cached(version: tuple, purchase_version: tuple) -> dict:
         "oof_built_at": _oof_built_at(),
         "oof_suggested_by": [{"key": k, "label": v, "counted": k in COUNTED_SOURCES,
                               "estimated": k == PO.FORMULARY_RULE} for k, v in SUGGESTED_BY.items()],
+        # GRN months whose out-of-formulary rows wait for their Item Master (prices and generic
+        # have them), each with the purchase build's note.
+        "oof_waiting": [{"period": p, "label": F._month_label(p), "note": PO.waiting_note(p)}
+                        for p in _oof_waiting()],
         # Price variation and generic vs branded: every GRN month, from the same build.
         **purchases,
         "built_at": _built_at(),
@@ -1149,6 +1148,32 @@ def _oof_periods() -> list:
     return _oof_periods_at(_version())
 
 
+@_cache
+def _oof_hcg_working_at(version: tuple) -> frozenset:
+    return frozenset(PO.hcg_working_months(_oof()))
+
+
+def _oof_hcg_working() -> frozenset:
+    """The out-of-formulary months built from HCG's own worksheet; every other month is
+    estimated (sources 2-5: HCG's other months and lists, then the app's match)."""
+    return _oof_hcg_working_at(_version())
+
+
+@_cache
+def _oof_waiting_at(version: tuple) -> tuple:
+    months = (_read_json(_purchase_dir() / PC.VALIDATION_FILE) or {}).get("months") or {}
+    built = set(_oof_periods()) if _has_oof() else set()
+    return tuple(p for p in sorted(months)
+                 if ((months[p] or {}).get("oof") or {}).get("waiting_for_item_master") and p not in built)
+
+
+def _oof_waiting() -> tuple:
+    """The GRN months whose out-of-formulary rows wait for their Item Master: the purchase
+    build's report says so (months.<p>.oof.waiting_for_item_master) and oof_purchase has no row
+    for them. Empty until the purchase build has run."""
+    return _oof_waiting_at(_version())
+
+
 def _oof_sums(df: pd.DataFrame, keys: list) -> pd.DataFrame:
     """Per `keys` ([] = one row): the summed values and HCG's loss % (missed ÷ possible)."""
     d = df[OOF_VALUES].astype(float)
@@ -1248,15 +1273,22 @@ def _oof_overview_cached(sc: Scope, not_applied: tuple, version: tuple) -> dict:
 
     h = _oof_sums(cur, []).iloc[0]
     check = _hcg_check(sc, hcg, cur, h) if covered else None
+    # A month is estimated when it was built without HCG's own worksheet: a property of the
+    # month, whatever the hospital, material type or brand selected.
+    hcg_months = _oof_hcg_working()
+    estimated = [m for m in sc.months if m not in hcg_months]
     headline = {**_oof_block(h), "brands": int(cur["material"].nunique()),
                 "vendors": int(cur["vendor"].nunique()), "hospitals": int(cur["plant"].nunique()),
-                "coverage": _oof_coverage(cur), "hcg_figure": check["margin_loss"] if check else None}
+                "coverage": _oof_coverage(cur), "hcg_figure": check["margin_loss"] if check else None,
+                "estimated": bool(estimated), "hcg_working": bool(sc.months) and not estimated,
+                "estimated_months": estimated}
 
     tr = _oof_sums(_cut(t, sc, months=False, ptype=False), ["period"]).set_index("period")
     hcg_month = (_cut(hcg.rows, sc, months=False, ptype=False, category=False).groupby("period")["loss"].sum()
                  if hcg is not None else None)
     trend = [{**_cash_trend_row(p, _oof_block(tr.loc[p]) if p in tr.index else OOF_EMPTY),
-              "hcg_loss": F._money(hcg_month.get(p, 0.0)) if hcg is not None and p in hcg.months else None}
+              "hcg_loss": F._money(hcg_month.get(p, 0.0)) if hcg is not None and p in hcg.months else None,
+              "estimated": p not in hcg_months}
              for p in _oof_periods()]
 
     every_unit = _cut(t, sc, plant=False, ptype=False)
@@ -1292,13 +1324,10 @@ def _oof_overview_cached(sc: Scope, not_applied: tuple, version: tuple) -> dict:
                                                                 ascending=[False, True], kind="mergesort")
 
     notes = [NOTE_OOF_SCOPE, NOTE_OOF_VALUES, NOTE_OOF_SOURCES, NOTE_VIEWS]
-    if hcg is None and (sc.category or sc.material):
-        notes.append(NOTE_OOF_HCG_CUT)
-    elif hcg is not None:
-        notes.append(NOTE_OOF_HCG)
-        if not covered:
-            notes.append(f"HCG's own Summary covers {', '.join(F._month_label(m) for m in sorted(hcg.months))} only: "
-                         f"HCG's figure is shown for those months and not beside a total that includes others.")
+    notes += [PO.estimated_note(m) for m in estimated]
+    notes += [PO.waiting_note(m) for m in _oof_waiting()]
+    # HCG's own Summary figures (hcg, hcg_figure, hcg_loss) are served for the tests' check
+    # against HCG's sheet; the page does not show them, so no note describes them.
     if not_applied:
         notes.append(_note_not_applied(not_applied))
     if len(sc.months) > 1:

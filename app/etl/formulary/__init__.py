@@ -9,7 +9,8 @@ FORMULARY_DATA_DIR that the API serves. Run by hand: `python -m app.etl.formular
   extract.py    one month's sales sheet -> FORMULARY_CACHE_DIR/lines_YYYY-MM.parquet
   masters.py    Item Master, Payer Master, hospital_map.csv, payer_overrides.csv
   classify.py   the rules (pure functions; also what the tests pin down)
-  aggregate.py  DuckDB: classify + sum the cached lines into the four tables
+  aggregate.py  DuckDB: classify + sum the cached lines into the published tables
+                (config.TABLES: the formulary_* tables and sales_items for revenue)
   validate.py   formulary_validation.json and the abort rules
   build.py      orchestration, atomic publish, CLI
 """

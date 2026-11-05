@@ -307,6 +307,44 @@ def test_month_report():
     assert set(P.report_section()["rules"]["price_status"]) == set(P.PRICE_STATUSES)
 
 
+def lupitux(period, plant, qty, total, vendor, vendor_name):
+    return line(period, plant, "102402", qty, total, 9_365.0, vendor=vendor, vendor_name=vendor_name,
+                desc="LUPITUX 100MG INJ VIAL", minor="CETUXIMAB")
+
+
+def test_unusually_low_purchases_count_hospital_brand_supplier_groups():
+    # KR bought LUPITUX under half the usual cheapest (8,100) from one supplier under two SAP codes
+    # in Aug, and again in Jul; DR's 60 vials a month at 8,100 set the usual cheapest:
+    #   Aug  3,000 (1) + 3,500 (1) + 8,100 x 60: 2 of 62 units under 8,100 (3%) -> usual cheapest 8,100
+    #   Jul  3,200 (1) + 8,100 x 60
+    # Both low KR rows of Aug are one hospital x brand x supplier (the supplier by name), and so are
+    # all three over the two months: the report counts 1 group a month, and 1 over both.
+    vard, vard_too = "VARDHMAN HEALTH SPECIALITIES", "Vardhman  Health Specialities"
+    rows = [lupitux(AUG, "HC05", 1, 3_000.0, "300100", vard), lupitux(AUG, "HC05", 1, 3_500.0, "300101", vard_too),
+            lupitux(AUG, "HC06", 60, 486_000.0, "300200", "OTHER PHARMA"),
+            lupitux(JUL, "HC05", 1, 3_200.0, "300100", vard), lupitux(JUL, "HC06", 60, 486_000.0, "300200", "OTHER PHARMA")]
+    t, months = P.build_table(frame(rows), {}, {})
+    assert (t["price_status"] == P.OK).all() and len(t[t["period"] == AUG]) == 3   # two SAP codes: two table rows
+    assert months[AUG]["unusually_low"] == {"rows": 1, "value": 6_500.0, "products": 1}
+    assert months[JUL]["unusually_low"] == {"rows": 1, "value": 3_200.0, "products": 1}
+    both = P.products(t).iloc[0]
+    assert (both["cheapest_price"], both["low_rows"], both["low_value"]) == (8_100.0, 1, 9_700.0)
+    # a second hospital or a second supplier is a group of its own (4 low units of 64: still 8,100)
+    more = rows + [lupitux(AUG, "HC06", 1, 3_000.0, "300201", "OTHER PHARMA"),
+                   lupitux(AUG, "HC05", 1, 3_000.0, "300300", "THIRD AGENCIES")]
+    _, months = P.build_table(frame(more), {}, {})
+    assert months[AUG]["unusually_low"] == {"rows": 3, "value": 12_500.0, "products": 1}
+    assert tuple(P.LOW_GROUP) == ("plant", "material", "vendor")
+
+
+def test_the_log_line_says_usual_cheapest():
+    _, months = P.build_table(frame(cetuximab_lines()), {}, {})
+    s = P.summary_line(months)
+    assert "1 with the dearest at least 1% above the usual cheapest" in s and "paid above the usual cheapest" in s
+    assert "more than one price" not in s
+    assert P.summary_line({}) == "[purchase] prices: no month built"
+
+
 def test_no_lines_give_an_empty_table():
     empty = frame([line(AUG, "HC05", "200010", 1, 1.0)]).iloc[0:0]
     t, months = P.build_table(empty, {}, {})

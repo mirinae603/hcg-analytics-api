@@ -116,6 +116,27 @@ def test_every_measure_by_hand(client, rules_data):
     assert any("never added up" in n for n in d["notes"])
 
 
+def test_the_p1_note_names_the_main_sheets_own_fy(client, rules_data):
+    # no spend report: no FY to name, so the note does not guess one
+    notes = get(client, "/formulary/rules/overview", Month=AUG)["notes"]
+    assert any("rank by the FY's SHARING" in n for n in notes) and not any("2026-27" in n for n in notes)
+    # the spend build read the 2027-28 Main Sheet: its SHARING column is that FY's
+    (rules_data / "spend" / spend.VALIDATION_FILE).write_text(json.dumps({"cash_list": {"financial_year": "2027-28"}}))
+    formulary.clear_caches()
+    spend.clear_caches()
+    notes = get(client, "/formulary/rules/overview", Month=AUG)["notes"]
+    assert any("P1/P2 = rank by '2027-28 SHARING' within a block" in n for n in notes)
+
+
+def test_the_rules_words_never_ask_hcg_to_confirm(client, rules_data):
+    # the committed brand_rules.csv and the page's notes say what each rule is, not what HCG is to
+    # confirm or send
+    d = get(client, "/formulary/rules/overview", Month=AUG)
+    words = " ".join([*d["notes"], *(f"{m['rule_ref']} {m['note']}" for m in d["measures"])])
+    assert "confirm" not in words and "until HCG" not in words and "Brand Priority Master" not in words
+    assert measures(d)["opd_brand_inpatient"]["note"] == "Shown for information"
+
+
 def test_alternative_split_uses_the_main_sheet_blocks(client, rules_data):
     m = measures(get(client, "/formulary/rules/overview", Plant="HC05", Month=AUG))
     # 100001 (R) shares block 1 with a P-SCH brand -> yes; 100003 (R-OPD) is alone in block 2 -> no

@@ -1,7 +1,8 @@
 """HCG's SAP GRN (goods receipt) extracts -> one clean line-level frame: the one reader the
 purchase build and the legacy curated import (app/etl/ingest.py) share.
 
-  find_grn_dir, grn_files  the GRN folder under FORMULARY_RAW_DIR and its workbooks
+  find_grn_dir, grn_files  the GRN folder under FORMULARY_RAW_DIR and its workbooks (.xlsx and
+                           .xlsb; any other file is named in GrnRead.skipped, never read)
   ensure_cached            one workbook into the cache (read once) -> its GrnFileReport
   cached_report            a workbook's cached report, if the cache holds it (no read)
   read_grn_file            one workbook -> (lines, GrnFileReport), through the cache
@@ -50,7 +51,7 @@ import pyarrow.parquet as pq
 
 from app.etl.formulary import excel as X
 from app.etl.formulary.classify import norm_code
-from app.etl.formulary.discover import BuildError, _excel_files
+from app.etl.formulary.discover import BuildError, _excel_files, not_read
 from app.etl.purchase import config as C
 
 # Every column the cache holds; a read returns the core columns plus the extras asked for.
@@ -193,8 +194,10 @@ def find_grn_dir(raw=None) -> Path:
     return found[0]
 
 
-def grn_files(raw=None) -> list:
-    return _excel_files(find_grn_dir(raw))
+def grn_files(raw=None, skipped: Optional[list] = None) -> list:
+    """The GRN folder's workbooks; its other files and its sub-folders (whose files are not
+    read) go into `skipped` (discover.SkippedFile)."""
+    return _excel_files(find_grn_dir(raw), skipped, expected_folders=())
 
 
 @dataclass
@@ -237,6 +240,7 @@ class GrnRead:
     frame: pd.DataFrame
     files: list = field(default_factory=list)          # GrnFileReport, by period
     warnings: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)        # discover.SkippedFile: the folder's other files
 
     @property
     def periods(self) -> list:
@@ -251,7 +255,8 @@ class GrnRead:
 
     def report(self) -> dict:
         return {"folder": self.folder.name if self.folder else None,
-                "files": [f.as_dict() for f in self.files], "warnings": list(self.warnings)}
+                "files": [f.as_dict() for f in self.files], "warnings": list(self.warnings),
+                "not_read": [str(s) for s in self.skipped]}
 
 
 def _cache_key(path: Path, st: os.stat_result) -> str:
@@ -455,13 +460,13 @@ def read_grn_files(raw=None, cache=None, files=None, months=None, extra: Sequenc
     base_price, discount_value, net_price, total_wo_tax, tax_pct, unit_mrp, manufacturer,
     material_type, minor_category, major_group, minor_group, grn_formulary; codes are text,
     amounts float. Returns and lines outside any scope are included: see apply_scope."""
-    folder = None
+    folder, skipped = None, []
     if files is None:
         folder = find_grn_dir(raw)
-        files = _excel_files(folder)
+        files = _excel_files(folder, skipped, expected_folders=())
     files = [Path(p) for p in files]
     if not files:
-        raise BuildError(f"no GRN workbooks in {folder}")
+        raise BuildError(f"no GRN workbooks (.xlsx or .xlsb) in {folder}{not_read(skipped)}")
     columns = _columns(extra)
     reps, by_month = [], {}
     for p in files:
@@ -482,7 +487,7 @@ def read_grn_files(raw=None, cache=None, files=None, months=None, extra: Sequenc
                 f"from the file)" for r in reps if r.unparseable_dates]
     frames = [_load(r, cache, columns) for r in reps]
     frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-    return GrnRead(folder=folder, frame=frame, files=reps, warnings=warnings)
+    return GrnRead(folder=folder, frame=frame, files=reps, warnings=warnings, skipped=skipped)
 
 
 # --------------------------------------------------------------------------- #

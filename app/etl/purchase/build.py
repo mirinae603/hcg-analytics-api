@@ -29,6 +29,14 @@ Tables are written to temp files and os.replace'd, purchase_validation.json last
 some months replaces only those months' rows (HCG's own tables only the months whose workbook
 was read); every committed table is aggregated and carries no GR, PO or invoice number
 (checked before publishing).
+
+What a new month can lack only WARNS (the log's '[purchase] warning:' lines and the report's
+`warnings`, which describe every month published): a file in a source folder that is not an
+.xlsx or .xlsb workbook (not read, named with the reason), a GRN month whose Item Master has not
+come (its out-of-formulary rows wait; prices and generic are built) and a month built without
+HCG's worksheet (Estimated). See oof.py. A month already published whose Item Master is no longer
+in the folder STOPS the build before any table is built (oof.lost_item_masters): that is a lost
+file, not a new month, and `--list` names it under 'missing:'.
 """
 from __future__ import annotations
 
@@ -89,6 +97,8 @@ class Inputs:
     without_hcg_sheet: frozenset = frozenset()   # months published from sources 2-5 although
                                                  # HCG's email has figures for them
     log: Callable = _log
+    skipped: list = field(default_factory=list)  # discover.SkippedFile: the source folders' files
+                                                 # that are not read (GRN, Item Master, OOF, Main Sheet)
 
 
 # A table as published after this build (this build's rows merged with the months kept), or
@@ -159,15 +169,17 @@ def load_inputs(months=None, *, raw=None, cache=None, reference=None, without_hc
     (every Item Master and HCG workbook is still read: other months' masters fill blank minor
     groups, other months' worksheets give HCG's pairs). `without_hcg_sheet`: months to publish
     from sources 2-5 although HCG's email has figures for them."""
+    from app.etl.spend.build import find_main_sheet       # the spend build owns the lookup
     read = G.read_grn_files(raw=raw, cache=cache, months=months, log=log)
+    skipped = list(read.skipped)
     scope = C.load_scope(reference)
     lines, funnel = G.apply_scope(read.frame, scope, read.blank_lines())
-    paths = M.item_master_paths(raw)
+    paths = M.item_master_paths(raw, skipped)
     item_masters = {p: M.item_master_frame(M.load_month_item_master(p, paths=paths))
                     for p in sorted(paths)}
-    hcg = M.load_hcg_workbooks(raw)
-    master = M.load_oof_master(raw=raw)
-    main = M.load_main_sheet(raw)
+    hcg = M.load_hcg_workbooks(files=M.find_hcg_workbooks(raw, skipped))
+    master = M.load_oof_master(path=M.find_oof_master(raw, skipped))
+    main = M.load_main_sheet(path=find_main_sheet(raw, skipped))
     email = O.load_email_figures(reference)
     log(f"[purchase] GRN months {', '.join(read.periods)} ({len(read.frame):,} lines read, "
         f"{len(lines):,} in scope); Item Masters {', '.join(item_masters) or 'none'}; HCG OOF "
@@ -175,11 +187,13 @@ def load_inputs(months=None, *, raw=None, cache=None, reference=None, without_hc
         f"{len(main.prices):,} priced brands; email figures for {len(email)} hospital-months")
     for w in read.warnings:
         log(f"[purchase] note: {w}")
+    for s in skipped:
+        log(f"[purchase] warning: {s}")
     return Inputs(scope=scope, grn=read, lines=lines, funnel=funnel, periods=read.periods,
                   item_masters=item_masters,
                   item_master_files={p: paths[p].name for p in item_masters}, hcg=hcg,
                   master=master, main=main, email=email, reference=reference,
-                  without_hcg_sheet=frozenset(without_hcg_sheet), log=log)
+                  without_hcg_sheet=frozenset(without_hcg_sheet), log=log, skipped=skipped)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,16 +211,42 @@ def month_base(inputs: Inputs, period: str) -> dict:
             "funnel": f[["step", "kind", "label", "lines", "value"]].to_dict("records")}
 
 
-def full_report(inputs: Inputs, months: dict, sections: dict, data=None) -> dict:
-    """This build's months merged into the published validation file."""
+def month_warnings(months: dict) -> list:
+    """The out-of-formulary warnings of every month in `months` (this build's and the ones kept
+    from the published report): a month waiting for its Item Master, an estimated month, a
+    month HCG's email has figures for without its worksheet."""
+    return [w for p in sorted(months) for w in ((months[p].get("oof") or {}).get("warnings") or [])]
+
+
+def published_report(data=None) -> dict:
+    """purchase_validation.json as published ({} when there is none or it cannot be read)."""
     vpath = C.data_dir(data) / C.VALIDATION_FILE
-    old = {}
-    if vpath.exists():
-        try:
-            old = json.loads(vpath.read_text())
-        except ValueError:
-            old = {}
-    merged = dict(old.get("months") or {})
+    if not vpath.exists():
+        return {}
+    try:
+        return json.loads(vpath.read_text())
+    except ValueError:
+        return {}
+
+
+def published_item_masters(data=None) -> dict:
+    """period -> the Item Master file its published out-of-formulary rows were built on, for
+    every month the published oof_purchase holds: the published report's
+    months.<p>.oof.item_master.file, None when the report does not name it."""
+    path = C.data_dir(data) / f"{C.OOF}.parquet"
+    if not path.exists():
+        return {}
+    months = published_report(data).get("months") or {}
+
+    def file(p: str) -> Optional[str]:
+        return (((months.get(p) or {}).get("oof") or {}).get("item_master") or {}).get("file")
+    return {p: file(p) for p in sorted(set(pd.read_parquet(path, columns=["period"])["period"].astype(str)))}
+
+
+def full_report(inputs: Inputs, months: dict, sections: dict, data=None) -> dict:
+    """This build's months merged into the published validation file. `warnings` hold the GRN
+    read's, the files not read and every published month's out-of-formulary warnings."""
+    merged = dict(published_report(data).get("months") or {})
     merged.update(months)
     merged = {k: merged[k] for k in sorted(merged)}
     return {
@@ -218,7 +258,7 @@ def full_report(inputs: Inputs, months: dict, sections: dict, data=None) -> dict
                   "order": "movement type -> material series -> storage location -> plant prefix "
                            "-> plant (HCG's order)"},
         "grn_folder": inputs.grn.folder.name if inputs.grn.folder else None,
-        "warnings": list(inputs.grn.warnings),
+        "warnings": list(inputs.grn.warnings) + [str(s) for s in inputs.skipped] + month_warnings(merged),
         **sections,
         "months": merged,
     }
@@ -302,8 +342,13 @@ def publish(merged: dict, report: dict, data=None) -> dict:
 def run(inputs: Inputs, *, data=None, cache=None, dry_run: bool = False,
         builders: tuple = TABLE_BUILDERS) -> dict:
     """Run the table builders on the inputs, validate, publish. Returns the validation
-    report; raises BuildError (nothing published) when a builder reports a problem."""
+    report; raises BuildError (nothing published) when a builder reports a problem, and before
+    any builder runs (a dry run too) when a month to build was published on an Item Master that is
+    no longer in the folder (oof.lost_item_masters)."""
     log = inputs.log
+    lost = O.lost_item_masters(inputs.periods, inputs.item_masters, published_item_masters(data))
+    if lost:
+        raise BuildError("an Item Master is missing, nothing published:\n  " + "\n  ".join(lost))
     tables, replaces, problems, built = {}, {}, [], []
     months = {p: month_base(inputs, p) for p in inputs.periods}
     for section, builder in builders:
@@ -354,19 +399,31 @@ def list_files(raw=None, cache=None, data=None, reference=None, log=_log) -> Non
     log(f"raw folder:    {C.raw_dir(raw)}")
     folder = G.find_grn_dir(raw)
     log(f"GRN folder:    {folder.name}  (each workbook's month comes from its GR dates)")
-    for p in G.grn_files(raw):
+    skipped: list = []
+    grn_months = []
+    for p in G.grn_files(raw, skipped):
         rep = G.cached_report(p, cache)
+        grn_months += [rep.period] if rep else []
         log(f"  {p.name}  |  " + (f"cached: {rep.period} ({FC.period_label(rep.period)}), "
                                   f"{rep.rows:,} lines" if rep else "not cached (read on the next build)"))
     log(f"GRN cache:     {C.cache_dir(cache)}")
-    for p, path in sorted(M.item_master_paths(raw).items()):
+    paths = M.item_master_paths(raw, skipped)
+    for p, path in sorted(paths.items()):
         log(f"Item Master:   {p} ({FC.period_label(p)})  {path.name}")
+    published = published_item_masters(data)
+    for p in O.waiting_for_item_master(grn_months, paths):
+        if p not in published:                 # a published month is not waiting: see 'missing'
+            log(f"  waiting:     {O.waiting_note(p)}")
+    for note in O.lost_item_masters(grn_months, paths, published):
+        log(f"  missing:     {note}")
     log(f"OOF folder:    {M.find_oof_dir(raw).name}")
-    log(f"  OOF master:  {M.find_oof_master(raw).name}")
-    for p in M.find_hcg_workbooks(raw):
+    log(f"  OOF master:  {M.find_oof_master(raw, skipped).name}")
+    for p in M.find_hcg_workbooks(raw, skipped):
         log(f"  HCG workbook: {p.name}  (month read from its worksheet)")
     from app.etl.spend.build import find_main_sheet       # the spend build owns the lookup
-    log(f"Main Sheet:    {find_main_sheet(raw).name}")
+    log(f"Main Sheet:    {find_main_sheet(raw, skipped).name}")
+    for s in skipped:
+        log(f"not read:      {s}")
     scope = C.load_scope(reference)
     log(f"scope:         {C.SCOPE_FILE}: " + "; ".join(f"{k} {v}" for k, v, _ in scope.rows))
     email = O.load_email_figures(reference)
