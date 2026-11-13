@@ -75,7 +75,7 @@ _SAFE_NAME = re.compile(r"[A-Za-z0-9 ,.&()/-]{1,80}")
 # read from the registry, which would load the dashboard handlers on import; a test keeps the
 # two in step.
 REPORT_KEYS = ("formulary-compliance", "brand-rules", "scheme-brand-saving", "attis-saving",
-               "cash-tpa-margin-loss")
+               "cash-tpa-margin-loss", "oof-margin-loss")
 
 
 def _one_of(value, allowed) -> bool:

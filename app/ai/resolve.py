@@ -204,6 +204,86 @@ def cities() -> tuple[str, ...]:
     return tuple(sorted(out))
 
 
+# What may sit between a hospital's name and its city when both are written: "KR, Bangalore",
+# "KR in Bangalore", "DR (Bangalore)".
+_ADDRESS_GAP = re.compile(r"[\s,()\-]*(?:\b(?:in|at)\b)?[\s,()\-]*", re.I)
+
+
+def _city_only_addresses_a_hospital(question: str, city: str) -> bool:
+    """True when every mention of `city` is part of how ONE named hospital is written.
+
+    "What was formulary compliance at HCG KR Bangalore?" names one hospital. Read as the city
+    as well, it reached the brief as "Bangalore covers HC01, HC05, HC06, HC40" and the scope
+    guard refused plant='HC05' as UNDER-SCOPED, so the answer came back pooled over all four
+    sites (98.51%) instead of KR's own 98.42%, and the headline changed between runs. A city
+    counts as a city only where the question names it on its own: "Bangalore", or "KR and the
+    rest of Bangalore".
+
+    The city is part of the name when the hospital's alias spells it ("KR Bangalore", "North
+    Bangalore"), or when it follows the name across a comma, bracket, "in" or "at" and the
+    hospital really is in that city ("KR in Bangalore"; "KR in Chennai" keeps Chennai a city)."""
+    from app.ai import hospitals as _hosp
+    named = [(s, e, codes[0]) for s, e, _alias, codes in _hosp.spans(question) if len(codes) == 1]
+    if not named:
+        return False
+    for m in re.finditer(rf"\b{re.escape(city)}\b", question, re.I):
+        inside = any(s <= m.start() and m.end() <= e for s, e, _code in named)
+        after = any(e <= m.start() and _ADDRESS_GAP.fullmatch(question[e:m.start()])
+                    and city.lower() in _hosp.name(code).lower() for _s, e, code in named)
+        if not (inside or after):
+            return False
+    return True
+
+
+def _hospital_city_words(question: str) -> set[str]:
+    """The city words that only say where a named hospital is ("bangalore" in "HCG KR
+    Bangalore"), lower-cased. Left free, "bangalore" formed a family of four Bangalore
+    hospitals (and five vendors) with the advice to cover them all. The hospital's own name
+    stays free: "panda" in "keytruda at Panda" is the family that marks the question as
+    site-scoped."""
+    return {c.lower() for c in cities() if re.search(rf"\b{re.escape(c)}\b", question, re.I)
+            and _city_only_addresses_a_hospital(question, c)}
+
+
+# "top 10", "bottom five", "the 5 worst", "20 biggest": how many rows a ranking question asks
+# for. "first" and "last" are left out: "last 3 months" is a window, not a ranking.
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+                "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+                "twenty five": 25, "thirty": 30, "fifty": 50}
+
+
+def _count(words) -> str:
+    return r"(\d{1,2}|" + "|".join(sorted(map(re.escape, words), key=len, reverse=True)) + r")"
+
+
+_RANK_WORD = r"(?:top|bottom|best|worst|highest|lowest|biggest|largest|smallest|leading)"
+# A count written BEFORE the rank word is read with care, because dates sit there too. HCG
+# writes its months as "Aug-26" and the app as "2026-08": the "26" and the "08" each read as a
+# count, and "Aug-26 top vendors" came back cut to 26 rows. So a number glued to a word, a
+# hyphen, a slash, an apostrophe or a point is no count, nor one after a month name
+# ("Aug 26 top vendors"); and "one" is no count here ("which one most often misses margin?").
+_TOP_N = (re.compile(rf"\b{_RANK_WORD}[\s-]+{_count(_COUNT_WORDS)}\b", re.I),
+          re.compile(rf"(?<![\w\-/'’.]){_count(set(_COUNT_WORDS) - {'one'})}[\s-]+"
+                     rf"(?:{_RANK_WORD}|most|least)\b", re.I))
+_MONTH_BEFORE = re.compile(
+    r"\b(?:" + "|".join(m.lower() for m in calendar.month_name[1:] + calendar.month_abbr[1:]) + r")\.?\s*\Z",
+    re.I)
+
+
+def top_n(question: str) -> int | None:
+    """The N of a "top N" question, or None. A get_kpi ranking used to show every row its
+    budget left room for, so "top 10 brands" came back as a table of 16."""
+    q = question or ""
+    for pat in _TOP_N:
+        for m in pat.finditer(q):
+            if _MONTH_BEFORE.search(q[:m.start(1)]):
+                continue
+            word = " ".join(m.group(1).lower().split())
+            n = int(word) if word.isdigit() else _COUNT_WORDS[word]
+            return n if n >= 1 else None
+    return None
+
+
 # What is being MEASURED. Ordered: the first match wins, so the more specific phrasings
 # come first.
 _MEASURES: list[tuple[str, tuple[str, ...]]] = [
@@ -301,10 +381,16 @@ _GRAIN_NOTES: dict[str, str] = {
 # the formulary" and the Dec–May sales share by formulary status.
 _REPORTS_NOTE = (
     "Formulary COMPLIANCE %, out-of-formulary spend, restricted/preferred brand use, "
-    "scheme/Attis/Healthium savings and cash & TPA margin loss are <<REPORTS>> reports "
-    "reachable ONLY through get_kpi keys formulary-compliance, brand-rules, "
-    "scheme-brand-saving, attis-saving, cash-tpa-margin-loss — there is no SQL table for "
-    "them, and they do not overlap the <<SALES>> sales window.")
+    "scheme/Attis/Healthium savings, cash & TPA margin loss and out-of-formulary margin missed "
+    "are <<REPORTS>> reports reachable ONLY through get_kpi keys formulary-compliance, "
+    "brand-rules, scheme-brand-saving, attis-saving, cash-tpa-margin-loss, oof-margin-loss — "
+    "there is no SQL table for them, and they do not overlap the <<SALES>> sales window.")
+
+# "Top 10 out-of-formulary brands by margin missed" was answered by ranking formulary-
+# compliance's out_of_formulary_cost — the drug COST billed — and worded as margin missed
+# (live run, 12-11-2026). HCG's out-of-formulary margin is a purchase figure with its own key.
+_OOF = r"(?:out[\s-]+of[\s-]+formulary|oof)"
+_MARGIN_MISSED = r"(?:margin|missed|miss|loss|lost|losing)"
 
 _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
     (r"\bformular",
@@ -327,6 +413,13 @@ _KEYWORD_NOTES: tuple[tuple[str, str], ...] = (
      "(scheme / GOV patients): their cost and share of all drug spend. It is NOT "
      "get_kpi('cash-tpa-margin-loss'), a different figure: the margin lost when a cash or TPA "
      "patient got a brand HCG's list suggests replacing."),
+    (rf"\b{_OOF}\b.*\b{_MARGIN_MISSED}\b|\b{_MARGIN_MISSED}\b.*\b{_OOF}\b",
+     "WHICH REPORT: the margin missed on OUT-OF-FORMULARY brands is get_kpi('oof-margin-loss') — "
+     "HCG's purchase method: the suggested formulary brand's margin minus the margin earned on the "
+     "out-of-formulary brands bought; view='items' ranks the brands by margin missed (also "
+     "'hospitals', 'vendors', 'trend'). It is NOT formulary-compliance's out_of_formulary_cost, "
+     "which is drug COST (spend), and NOT cash-tpa-margin-loss (cash & TPA patients' brands). "
+     "Never present a cost ranking as margin missed."),
     # The same reports asked for without the word "formulary".
     (r"(?<!formulary )\bcompliance\b|\b(?:restricted|preferred) brands?\b|\bbrand[- ]rules?\b"
      r"|\battis\b|\bhealthium\b|\bscheme (?:brand )?sav|\bcash\s*(?:&|and)\s*tpa\b",
@@ -506,6 +599,7 @@ def _resolve_uncached(question: str, limit: int = 8) -> dict:
     # because a company with five trading names is five rows, not one. Report the family and
     # the LIKE filter that covers it rather than silently picking its biggest member.
     claimed = {t.lower() for e in deduped for t in _WORD.findall(e["text"])}
+    claimed |= _hospital_city_words(q)
     schema_words = _schema_vocabulary()
     families: list[dict] = []
     for tok in interesting:
@@ -573,7 +667,8 @@ def _resolve_uncached(question: str, limit: int = 8) -> dict:
                                "n": len(values)})
     lookalikes = lookalikes[:6]
 
-    found_cities = [c for c in cities() if re.search(rf"\b{re.escape(c)}\b", q, re.I)]
+    found_cities = [c for c in cities() if re.search(rf"\b{re.escape(c)}\b", q, re.I)
+                    and not _city_only_addresses_a_hospital(q, c)]
     low = q.lower()
     # WORD boundaries, not substrings. "Which hospital generates the most sales revenue?"
     # was typed as a PRICE question because "generates" contains "rate" — and the brief then
@@ -724,7 +819,7 @@ def brief(question: str) -> str:
     # "KR", "Nagpur": hospital names as HCG says them, which no dimension value spells that
     # way (and two-letter words never reach the resolver at all).
     from app.ai import hospitals as _hosp
-    hosp = [(a, c) for a, c in _hosp.mentioned(question) if len(c) == 1
+    hosp = [(a, c) for a, c in hospitals_named(question, r) if len(c) == 1
             and not any(e["kind"] == "hospital" for e in r["entities"])]
     if not (r["entities"] or r["families"] or r["cities"] or r["measures"] or r["grains"]
             or asks_about_time or typos or kw_hits or rel_note or hosp):
@@ -1524,9 +1619,72 @@ def _names_a_site(question: str) -> bool:
     q = question or ""
     if _SITE_WORDING.search(q):
         return True
+    # a hospital named the way HCG says it: "KR Bangalore", "North Bangalore", "Nagpur"
+    if hospitals_named(q):
+        return True
     short = _site_short_names()
     words = [t.lower() for t in _WORD.findall(q)]
     return any(prev in ("hcg", "at", "in") and w in short for prev, w in zip(words, words[1:]))
+
+
+def hospitals_named(question: str, r: dict | None = None) -> list[tuple[str, tuple[str, ...]]]:
+    """hospitals.mentioned(), less the names that are part of a product's name in the question.
+
+    "DR" is HCG DR (HC06), and it is also the delayed-release mark and a brand word in item
+    names ("DR EXCELD 60000IU CAP", "DOXY 1-L-DR FORTE CAP"). Read as the hospital, a monthly
+    trend question about one of those products lost its query, and the brief told the model
+    that HC06's month-by-month figures do not exist. A name is part of the product's name
+    when it lies inside the product description the question gives, or when it is joined to
+    a product word the question names and an item description spells the two together
+    ("DR EXCELD"; "KR keytruda" is no item, so KR stays the hospital).
+
+    `r` is resolve(question) when the caller has it already."""
+    from app.ai import hospitals as _hosp
+    spans = _hosp.spans(question)
+    if not spans:
+        return []
+    r = r if r is not None else resolve(question)
+    products = [e["text"] for e in r["entities"] if e["kind"] in ("material", "generic")]
+    within = [(m.start(), m.end()) for text in products
+              for m in re.finditer(r"\s+".join(map(re.escape, text.split())), question, re.I)]
+    tokens = {f["token"].lower() for f in r["families"] if f["kind"] in ("material", "generic")}
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for s, e, alias, codes in spans:
+        if any(a <= s and e <= b for a, b in within) or _joined_to_a_product_word(question, s, e, tokens):
+            continue
+        if not any(a == alias for a, _c in out):
+            out.append((alias, codes))
+    return out
+
+
+# the name it had while only this module used it
+_hospitals_named = hospitals_named
+
+
+def _joined_to_a_product_word(question: str, start: int, end: int, tokens: set[str]) -> bool:
+    """True when the words at [start, end) and the product word right next to them (a space or
+    a hyphen apart) are written together in an item description."""
+    phrases = []
+    after = re.match(r"[\s-]+([A-Za-z0-9]+)", question[end:])
+    if after and after.group(1).lower() in tokens:
+        phrases.append(question[start:end + after.end()])
+    before = re.search(r"([A-Za-z0-9]+)[\s-]+\Z", question[:start])
+    if before and before.group(1).lower() in tokens:
+        phrases.append(question[before.start():end])
+    return any(_in_an_item_name(" ".join(p.upper().split())) for p in phrases)
+
+
+@lru_cache(maxsize=256)
+def _in_an_item_name(phrase: str) -> bool:
+    """True when some item description contains `phrase` (upper case, single spaces)."""
+    from app.ai import warehouse
+    try:
+        rows = warehouse.query(
+            "SELECT 1 FROM dim_material WHERE upper(CAST(material_desc AS VARCHAR)) LIKE ? LIMIT 1",
+            ["%" + phrase.replace("%", "").replace("_", "") + "%"])
+    except Exception:
+        return False
+    return bool(rows)
 
 
 def _names_as_the_object(question: str, token: str) -> bool:

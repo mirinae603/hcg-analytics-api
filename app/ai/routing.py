@@ -46,6 +46,11 @@ _LOCKS: list[tuple[re.Pattern, str]] = [
      "This is a PRICE-DISPERSION question → you MUST use mart_material_price_stats, rank by clean_price_spread (or price_ratio) among clean_n>=5, scoped by category. It is a WRONG answer to return a top-by-VALUE list, biggest purchase orders, capex lines, or a sales-margin/profit ranking."),
     (re.compile(r"\b(genuine|actual|real)\b.{0,25}\bsupply\b|\bsupply\b.{0,25}\bexcluding\b.{0,15}\b(capital|capex|service)|exclud\w*\b.{0,15}\b(capital|capex|service)", re.I),
      "Genuine medical SUPPLY spend → classify on fact_po.doc_type: Supply = doc_type NOT IN ('Service PO','Dom Capital PO','CMC','AMC','Imp capital PO') (order lines without a material are not in fact_po at all). Do NOT additionally filter by material_type — NULL-material_type domestic-PO lines are still genuine supply and dropping them undercounts."),
+    # Live, 12-11-2026: "top 10 out-of-formulary brands by margin missed" ranked
+    # formulary-compliance's out-of-formulary COST and called it margin missed.
+    (re.compile(r"\b(out[\s-]+of[\s-]+formulary|oof)\b.{0,80}\b(margin|missed|miss|loss|lost|losing)\b"
+                r"|\b(margin|missed|loss|lost)\b.{0,80}\b(out[\s-]+of[\s-]+formulary|oof)\b", re.I),
+     "OUT-OF-FORMULARY MARGIN MISSED → you MUST use get_kpi(\"oof-margin-loss\") (HCG's purchase method: the suggested formulary brand's margin − the margin earned); view=\"items\" ranks brands by margin missed, \"hospitals\"/\"vendors\"/\"trend\" the other cuts. It is a WRONG answer to rank formulary-compliance's out_of_formulary_cost (drug COST, a spend figure) or to use cash-tpa-margin-loss."),
 ]
 
 
@@ -112,6 +117,8 @@ _CORPUS: list[tuple[str, str]] = [
      "SCHEME / ATTIS SAVINGS → get_kpi(\"scheme-brand-saving\" / \"attis-saving\") (<<REPORTS>> only; no SQL table). Report each hospital separately — never add up percentages."),
     ("cash and TPA margin loss; margin lost on cash patients; TPA margin leakage",
      "CASH & TPA MARGIN LOSS → get_kpi(\"cash-tpa-margin-loss\") (<<REPORTS>> only; no SQL table). Not the <<SALES_SHORT>> sales tables. Spend on restricted brands for cash & TPA patients is NOT this: brand-rules."),
+    ("out of formulary margin missed; margin lost on out-of-formulary brands; OOF margin loss; which out-of-formulary brands or vendors miss the most margin",
+     "OUT-OF-FORMULARY MARGIN MISSED → get_kpi(\"oof-margin-loss\") (<<REPORTS>> only, purchases; no SQL table): views summary/trend/hospitals/items/vendors. Not formulary-compliance's out-of-formulary spend (drug cost), not cash-tpa-margin-loss."),
     ("spend on restricted brands for cash and TPA patients; restricted brands given to cash patients; restricted brand consumption for cash & TPA",
      "RESTRICTED BRANDS FOR CASH & TPA → get_kpi(\"brand-rules\", measure=\"restricted_cash_tpa\"): the SPEND and its share of drug spend (<<REPORTS>> only). Not cash-tpa-margin-loss, which is margin lost vs suggested brands."),
     ("out of formulary stock; non-formulary items; is this item on the formulary; share of sales from non-formulary items",

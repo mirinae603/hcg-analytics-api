@@ -20,12 +20,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from app.ai import warehouse
-from app.ai import scope as _scope, semantics, charts, routing, kpi_registry, windows
+from app.ai import scope as _scope, semantics, charts, routing, kpi_registry, windows, hcg_reports
 from app.ai import resolve as _resolver
 from app.ai import page_context
 from app.ai.deep import engine as _deep_engine, sanity as _sanity
@@ -126,12 +127,19 @@ def _is_retriable(e: Exception) -> bool:
 def _llm_error_text(e: Exception) -> str:
     """What to tell the user when the model cannot be reached at all. Every failure used to
     read "briefly overloaded (rate-limited)", which sent people to wait out a wrong key or a
-    missing deployment. The status decides the wording; the key itself is never included."""
+    missing deployment. The status decides the wording. The service's own error text stays
+    in the log, under a ref the user is shown: it can quote the request back, and the reply
+    is saved for every user of the chat to read. The key itself is never included."""
     root = e.__cause__ if isinstance(e, _StreamOpenFailed) and e.__cause__ else e
     status = getattr(root, "status_code", None) or getattr(getattr(root, "response", None), "status_code", None)
     body = getattr(root, "body", None)
     detail = str((body.get("message") if isinstance(body, dict) else None) or root)[:160]
-    _log.warning("ai.llm_error type=%s status=%s detail=%s", type(root).__name__, status, detail)
+    ref = secrets.token_hex(4)
+    _log.warning("ai.llm_error ref=%s type=%s status=%s detail=%s", ref, type(root).__name__, status, detail)
+    return "%s (ref %s)" % (_llm_error_words(root, status), ref)
+
+
+def _llm_error_words(root: Exception, status) -> str:
     if status in (401, 403):
         return ("The AI service rejected the key or the endpoint (error %s). Check AZURE_OPENAI_API_KEY "
                 "and AZURE_OPENAI_ENDPOINT on the server; `python -m app.ai.check_connection` tests them."
@@ -140,7 +148,7 @@ def _llm_error_text(e: Exception) -> str:
         return ("The AI model was not found on this Azure resource (error 404). Check that the deployment "
                 f"named in AZURE_OPENAI_DEPLOYMENT ('{AZURE_DEPLOYMENT}') exists there.")
     if status == 400:
-        return f"The AI service refused the request (error 400): {detail}"
+        return "The AI service refused the request (error 400). Please try asking it another way."
     if status == 429 or "ratelimit" in type(root).__name__.lower():
         return "The AI service is briefly overloaded (rate-limited). Please try that again in a moment."
     if _is_retriable(root):
@@ -601,10 +609,10 @@ SYSTEM = """You are the HCG Supply-Chain AI Analyst. You answer ANY question abo
 
 HOW YOU WORK — like a sharp, friendly human analyst:
 • NAMED KPI? If the question names or clearly maps to one of the KNOWN KPIS listed in get_kpi's own description, call get_kpi FIRST — it returns the exact same calculation the dashboard card for that metric uses, not a re-derived approximation. Only fall back to run_sql for that topic if get_kpi genuinely doesn't cover the specific cut being asked for (e.g. a single named item's detail, or a custom breakdown no KPI card offers). get_kpi accepts a specific hospital or category — try that argument before ever telling the user a breakdown "isn't available"; do not reason about whether it's queryable, just call it and see.
-• <<REPORTS>> REPORTS — formulary compliance %, out-of-formulary spend, restricted/preferred brand use (brand rules), scheme/Attis/Healthium brand saving missed, and cash & TPA margin loss — exist ONLY through get_kpi keys formulary-compliance, brand-rules, scheme-brand-saving, attis-saving, cash-tpa-margin-loss. There is no SQL table for them: never answer them with run_sql or from dim_material.formulary_status (that flag is only for "is item X on the formulary" and the <<SALES_SHORT>> sales share by formulary status). They take month / view / doctor / material / payer / patient_type / segment arguments. The default is the latest month (<<REPORTS_LATEST>>), so pass month for any other month (month="all" with view="trend" for month by month) and always state the month(s) you used. Their percentages are ratios of sums: never add or average them across hospitals — pass several codes (plant="HC05,HC06") for a pooled figure, or view="hospitals" to rank them. They do not overlap the <<SALES>> sales/procurement window.
+• <<REPORTS>> REPORTS — formulary compliance %, out-of-formulary spend, restricted/preferred brand use (brand rules), scheme/Attis/Healthium brand saving missed, cash & TPA margin loss, and the margin missed on out-of-formulary brands bought — exist ONLY through get_kpi keys formulary-compliance, brand-rules, scheme-brand-saving, attis-saving, cash-tpa-margin-loss, oof-margin-loss. Out-of-formulary SPEND (formulary-compliance) and out-of-formulary MARGIN MISSED (oof-margin-loss) are different measures: answer with the one the question names, and for a "top N" pass top=N. There is no SQL table for them: never answer them with run_sql or from dim_material.formulary_status (that flag is only for "is item X on the formulary" and the <<SALES_SHORT>> sales share by formulary status). They take month / view / doctor / material / payer / patient_type / segment arguments. The default is the latest month (<<REPORTS_LATEST>>), so pass month for any other month (month="all" with view="trend" for month by month) and always state the month(s) you used. Their percentages are ratios of sums: never add or average them across hospitals — pass several codes (plant="HC05,HC06") for a pooled figure, or view="hospitals" to rank them. They do not overlap the <<SALES>> sales/procurement window.
 • UNDERSTAND the real intent first. If the request is ANSWERABLE from the data but genuinely ambiguous or under-specified (unclear time range, which metric/entity), call ask_clarification with ONE short question (and 2–4 quick options) INSTEAD of guessing. Don't over-ask — if a sensible default is obvious, just proceed and state the assumption.
 • NEVER ask permission to give an answer you can already give. Check the DIMENSIONAL MODEL first: if a table carries the entity AND a time axis (e.g. sales_by_material_month for one product's monthly sales, <<SALES>>), query it. Only if no table carries that combination, give the closest correct figure in the same reply and name what is missing — never end the turn with "would you like … instead?"; asking whether the user wants it is a wasted turn that makes the assistant look like it is refusing. ask_clarification is for choosing BETWEEN real options, never for offering something you could simply have handed over.
-• OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts) and HCG's <<REPORTS>> reports (formulary compliance, brand rules, scheme/Attis brand savings, cash & TPA margin loss). If asked for something the data simply doesn't contain — people/roles OTHER THAN the treating doctors in those reports (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
+• OUT OF SCOPE: this assistant only covers HCG supply-chain data (sales, procurement, inventory, expiry, consumption, forecasts) and HCG's <<REPORTS>> reports (formulary compliance, brand rules, scheme/Attis brand savings, cash & TPA and out-of-formulary margin loss). If asked for something the data simply doesn't contain — people/roles OTHER THAN the treating doctors in those reports (e.g. "who is the CEO"), org structure, patient/clinical records, real-world/external facts, weather — do NOT ask a clarifying question and do NOT query. Briefly say it's outside the supply-chain data you have, and point them to what you CAN answer. Decline cleanly in one sentence.
 • If lookup_item returns probably_not_an_item=true, the name is NOT a product — it is a manufacturer, vendor or hospital, and `also_found_in` says which column holds it. Filter THAT column. "MSD" matched a stationery sticker called STICKER-MSDS on a substring while MSD the manufacturer has 614 procurement lines worth ₹42.34 Cr; answering about the sticker is the wrong entity, not a near miss. Do NOT offer those substring matches back as a clarifying choice either — the flag means they are coincidences, so listing them asks the user to pick between the right answer and noise. Proceed with the manufacturer/vendor and say which you used.
 • SPECIFIC ITEM? For ANY question about a particular product/SKU (named or by code), call lookup_item FIRST. It returns the item's identity (generic, group, manufacturer, formulary status) and a COMPLETE footprint — the row count in EVERY table it touches (sales, PO, GRN, consumption, inventory, forecasts). This guarantees you never miss a source: an item with 0 sales/purchases but rows in fact_inventory is DEAD / NON-MOVING stock (report qty, aging, expiry, formulary) — never call that "no data". Then run_sql only the tables the footprint shows have rows.
 • BEFORE you write a query, check the DIMENSIONAL MODEL above for the table you're about to use: you may only GROUP BY / filter on a dimension in its "slice by" list, and may only show a time trend if its "time axis" isn't NONE. If the cut the user wants (a dimension × a time axis, or two dimensions) doesn't exist together in any one table, that exact breakdown is NOT available — give the closest correct cut and say so. Never take a broader table's numbers and label them as a narrower entity/period.
@@ -779,8 +787,66 @@ def _humanize_col(c: str) -> str:
     return clean or c.replace("_", " ").strip().title()
 
 
+# What charts.build can draw from each encoding. `y` is the only one that takes several
+# columns (one series each); x is the one category axis, color/series the one grouping,
+# size the one bubble size and y2 the one line on the secondary axis. The rest are words.
+_SPEC_ONE_COLUMN = ("x", "color", "series", "size", "y2")
+_SPEC_ONE_WORD = ("type", "value_format", "y2_format", "orientation", "title")
+
+
+def _spec_names(v) -> list[str]:
+    """Every non-blank string in v, in order: v itself if it is one, else the strings in a
+    list, however deeply nested. Anything else (a number, an object, null) names nothing."""
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    if isinstance(v, (list, tuple)):
+        return [n for item in v for n in _spec_names(item)]
+    return []
+
+
+def _normalise_chart_spec(spec) -> dict | None:
+    """The model's chart spec in the shape the chart code reads, or None when it is not a
+    spec at all. The schema asks for one column name in x/color/size/y2, but the model
+    sometimes sends a list there, or a list of lists in y; _pick_result put those into a set
+    and the TypeError lost the whole answer. A list in a one-column encoding keeps its first
+    name, the one the model put first; a nested y is flattened to one list of series. A
+    value that names no column is dropped, as if the model had left the encoding out. A
+    spec that is already well formed comes back equal to itself."""
+    if not isinstance(spec, dict):
+        return None
+    out = dict(spec)
+    for k in _SPEC_ONE_COLUMN + _SPEC_ONE_WORD:
+        if k in out and not isinstance(out[k], str):
+            names = _spec_names(out[k])
+            if names:
+                out[k] = names[0]
+            else:
+                del out[k]
+    if "y" in out and not isinstance(out["y"], str):
+        names = _spec_names(out["y"])
+        if names:
+            out["y"] = names
+        else:
+            del out["y"]
+    return out
+
+
+def _chart_specs(present_args: dict) -> list[dict]:
+    """The chart specs present() attached, each through _normalise_chart_spec, so every
+    reader after this (_pick_result, the metric guard, _enhance_spec, charts.build) sees
+    the same well-formed shape. `charts` is the list; one spec sent on its own instead of a
+    list counts as a list of one. The deprecated single `chart` is read only when `charts`
+    gives none."""
+    def usable(raw) -> list[dict]:
+        raw = [raw] if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        return [s for s in (_normalise_chart_spec(r) for r in raw) if s]
+    return usable(present_args.get("charts")) or usable(present_args.get("chart"))
+
+
 def _pick_result(results, chart):
-    """Find the query result whose columns cover the chart's referenced columns (prefer most recent)."""
+    """Find the query result whose columns cover the chart's referenced columns (prefer most
+    recent). `chart` is a spec from _normalise_chart_spec: one name per encoding, y a name
+    or a flat list of names."""
     if not chart:
         return None
     needed = set()
@@ -795,6 +861,37 @@ def _pick_result(results, chart):
         if needed.issubset(set(res["columns"])):
             return res
     return results[-1] if results else None
+
+
+def _draw_chart(results, spec, ans):
+    """(the result the chart is drawn from, the figure) for one chart spec, or (None, None)
+    when no result has rows for it. The figure is None when charts.build finds nothing to
+    draw; the result still goes to the table then."""
+    res = _pick_result(results, spec)
+    if not res or not res["rows"]:
+        return None, None
+    # Degenerate-metric guard: if the chosen column is mostly-zero but the answer is
+    # about a healthier one in the same result, chart that instead (and retitle to
+    # name it). Fail-open — any hiccup leaves the model's original spec untouched.
+    try:
+        better = _better_chart_metric(res, spec, ans)
+        if better:
+            spec["y"] = better
+            spec["value_format"] = infer_kind(better)
+            xh = _humanize_col(spec.get("x") or "")
+            spec["title"] = f"{_humanize_col(better)} by {xh}" if xh else _humanize_col(better)
+    except Exception:
+        pass
+    if not spec.get("value_format") and spec.get("y"):
+        yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
+        spec["value_format"] = infer_kind(str(yk))
+    _enhance_spec(spec, res)
+    # Same terminology filter as the prose answer — the model writes chart titles
+    # itself and the audit found "Inventory Turnover Ratio by plant" shipped as a
+    # literal chart title in one session.
+    if spec.get("title"):
+        spec["title"] = _sanitize_prose(spec["title"])
+    return res, charts.build(res["rows"], spec)
 
 
 # ── deterministic number check ────────────────────────────────────────────────
@@ -1207,7 +1304,11 @@ def answer(query: str, history: list | None = None, context: dict | None = None)
 
     `context` is the dashboard page the question was asked from (normalised by
     app/ai/page_context in chat.py / router.py, and again by context_line), or None. The body is _answer; this wrapper only times the turn and logs what it cost,
-    whichever of its many exits it leaves by."""
+    whichever of its many exits it leaves by.
+
+    An "error" event's text is shown and saved as it is, so it is always fixed wording, never
+    an exception's text. A failure with nothing useful to tell the user raises instead, and
+    the caller's chat_service.TurnReply logs it with a ref and sends the generic error."""
     acc = _Usage()
     try:
         yield from _answer(query, history, context, acc)
@@ -1227,12 +1328,12 @@ def _answer(query: str, history: list | None, context: dict | None, acc: _Usage)
     # itself), routing's embedding call, then the model. Each is a real wait with nothing
     # to show otherwise, and users read a long instant silence as "stuck".
     yield {"type": "step", "text": "Understanding your question"}
-    try:
-        client = _client()
-        ctx = semantics.context()
-    except Exception as e:
-        yield {"type": "error", "text": f"AI service unavailable: {e}"}
-        return
+    # Not caught here. Building the client or the schema context fails on a DuckDB or file
+    # error, which the user cannot act on and whose text can carry a path or SQL. Every caller
+    # runs this generator through chat_service.TurnReply, whose fail() logs the traceback with
+    # a ref and sends the generic error in its place.
+    client = _client()
+    ctx = semantics.context()
 
     # IDENTIFY BEFORE QUERYING. Every wrong answer this assistant produced came from acting
     # on a word before typing it: "MSD" answered as a stationery sticker, "Bangalore" as a
@@ -1460,6 +1561,14 @@ def _answer(query: str, history: list | None, context: dict | None, acc: _Usage)
                     if _val not in (None, "", [], ()):
                         extra[_name] = _val
                 entry = kpi_registry.KPI_REGISTRY.get(kpi_key) or {}
+                # "Top 10 … brands" asks for ten rows. A ranked report view held every row its
+                # budget left room for (16 in the live run), so the question's N goes in
+                # when the model did not send one.
+                if "top" not in extra and "top" in entry.get("args", ()) \
+                        and str(args.get("view") or "").strip().lower() in hcg_reports.RANKED_VIEWS:
+                    _n = _resolver.top_n(query)
+                    if _n and _n <= hcg_reports.TOP_MAX:
+                        extra["top"] = _n
                 # The canonical path produces no SQL, so every scope guard in this file
                 # sat it out: "Bangalore hospitals spend ₹649.91 Cr" was the whole network.
                 # `ratio`: a percentage KPI's per-site figures must never be summed, so the
@@ -1770,11 +1879,7 @@ def _answer(query: str, history: list | None, context: dict | None, acc: _Usage)
         yield {"type": "done"}
         return
 
-    chart_specs = present_args.get("charts")
-    if not chart_specs:
-        single = present_args.get("chart")
-        chart_specs = [single] if single else []
-    chart_specs = [c for c in chart_specs if c]
+    chart_specs = _chart_specs(present_args)
 
     # If the answer came back as plain content (model didn't call present), it was never
     # audited inline — audit it now so EVERY data-backed answer gets the same gate. Same
@@ -1828,32 +1933,18 @@ def _answer(query: str, history: list | None, context: dict | None, acc: _Usage)
             chart_specs = [auto]
 
     table_res = None
+    # Each chart is drawn on its own. One that failed used to raise out of this loop before
+    # the table was sent, so the user lost the other charts and the table with it. Now it is
+    # logged with a ref and skipped, and once the table is out the turn sends one error,
+    # which chat_service.TurnReply turns into the partial notice under the answer.
+    chart_ref = None
     for spec in chart_specs:
-        res = _pick_result(results, spec)
-        if not res or not res["rows"]:
-            continue
-        # Degenerate-metric guard: if the chosen column is mostly-zero but the answer is
-        # about a healthier one in the same result, chart that instead (and retitle to
-        # name it). Fail-open — any hiccup leaves the model's original spec untouched.
         try:
-            better = _better_chart_metric(res, spec, ans)
-            if better:
-                spec["y"] = better
-                spec["value_format"] = infer_kind(better)
-                xh = _humanize_col(spec.get("x") or "")
-                spec["title"] = f"{_humanize_col(better)} by {xh}" if xh else _humanize_col(better)
+            res, fig = _draw_chart(results, spec, ans)
         except Exception:
-            pass
-        if not spec.get("value_format") and spec.get("y"):
-            yk = spec["y"][0] if isinstance(spec["y"], list) else spec["y"]
-            spec["value_format"] = infer_kind(str(yk))
-        _enhance_spec(spec, res)
-        # Same terminology filter as the prose answer — the model writes chart titles
-        # itself and the audit found "Inventory Turnover Ratio by plant" shipped as a
-        # literal chart title in one session.
-        if spec.get("title"):
-            spec["title"] = _sanitize_prose(spec["title"])
-        fig = charts.build(res["rows"], spec)
+            chart_ref = chart_ref or secrets.token_hex(4)
+            _log.exception("ai.chart_failed ref=%s", chart_ref)
+            continue
         if fig:
             yield {"type": "chart", "plotly": fig}
         table_res = table_res or res
@@ -1869,6 +1960,9 @@ def _answer(query: str, history: list | None, context: dict | None, acc: _Usage)
                                           "columns": [{"key": c, "label": _sanitize_prose(c), "kind": col_kind(c, table_res["rows"])} for c in table_res["columns"]],
                                           "rows": table_res["rows"][:50]},
                "note": ("Showing top 50 of %d rows." % table_res["row_count"]) if table_res.get("truncated") or table_res["row_count"] > 50 else ""}
+    if chart_ref:
+        yield {"type": "error", "ref": chart_ref,
+               "text": "A chart for this answer couldn't be drawn. (ref %s)" % chart_ref}
 
     # Better, grounded follow-ups (dedicated cheap-model call), delivered after the answer,
     # chart and table have already reached the user, as a patch onto the same message; if

@@ -545,11 +545,14 @@ def _kpi_scope_mismatch(key: str, plant: str, question: str, ratio: bool = False
         # A hospital named the way people say it ("KR", "Nagpur", "Panda") is in neither
         # the city list nor the warehouse's codes, so this guard never saw it: asked what KR
         # spent on restricted brands, the model dropped the hospital and reported the
-        # network's ₹3.17 Cr as KR's ₹43.47 L (golden fs-kr-*, 10-10-2026).
+        # network's ₹3.17 Cr as KR's ₹43.47 L (golden fs-kr-*, 10-10-2026). Read through
+        # resolve, as the fast path does, so the "DR" in "DR EXCELD 60000IU CAP" is the
+        # product's word and not HCG DR (HC06).
         from app.ai import hospitals as _hosp
-        codes = list(dict.fromkeys(c[0] for _a, c in _hosp.mentioned(question or "") if len(c) == 1))
+        mentions = [(a, c) for a, c in _resolve.hospitals_named(question or "", r) if len(c) == 1]
+        codes = list(dict.fromkeys(c[0] for _a, c in mentions))
         if codes:
-            said = ", ".join(a for a, c in _hosp.mentioned(question or "") if len(c) == 1)
+            said = ", ".join(a for a, _c in mentions)
             head = (f"UNSCOPED KPI — this question names {said} = {_hosp.describe(codes)}, and "
                     f"get_kpi('{key}') without a `plant` argument returns the figure for the WHOLE "
                     f"network. ")

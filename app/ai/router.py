@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from app.ai import orchestrator, page_context, transcribe, warehouse
+from app.services.chat_service import TurnReply
 
 router = APIRouter()
 
@@ -46,11 +47,18 @@ def ai_chat(req: ChatReq):
     extra = {"context": ctx} if ctx else {}
 
     def gen():
+        # Nothing is stored here, but the events are the chat routes' own: TurnReply turns a
+        # failure into the same generic error (a partial one once the answer is out) instead
+        # of the exception's text, which can carry SQL or a service's error body.
+        turn = TurnReply("/ai/chat")
         try:
             for ev in orchestrator.answer(req.query, req.history, **extra):
-                yield f"data: {json.dumps(ev)}\n\n"
-        except Exception as e:  # never break the stream ungracefully
-            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+                yield f"data: {json.dumps(turn.add(ev))}\n\n"
+        except Exception:  # never break the stream ungracefully
+            yield f"data: {json.dumps(turn.fail())}\n\n"
+        closing = turn.finish()
+        if closing:
+            yield f"data: {json.dumps(closing)}\n\n"
         yield "data: {\"type\": \"end\"}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream",
