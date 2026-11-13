@@ -11,9 +11,11 @@ same arguments the pages do.
 
 It never blocks a start or a request, and never raises: it runs in a daemon thread, a failure is
 logged and the next visitor fills the caches the usual way. It runs only when there is room for
-it. The tables stay in memory once read (WARM_NEEDS_MB), and app/main.py's note on the 512 MB
-free tier still holds: reading them at boot on a box that cannot hold them would crash it into a
-restart loop, so with less memory free than that, nothing is warmed and the page loads on first
+it AND for the AI Analyst's first answer after it. The tables stay in memory once read
+(WARM_NEEDS_MB), and the AI Analyst's first answer then reads its own on top (AI_RESERVE_MB), so
+a container that holds either alone may not hold both: warming it anyway gets the server killed
+on the first AI question (as on 13-Nov-2026). app/main.py's note on the 512 MB free tier still
+holds too. With less memory free than both need, nothing is warmed and the page loads on first
 visit, as before.
 
 It runs only in a serving process: the lifespan marks the start (serving()). The tests build
@@ -43,6 +45,11 @@ if not _log.handlers and not logging.getLogger().handlers:
 # answer took a 212 MB process to 685 MB at its peak and kept about 400 MB of it (the sales_items
 # table, the spend tables and the purchase prices stay in their read caches). With room to spare.
 WARM_NEEDS_MB = 600
+# Memory the AI Analyst's first answer takes on top of a warm cache: it reads the tables its SQL
+# runs on, which the warm-up's caches do not share. Measured on the Oct-2026 tables (13-Nov-2026):
+# a warmed 687 MB process peaked at 1,484 MB on the first question, a cold 240 MB one at 1,291 MB.
+# With room to spare. A warm-up starts only with both free, so the AI can still answer after it.
+AI_RESERVE_MB = 850
 # Where a container's memory limit and use are read: cgroup v2, then v1. With no limit set the
 # machine's MemAvailable decides (MEMINFO).
 CGROUP_FILES = (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
@@ -128,9 +135,10 @@ def _run(reason: str) -> None:
 def _warm_once(reason: str) -> None:
     try:
         free = free_mb()
-        if free is not None and free < WARM_NEEDS_MB:
-            _log.info("cache warm-up (%s) skipped: %.0f MB free, %d MB needed; the first visit fills the caches",
-                      reason, free, WARM_NEEDS_MB)
+        needed = WARM_NEEDS_MB + AI_RESERVE_MB
+        if free is not None and free < needed:
+            _log.info("cache warm-up (%s) skipped: %.0f MB free, %d MB needed (%d to warm, %d kept for the "
+                      "AI Analyst); the first visit fills the caches", reason, free, needed, WARM_NEEDS_MB, AI_RESERVE_MB)
             return
         t0 = time.perf_counter()
         warm()
