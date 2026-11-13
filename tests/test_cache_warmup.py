@@ -137,9 +137,26 @@ def test_too_little_memory_warms_nothing(calls, monkeypatch, caplog):
         assert W.start("startup") is True
         _join()
     assert calls == []
-    assert "skipped: 599 MB free, 600 MB needed" in caplog.text
+    assert "skipped: 599 MB free, 1450 MB needed (600 to warm, 850 kept for the AI Analyst)" in caplog.text
     # memory that cannot be read does not stop it (a developer's machine without /proc)
     monkeypatch.setattr(W, "free_mb", lambda: None)
+    assert W.start("startup") is True
+    _join()
+    assert calls == [THREAD]
+
+
+def test_room_to_warm_but_not_for_the_ai_after_it_warms_nothing(calls, monkeypatch, caplog):
+    # 13-Nov-2026: a container with room for the warm-up alone was warmed, and the AI Analyst's
+    # first answer on top of it got the server killed. Warming now needs room for both.
+    W.serving()
+    for free in (W.WARM_NEEDS_MB, W.WARM_NEEDS_MB + W.AI_RESERVE_MB - 1.0):
+        monkeypatch.setattr(W, "free_mb", lambda free=free: free)
+        with caplog.at_level(logging.INFO, logger=W.__name__):
+            assert W.start("startup") is True
+            _join()
+        assert calls == []
+    assert "kept for the AI Analyst" in caplog.text
+    monkeypatch.setattr(W, "free_mb", lambda: float(W.WARM_NEEDS_MB + W.AI_RESERVE_MB))
     assert W.start("startup") is True
     _join()
     assert calls == [THREAD]

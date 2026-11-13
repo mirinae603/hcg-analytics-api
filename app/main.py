@@ -55,7 +55,7 @@ app.include_router(api_router)
 # navigation instant, and the big fact tables are not held resident (see data_access.load).
 # The one warm-up the lifespan starts (app/api/warmup.py) reads only the executive overview's
 # tables, never fact_grn / fact_po, in a background thread, and only when the memory they
-# take is free.
+# take is free with room left for the AI Analyst's first answer (warmup.AI_RESERVE_MB).
 
 # After each request, hand the memory freed by transient big-table loads back to the OS.
 # glibc keeps freed heap by default (RSS stays high on a 512 MB box); malloc_trim(0)
