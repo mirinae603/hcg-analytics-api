@@ -244,3 +244,33 @@ def test_there_is_no_drugs_only_segment():
     assert kpi_registry._EXTRA_SCHEMA["segment"]["enum"] == ["onco", "non-onco", "consumables"]
     ctx = page_context.normalise({"page": "spend", "filters": {"segment": "drugs"}})
     assert "segment" not in (ctx.get("filters") or {})
+
+
+def test_a_chat_deleted_after_its_answer_keeps_the_answer_on_screen(client, admin_headers,
+                                                                   db_session_factory, monkeypatch):
+    # An error after the answer is partial, so the answer already shown stays and the line
+    # saying it was not saved goes under it. _GONE was sent without it and replaced the answer.
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    monkeypatch.setattr("app.ai.orchestrator.answer", _deleting_answer(db_session_factory, [session["id"]]))
+    with client.stream("POST", f"/chat/sessions/{session['id']}/messages/stream",
+                       json={"query": "hi"}, headers=admin_headers) as r:
+        events = [json.loads(line[5:]) for line in r.iter_lines() if line.startswith("data:")]
+    gone = [e for e in events if e["type"] == "error"]
+    assert len(gone) == 1 and "deleted" in gone[0]["text"] and gone[0]["partial"] is True
+
+
+def test_a_chat_deleted_before_any_answer_is_a_plain_error(client, admin_headers,
+                                                          db_session_factory, monkeypatch):
+    session = client.post("/chat/sessions", json={}, headers=admin_headers).json()
+    deleting = _deleting_answer(db_session_factory, [session["id"]])
+
+    def _no_answer(query, history=None, **kw):
+        gen = deleting(query, history, **kw)
+        next(gen)                         # deletes the chat; its answer is never sent
+        yield {"type": "clarify", "text": "Which hospital do you mean?", "options": ["KR"]}
+    monkeypatch.setattr("app.ai.orchestrator.answer", _no_answer)
+    with client.stream("POST", f"/chat/sessions/{session['id']}/messages/stream",
+                       json={"query": "hi"}, headers=admin_headers) as r:
+        events = [json.loads(line[5:]) for line in r.iter_lines() if line.startswith("data:")]
+    gone = [e for e in events if e["type"] == "error"]
+    assert len(gone) == 1 and "deleted" in gone[0]["text"] and "partial" not in gone[0]

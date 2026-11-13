@@ -11,6 +11,8 @@ This module is that missing vocabulary, and nothing else. It is used three ways:
 - resolve(): a plant argument the exact lookups did not recognise ("KR", "North Bangalore").
 - mentioned(): hospitals a question names, so the scope guard can refuse a call that left
   the hospital out, and the brief can say which codes the tables use.
+- spans(): where in the question each of those names sits, so a city written as part of
+  one hospital's name ("HCG KR, Bangalore") is not read as the whole city.
 - prompt_line(): the short list given to the model in the get_kpi plant description.
 
 The list is written out here, not guessed from hospital_map.csv: words such as "City",
@@ -124,20 +126,28 @@ def _patterns() -> list[tuple[re.Pattern, str]]:
     return pats
 
 
-def mentioned(question: str) -> list[tuple[str, tuple[str, ...]]]:
-    """(alias as written, codes) for each hospital the question names, without overlaps."""
+def spans(question: str) -> list[tuple[int, int, str, tuple[str, ...]]]:
+    """(start, end, alias, codes) for every place the question names a hospital, in the
+    order the question names them. Longer aliases claim their words first, so "KR Bangalore"
+    is one mention of HC05, not "KR" plus the city."""
     q = question or ""
-    taken: list[tuple[int, int]] = []
-    found: list[tuple[int, str]] = []
+    taken: list[tuple[int, int, str, tuple[str, ...]]] = []
     for pat, alias in _patterns():
         for m in pat.finditer(q):
-            if any(m.start() < e and s < m.end() for s, e in taken):
+            if any(m.start() < e and s < m.end() for s, e, _a, _c in taken):
                 continue
-            taken.append((m.start(), m.end()))
-            if not any(a == alias for _, a in found):
-                found.append((m.start(), alias))
-    # in the order the question names them
-    return [(alias, _ALIASES[alias]) for _, alias in sorted(found)]
+            taken.append((m.start(), m.end(), alias, _ALIASES[alias]))
+    return sorted(taken)
+
+
+def mentioned(question: str) -> list[tuple[str, tuple[str, ...]]]:
+    """(alias as written, codes) for each hospital the question names, without overlaps,
+    once each, in the order the question names them."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for _s, _e, alias, codes in spans(question):
+        if not any(a == alias for a, _c in out):
+            out.append((alias, codes))
+    return out
 
 
 def prompt_line() -> str:

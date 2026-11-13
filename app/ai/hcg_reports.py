@@ -1,5 +1,6 @@
 # app/ai/hcg_reports.py — the Jun–Aug 2026 HCG reports (formulary compliance, brand rules,
-# scheme / Attis brand savings, cash & TPA margin loss) shaped for the chatbot's get_kpi tool.
+# scheme / Attis brand savings, cash & TPA and out-of-formulary margin loss) shaped for the
+# chatbot's get_kpi tool.
 #
 # WHY THIS EXISTS: the dashboard handlers in app/api/formulary.py, spend.py and brand_rules.py
 # already compute every one of these figures exactly as HCG's monthly report does, so the AI
@@ -52,6 +53,14 @@ BRAND_RULE_VIEWS = ("measures", "trend", "hospitals", "doctors", "items", "book"
 SAVING_VIEWS = ("summary", "trend", "hospitals", "doctors", "items")
 ATTIS_VIEWS = SAVING_VIEWS + ("consumption",)
 CASH_VIEWS = SAVING_VIEWS
+OOF_VIEWS = ("summary", "trend", "hospitals", "items", "vendors")
+
+
+# The views whose rows are a ranking by the report's own money figure (most missed or most
+# spent first), so their first N rows ARE the "top N" (see top_rows). The hospital ranking is
+# not one of them: the formulary one runs worst compliance first, a different order.
+RANKED_VIEWS = ("items", "doctors", "vendors")
+TOP_MAX = 50                    # the most rows a "top N" can ask for (the chat table shows 50)
 
 
 # ── Plumbing ──────────────────────────────────────────────────────────────────
@@ -1059,3 +1068,99 @@ def cash_tpa_margin_loss(Plant=None, Category=None, month=None, payer=None, pati
                          view=None, doctor=None, material=None) -> dict:
     return _spend("cash", Plant, Category, month, patient_type, segment, view, doctor,
                   material, payer=payer)
+
+
+# ── Out-of-formulary margin missed (HCG's purchase method) ────────────────────
+# The Spend page's Out of formulary section: every goods receipt of a brand the month's Item
+# Master flags OUT OF FORMULARY, set against the formulary brand HCG would have bought. Its
+# figure is a MARGIN, with the same three amounts as cash & TPA (S._oof_block), so it shares
+# CASH's ratio. It is not formulary-compliance's out_of_formulary_cost, which is the drug COST
+# billed to patients: "top out-of-formulary brands by margin missed" ranked by that cost was
+# the wrong measure under the right words. Purchases carry no payer, patient type or doctor;
+# the goods supplier (vendor) takes the doctor's place.
+NOTE_OOF = ("Out-of-formulary brands BOUGHT (goods receipts) set against the formulary brand HCG's list "
+            "suggests. margin missed = the suggested brands' margin − the margin earned, net (a brand earning "
+            "more than its suggestion lowers it); margin_loss_pct = missed ÷ the suggested brands' margin.")
+
+
+def _oof_kwargs(plant, month, segment, category, material) -> dict:
+    # every argument explicit: called directly, a handler's Query(None) default is a Query object
+    return {"Plant": plant, "Month": month, "Type": None, "Segment": segment, "Category": category,
+            "Payer": None, "Material": material}
+
+
+@_report("out-of-formulary margin")
+def oof_margin_loss(Plant=None, Category=None, month=None, segment=None, view=None, material=None) -> dict:
+    periods = S._oof_periods()              # 503 first
+    view, _ = _view(view, OOF_VIEWS, "oof-margin-loss")
+    plants = _plants(Plant)
+    mat = _material(material, [S._oof()]) if _text(material) else None
+    code = mat[0] if mat else None
+    K = _oof_kwargs(None, _month_arg(month, periods), _text(segment), _text(Category), code)
+
+    if plants and len(plants) > 1:
+        if view not in ("summary", "hospitals"):
+            raise ValueError(f"Several hospitals are pooled for view 'summary' or 'hospitals' only; call once per "
+                             f"hospital for view '{view}'.")
+        per = [S.spend_oof_overview(**{**K, "Plant": c}) for c in plants]
+        rows = [{"hospital": ov["scope"]["his_name"] or ov["scope"]["plant_name"], "plant": c,
+                 **_sp_row(CASH, ov["headline"])} for c, ov in zip(plants, per)]
+        totals = _sp_pool(CASH, [_sp_row(CASH, ov["headline"], True) for ov in per])
+        scope = _scope({**per[0]["scope"], "plant": ",".join(plants),
+                        "his_name": " + ".join(r["hospital"] for r in rows)})
+        return _finish(view, totals, scope, rows, periods, notes=[
+            NOTE_OOF, f"Pooled over {len(plants)} hospitals: amounts added first, the % taken once."])
+
+    K["Plant"] = plants[0] if plants else None
+    ov = S.spend_oof_overview(**K)
+    h = ov["headline"]
+    scope = _scope(ov["scope"])
+    if mat:
+        scope.update(item=mat[1], material=code)
+    estimated = ("Estimated: " + ", ".join(F._month_label(m) for m in h["estimated_months"])
+                 + " had no HCG worksheet, so some suggested brands are the app's match."
+                 if h.get("estimated_months") else None)
+    note = _handler_note(ov.get("notes")) or estimated
+    totals = {**_sp_row(CASH, h, True), "purchase_value": _m(h["purchase_value"])}
+
+    if view == "summary":
+        totals.update(brands=h["brands"], vendors=h["vendors"], hospitals=h["hospitals"])
+        rows = [{"breakdown": c["label"], **_sp_row(CASH, c)} for c in ov["by_category"]]
+        return _finish("summary", totals, scope, rows, periods,
+                       notes=[NOTE_OOF, note or "Rows: by material type (onco / non-onco)."])
+    if view == "trend":
+        rows = [{"month": t["label"], **_sp_row(CASH, t)} for t in ov["trend"]]
+        return _finish("trend", totals, scope, rows, periods,
+                       notes=[NOTE_OOF, "The trend shows every month whatever the month filter."])
+    if view == "hospitals":
+        rows = [{"hospital": _hospital_name(x), "plant": x["plant"], **_sp_row(CASH, x, amounts=1)}
+                for x in ov["by_hospital"]]
+        return _finish("hospitals", totals, scope, rows, periods, notes=[
+            "Every hospital, most margin missed first, whatever the hospital filter. Never add or average the "
+            "percentages: a group's % is its summed amounts' ratio.", note])
+    if view == "items":
+        rows, total = _page(S.spend_oof_items, Vendor=None, **K)
+        out = [{"item": r["material_desc"], "material": r["material"], "suggested_item": r["suggested_desc"],
+                **_sp_row(CASH, r), "qty": r["qty"]} for r in rows]
+        return _finish("items", totals, scope, out, periods, total,
+                       [NOTE_OOF, "Brands bought, most margin missed first (brands with no suggested brand last)."])
+    # vendors
+    rows, total = _page(S.spend_oof_vendors, **K)
+    out = [{"vendor": r["vendor_name"], **_sp_row(CASH, r), "brands": r["brands"]} for r in rows]
+    return _finish("vendors", totals, scope, out, periods, total,
+                   [NOTE_OOF, "Goods suppliers, most margin missed first."])
+
+
+def top_rows(payload: dict, n: int) -> tuple[dict, bool]:
+    """(payload, applied): a ranked view cut to its first `n` rows, the "top N" a question asked
+    for. A get_kpi table used to show every row the budget left room for: "top 10 brands" came
+    back as 16. Not applied to any other view (a trend, a summary breakdown, the hospital
+    ranking), whose rows are not ordered by the report's figure; the caller reports that."""
+    if not isinstance(payload, dict) or payload.get("view") not in RANKED_VIEWS or "rows" not in payload:
+        return payload, False
+    rows = payload["rows"][:n]
+    # _fit's "Showing the first k of m rows" no longer describes the list; rows_total still does
+    notes = [x for x in payload.get("notes", []) if not x.startswith("Showing the first ")]
+    if len(rows) < int(payload.get("rows_total") or 0) and len(notes) < 2:
+        notes.append(f"The top {len(rows)} of {payload['rows_total']} rows, ranked as listed.")
+    return {**payload, "rows": rows, "notes": notes}, True

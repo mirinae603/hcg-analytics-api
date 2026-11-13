@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +21,15 @@ from sqlalchemy.orm import Session
 
 from app.ai import orchestrator
 from app.models import ChatMessage, ChatSession, User
+
+_log = logging.getLogger(__name__)
+# The app configures no logging (as in app/ai/orchestrator.py): a plain stderr handler only when
+# nobody has configured one, so a failed turn's traceback and its ref are seen.
+if not _log.handlers and not logging.getLogger().handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _log.addHandler(_h)
+    _log.setLevel(logging.INFO)
 
 
 def _user_public(user: Optional[User]) -> Optional[Dict]:
@@ -108,66 +119,150 @@ def _answer_events(engine, query: str, history: List[Dict], context: Optional[Di
     return engine.answer(query, history)
 
 
+# What the user reads when a turn fails. Never the exception's own text: that can carry SQL,
+# a file path or a service's error body. The ref is written to the server log beside the
+# traceback, so support can find what happened from what the user saw.
+_FAILED = "Sorry — something went wrong answering that. Please try again. (ref {ref})"
+_PARTIAL = "Part of this answer couldn't be completed, so a chart or table may be missing. (ref {ref})"
+
+
+def _has_text(text) -> bool:
+    return text is not None and bool(str(text).strip())
+
+
+class TurnReply:
+    """One AI turn, folded from the engine's events into the reply that is stored. Both chat
+    routes and POST /ai/chat use it, so the same events give the same reply and the same
+    error events everywhere.
+
+    `add(ev)` takes each event and returns the one to send on, `fail()` is called from the
+    except block when the engine raises, `finish()` when it stops, and `reply()` gives the
+    stored shape. A failure before the answer turns the turn into an error reply: no
+    verified, no chart, no table, so no trust badge sits on it. A failure after the answer
+    keeps everything the user already has — text, verified, charts, table — and adds a
+    `notice`: the answer used to be replaced by the error while `verified` stayed
+    "canonical", and the UI showed the green badge on an error.
+
+    `verified` is stored as the orchestrator's own "ok" | "corrected" | "flagged" |
+    "canonical" | None string, NOT collapsed to a bool — Python truthy-strings mean
+    bool("flagged") is True, which previously rendered a flagged (unreliable) answer with a
+    green "Verified" badge, the opposite of what the badge means."""
+
+    def __init__(self, route: str):
+        self.route = route
+        self.text: Optional[str] = None
+        self.verified: Optional[str] = None
+        self.options: List[str] = []
+        self.charts: List[Dict] = []
+        self.table: Optional[Dict] = None
+        self.queries: List[Dict] = []
+        self.kind = "answer"
+        self.scope: Optional[str] = None
+        self.notice: Optional[str] = None
+        # True once an answer with words has been sent. An empty answer is no answer: the
+        # user has nothing to keep, so a failure after it is a failure before an answer.
+        self.answered = False
+
+    def add(self, ev: Dict) -> Dict:
+        t = ev.get("type")
+        if t == "answer":
+            self.text = ev.get("text")
+            self.verified = ev.get("verified")
+            self.options = ev.get("options") or self.options
+            # See _history_for_orchestrator's docstring: dropping this is exactly what
+            # broke multi-turn follow-ups (every prior scope silently reset to "").
+            self.scope = ev.get("scope") or self.scope
+            self.answered = _has_text(self.text)
+        elif t == "chart":
+            if ev.get("plotly"):
+                self.charts.append(ev["plotly"])
+        elif t == "table":
+            tbl = ev.get("table")
+            self.table = {**tbl, "note": ev.get("note", "")} if tbl else None
+        elif t == "sql":
+            self.queries.append({"purpose": ev.get("purpose"), "sql": ev.get("sql"),
+                                 "rows": ev.get("rows"), "error": ev.get("error")})
+        elif t == "followups":
+            self.options = ev.get("options") or self.options
+        elif t == "clarify":
+            self.text = ev.get("text")
+            self.options = ev.get("options") or self.options
+            self.kind = "clarify"
+        elif t == "error":
+            # The engine's own ref when it sent one (it logged the traceback under it), so the
+            # ref the user is shown finds that traceback.
+            ref = ev.get("ref") or secrets.token_hex(4)
+            if self.answered:
+                _log.error("chat.turn_error_after_answer route=%s ref=%s text=%s",
+                           self.route, ref, ev.get("text"))
+                return self._partial(ref)
+            # Before an answer the engine's own error text is the reply: it is written for
+            # the user ("isn't configured", "the AI service rejected the key"). One with no
+            # words was sent on as it was, and finish() then sent the generic error as well:
+            # two errors for one failure. It gets the generic words here, so it is the only one.
+            text = ev.get("text")
+            if not _has_text(text):
+                _log.error("chat.turn_error_no_text route=%s ref=%s", self.route, ref)
+                text = _FAILED.format(ref=ref)
+            return self._error(text)
+        # "step" / "done" are progress-only — nothing to persist from them.
+        return ev
+
+    def fail(self) -> Dict:
+        """The error event for an exception the engine raised. Call it from the except block,
+        so the traceback is logged with the ref the user is shown."""
+        ref = secrets.token_hex(4)
+        _log.exception("chat.turn_failed route=%s ref=%s answered=%s", self.route, ref, self.answered)
+        if self.answered:
+            return self._partial(ref)
+        return self._error(_FAILED.format(ref=ref))
+
+    def finish(self) -> Optional[Dict]:
+        """Close the turn. A turn that ends with no words is a failed turn: a reply once
+        persisted `"text": ""` with a chart, a table, a badge and follow-up chips around it,
+        which reads as the product being broken. Returns the error event to send then, else
+        None."""
+        if _has_text(self.text):
+            return None
+        ref = secrets.token_hex(4)
+        _log.error("chat.turn_no_text route=%s ref=%s", self.route, ref)
+        return self._error(_FAILED.format(ref=ref))
+
+    def reply(self) -> Dict:
+        out = {"text": self.text, "verified": self.verified, "options": self.options,
+               # "chart" (the last one) stays for readers older than "charts".
+               "chart": self.charts[-1] if self.charts else None, "charts": self.charts,
+               "table": self.table, "queries": self.queries, "kind": self.kind, "scope": self.scope}
+        if self.notice:
+            out["notice"] = self.notice
+        return out
+
+    def _partial(self, ref: str) -> Dict:
+        self.notice = _PARTIAL.format(ref=ref)
+        return {"type": "error", "text": self.notice, "partial": True}
+
+    def _error(self, text: Optional[str]) -> Dict:
+        self.text = text
+        self.kind = "error"
+        self.verified = None
+        self.options = []
+        self.charts = []
+        self.table = None
+        return {"type": "error", "text": text}
+
+
 def _run_ai_turn(query: str, history: List[Dict], context: Optional[Dict[str, Any]] = None) -> Dict:
     """Consume orchestrator.answer's SSE-event generator into one consolidated reply.
     Never raises — any failure becomes an error-flavoured reply so a message is always
-    persisted (and returned) instead of leaving a user turn with no response at all.
-
-    `verified` is stored as the orchestrator's own "ok" | "corrected" | "flagged" | None
-    string, NOT collapsed to a bool — Python truthy-strings mean bool("flagged") is True,
-    which previously rendered a flagged (unreliable) answer with a green "Verified" badge,
-    the opposite of what the badge means. Mirrors exactly what the live SSE /ai/chat path
-    has always sent the frontend (see the "answer" event in app/ai/orchestrator.py)."""
-    text: Optional[str] = None
-    verified: Optional[str] = None
-    options: List[str] = []
-    chart = None
-    table = None
-    queries: List[Dict] = []
-    kind = "answer"
-    scope: Optional[str] = None
+    persisted (and returned) instead of leaving a user turn with no response at all."""
+    turn = TurnReply("/chat/sessions/{id}/messages")
     try:
         for ev in _answer_events(orchestrator, query, history, context):
-            t = ev.get("type")
-            if t == "answer":
-                text = ev.get("text")
-                verified = ev.get("verified")
-                options = ev.get("options") or options
-                # See _history_for_orchestrator's docstring: dropping this is exactly what
-                # broke multi-turn follow-ups (every prior scope silently reset to "").
-                scope = ev.get("scope") or scope
-            elif t == "chart":
-                chart = ev.get("plotly")
-            elif t == "table":
-                tbl = ev.get("table")
-                table = {**tbl, "note": ev.get("note", "")} if tbl else None
-            elif t == "sql":
-                queries.append({"purpose": ev.get("purpose"), "sql": ev.get("sql"),
-                                 "rows": ev.get("rows"), "error": ev.get("error")})
-            elif t == "followups":
-                options = ev.get("options") or options
-            elif t == "clarify":
-                text = ev.get("text")
-                options = ev.get("options") or options
-                kind = "clarify"
-            elif t == "error":
-                text = ev.get("text")
-                kind = "error"
-            # "step" / "done" are progress-only — nothing to persist from them.
-    except Exception as e:  # the orchestrator/Azure call itself blew up
-        text = f"The AI Analyst hit an error answering that: {e}"
-        kind = "error"
-
-    # Empty counts as missing, not just None. A turn once persisted `"text": ""` with a
-    # full chart, table, badge and follow-up chips attached — the UI faithfully rendered
-    # every one of those around a blank answer, which reads as the product being broken.
-    # Whatever the cause upstream, a reply with no words is never worth storing as one.
-    if text is None or not str(text).strip():
-        text = "I couldn't generate a response for that."
-        kind = "error"
-
-    return {"text": text, "verified": verified, "options": options, "chart": chart,
-            "table": table, "queries": queries, "kind": kind, "scope": scope}
+            turn.add(ev)
+    except Exception:  # the orchestrator/Azure call itself blew up
+        turn.fail()
+    turn.finish()
+    return turn.reply()
 
 
 # ---------- public API ----------
@@ -287,6 +382,9 @@ def _save_reply(db: Session, sid: int, reply: Dict) -> Optional[ChatMessage]:
 
 _GONE = "This chat was deleted while the answer was being written, so the answer was not saved."
 
+_STREAM_ROUTE = "/chat/sessions/{id}/messages/stream"
+
+
 def stream_message_events(db: Session, session_id: int, query: str, mode: str = "fast",
                           context: Optional[Dict[str, Any]] = None):
     """Generator of SSE-shaped event dicts for a session-backed turn — the live-progress
@@ -331,54 +429,24 @@ def stream_message_events(db: Session, session_id: int, query: str, mode: str = 
     db.refresh(user_msg)
     yield {"type": "user_message", "message": _serialize_message(user_msg)}
 
-    text: Optional[str] = None
-    verified: Optional[str] = None
-    options: List[str] = []
-    chart = None
-    table = None
-    queries: List[Dict] = []
-    kind = "answer"
-    scope: Optional[str] = None
-
+    turn = TurnReply(_STREAM_ROUTE)
     try:
         for ev in _answer_events(engine, query, history, context):
-            t = ev.get("type")
-            if t == "answer":
-                text = ev.get("text"); verified = ev.get("verified")
-                options = ev.get("options") or options
-                scope = ev.get("scope") or scope
-            elif t == "chart":
-                chart = ev.get("plotly")
-            elif t == "table":
-                tbl = ev.get("table")
-                table = {**tbl, "note": ev.get("note", "")} if tbl else None
-            elif t == "sql":
-                queries.append({"purpose": ev.get("purpose"), "sql": ev.get("sql"),
-                                 "rows": ev.get("rows"), "error": ev.get("error")})
-            elif t == "followups":
-                options = ev.get("options") or options
-            elif t == "clarify":
-                text = ev.get("text"); options = ev.get("options") or options; kind = "clarify"
-            elif t == "error":
-                text = ev.get("text"); kind = "error"
             # Forward every event live — "step"/"done" included, so the UI can show real
             # progress instead of a single frozen spinner label for the whole turn.
-            yield ev
-    except Exception as e:  # the orchestrator/Azure call itself blew up mid-stream
-        text = f"The AI Analyst hit an error answering that: {e}"
-        kind = "error"
-        yield {"type": "error", "text": text}
-
-    if text is None:
-        text = "I couldn't generate a response for that."
-        kind = "error"
-
-    reply = {"text": text, "verified": verified, "options": options, "chart": chart,
-             "table": table, "queries": queries, "kind": kind, "scope": scope}
+            yield turn.add(ev)
+    except Exception:  # the orchestrator/Azure call itself blew up mid-stream
+        yield turn.fail()
+    closing = turn.finish()
+    if closing:
+        yield closing
+    reply = turn.reply()
 
     assistant_msg = _save_reply(db, sid, reply)
     if assistant_msg is None:
-        yield {"type": "error", "text": _GONE}
+        # Like any error after the answer, this one is partial then: the answer on screen
+        # stays, with the line saying it was not saved under it.
+        yield {"type": "error", "text": _GONE, **({"partial": True} if turn.answered else {})}
         return
 
     yield {"type": "persisted", "assistant_message": _serialize_message(assistant_msg)}

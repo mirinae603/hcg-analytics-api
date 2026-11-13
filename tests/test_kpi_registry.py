@@ -10,7 +10,9 @@ import pytest
 from app.ai import kpi_registry as kr
 from app.core.config import settings
 
-REPORT_KEYS = ("formulary-compliance", "brand-rules", "scheme-brand-saving", "attis-saving", "cash-tpa-margin-loss")
+REPORT_KEYS = ("formulary-compliance", "brand-rules", "scheme-brand-saving", "attis-saving", "cash-tpa-margin-loss",
+               "oof-margin-loss")
+_DATA_DIR = {"formulary": "FORMULARY_DATA_DIR", "spend": "SPEND_DATA_DIR", "purchase": "PURCHASE_DATA_DIR"}
 
 
 def _built(entry: dict) -> bool:
@@ -19,8 +21,7 @@ def _built(entry: dict) -> bool:
     need = entry.get("needs")
     if not need:
         return True
-    folder = settings.FORMULARY_DATA_DIR if need == "formulary" else settings.SPEND_DATA_DIR
-    return any(Path(folder).glob("*.parquet"))
+    return any(Path(getattr(settings, _DATA_DIR[need])).glob("*.parquet"))
 
 
 def test_every_registered_kpi_can_be_called_unfiltered():
@@ -126,7 +127,7 @@ def test_no_ignored_args_key_when_nothing_was_ignored(monkeypatch):
 def test_report_entries_declare_window_ratio_and_data():
     for key in REPORT_KEYS:
         e = kr.KPI_REGISTRY[key]
-        assert e["ratio"] is True and e["needs"] in ("formulary", "spend"), key
+        assert e["ratio"] is True and e["needs"] in _DATA_DIR, key
         assert e["window"] == "reports"                        # months read from the data
         assert e["about"].startswith("<<REPORTS>> ONLY"), key
         assert e["hint"].startswith("<<REPORTS>> ONLY"), key

@@ -150,6 +150,28 @@ def test_site_short_forms_are_read_from_the_plant_names():
     assert not resolve._names_a_site("monthly sales trend across the HCG network")
 
 
+def test_dr_inside_a_product_name_is_not_the_dr_hospital():
+    # "DR" is HCG DR (HC06) and also a word in item names. Read as the hospital, these lost
+    # their monthly query and the brief said HC06's monthly figures do not exist.
+    for q in ("Monthly sales trend of DR EXCELD 60000IU CAP",
+              "Monthly sales trend of DOXY 1-L-DR FORTE CAP"):
+        assert not resolve._names_a_site(q), q
+        assert not resolve.site_trend_unavailable(q), q
+        assert item_trend_sql(q), q
+        b = brief(q)
+        assert "HC06" not in b and "NOT AVAILABLE AT THIS GRAIN" not in b, q
+    # joined to a product word that an item name spells with it, DR is still the product's
+    assert not resolve._hospitals_named("Monthly sales trend of DR EXCELD")
+
+
+def test_a_hospital_beside_a_product_is_still_the_hospital():
+    assert resolve._hospitals_named("monthly trend of exceld at DR") == [("DR", ("HC06",))]
+    assert resolve.site_trend_unavailable("Monthly revenue of DR EXCELD 60000IU CAP at HCG KR")
+    # no item is called "KR KEYTRUDA", so KR here is the hospital
+    assert resolve._names_a_site("KR keytruda monthly sales trend")
+    assert item_trend_sql("KR keytruda monthly sales trend") is None
+
+
 def test_the_brief_says_a_hospital_product_trend_does_not_exist():
     b = brief("sales trend of keytruda at HCG KR")
     assert "MONTHLY SALES EXIST" not in b

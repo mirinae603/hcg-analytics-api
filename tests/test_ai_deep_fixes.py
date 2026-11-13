@@ -122,6 +122,19 @@ def test_one_named_hospital_is_asked_for_its_code_not_told_it_is_several(monkeyp
     assert "MORE THAN ONE" not in w
 
 
+def test_warehouse_dr_in_a_product_name_is_not_the_dr_hospital():
+    # "DR" is HCG DR (HC06) and also a word in item names. Deep mode read the hospitals
+    # straight from hospitals.mentioned(), so a report about DR EXCELD was told to scope to
+    # HC06; it now reads them through resolve, like the fast path.
+    for q in ("Formulary compliance of DR EXCELD 60000IU CAP in Aug-26",
+              "Out-of-formulary margin missed on DOXY 1-L-DR FORTE CAP in Aug-26"):
+        w = _kpi_scope_mismatch("formulary-compliance", "", q)
+        assert w is None or "HC06" not in w, (q, w)
+    # the hospital written as HCG says it is still the hospital
+    w = _kpi_scope_mismatch("formulary-compliance", "", "Formulary compliance at DR Bangalore in Aug-26")
+    assert w and w.startswith("UNSCOPED") and "plant='HC06'" in w
+
+
 # ── the product check: a brand the user names, not a word that sits inside an item name ──
 # The first version counted every resolver family of five or fewer SKUs as one product, and
 # refused the canonical KPI for 27 ordinary questions. Each of these was refused on the real

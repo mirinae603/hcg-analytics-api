@@ -48,8 +48,8 @@ from app.core import data_access as da
 #            these and reports the rest back as _ignored_args.
 #   ratio  — the figure is a percentage, average or ratio of sums: never add or average it
 #            across hospitals (the scope guards word their advice from this).
-#   needs  — "formulary" / "spend": the published data folder the entry reads (tests skip the
-#            entry when it is not built).
+#   needs  — "formulary" / "spend" / "purchase": the published data folder the entry reads
+#            (tests skip the entry when it is not built).
 #   window — "reports": the entry covers HCG's report months, not the warehouse's sales months.
 #            Both are read from the data (app/ai/windows.py); no month is written here.
 REPORT_WINDOW = "reports"
@@ -178,19 +178,20 @@ KPI_REGISTRY: dict[str, dict[str, Any]] = {
         "fn": hcg_reports.formulary_compliance, "label": "Formulary Compliance", "plant": True, "category": True,
         "ratio": True, "needs": "formulary", "window": REPORT_WINDOW,
         "args": ("month", "payer", "patient_type", "segment", "method", "view", "doctor", "material",
-                 "formulary_group"),
+                 "formulary_group", "top"),
         "about": ("<<REPORTS>> ONLY. HCG's monthly formulary compliance: compliance % = Formulary ÷ (Formulary + "
                   "Out of Formulary) drug cost, out-of-formulary / non-formulary spend, GOV restricted and preferred "
                   "brand figures; by month, hospital, segment, IP/OP, payer, class, doctor and item. NOT for share of "
                   "sales revenue by formulary status (<<SALES_SHORT>>, use run_sql on sales_* joined to "
-                  "dim_material.formulary_status)."),
-        "hint": ("<<REPORTS>> ONLY: compliance %, out-of-formulary spend; views summary/trend/hospitals/segments/"
-                 "types/payers/classes/doctors/items. Not <<SALES_SHORT>> sales by formulary status"),
+                  "dim_material.formulary_status). NOT the margin missed on out-of-formulary brands: oof-margin-loss."),
+        "hint": ("<<REPORTS>> ONLY: compliance %, out-of-formulary SPEND (not margin missed); views summary/"
+                 "trend/hospitals/segments/types/payers/classes/doctors/items. Not <<SALES_SHORT>> sales by "
+                 "formulary status"),
     },
     "brand-rules": {
         "fn": hcg_reports.brand_rules, "label": "Brand Rules (restricted / preferred brands)", "plant": True,
         "category": True, "ratio": True, "needs": "formulary", "window": REPORT_WINDOW,
-        "args": ("month", "patient_type", "segment", "measure", "view", "doctor", "material", "payer"),
+        "args": ("month", "patient_type", "segment", "measure", "view", "doctor", "material", "payer", "top"),
         "about": ("<<REPORTS>> ONLY. SPEND on brands that break HCG's brand rules, per payer (measure): restricted / "
                   "preferred / out-of-formulary brands for scheme patients, RESTRICTED BRANDS FOR CASH & TPA PATIENTS "
                   "(restricted_cash_tpa), SCH brands for cash & TPA, -OPD brands on inpatients; each as cost and share "
@@ -201,7 +202,7 @@ KPI_REGISTRY: dict[str, dict[str, Any]] = {
     "scheme-brand-saving": {
         "fn": hcg_reports.scheme_saving, "label": "Scheme Brand Saving Missed", "plant": True, "category": True,
         "ratio": True, "needs": "spend", "window": REPORT_WINDOW,
-        "args": ("month", "patient_type", "segment", "view", "doctor", "material", "scheme_group"),
+        "args": ("month", "patient_type", "segment", "view", "doctor", "material", "scheme_group", "top"),
         "about": ("<<REPORTS>> ONLY. Saving missed when scheme (GOV) patients got a brand for which HCG's scheme "
                   "list suggests a cheaper one (every suggestion; Attis and J&J & Covidien → Healthium slices)."),
         "hint": "<<REPORTS>> ONLY: saving missed on scheme patients' brands vs the scheme list (incl. Healthium)",
@@ -209,7 +210,7 @@ KPI_REGISTRY: dict[str, dict[str, Any]] = {
     "attis-saving": {
         "fn": hcg_reports.attis_saving, "label": "Attis Saving Missed", "plant": True, "category": True,
         "ratio": True, "needs": "spend", "window": REPORT_WINDOW,
-        "args": ("month", "patient_type", "segment", "view", "doctor", "material", "payer"),
+        "args": ("month", "patient_type", "segment", "view", "doctor", "material", "payer", "top"),
         "about": ("<<REPORTS>> ONLY. Saving missed when scheme (GOV) patients got a brand for which HCG's scheme "
                   "list suggests an Attis brand; plus Attis consumption across every payer."),
         "hint": "<<REPORTS>> ONLY: saving missed vs the Attis brand for scheme patients; Attis consumption",
@@ -217,18 +218,32 @@ KPI_REGISTRY: dict[str, dict[str, Any]] = {
     "cash-tpa-margin-loss": {
         "fn": hcg_reports.cash_tpa_margin_loss, "label": "Cash & TPA Margin Loss", "plant": True, "category": True,
         "ratio": True, "needs": "spend", "window": REPORT_WINDOW,
-        "args": ("month", "payer", "patient_type", "segment", "view", "doctor", "material"),
+        "args": ("month", "payer", "patient_type", "segment", "view", "doctor", "material", "top"),
         "about": ("<<REPORTS>> ONLY. Margin HCG lost on cash and TPA patients given a brand for which its list "
                   "suggests a higher-margin one; loss % = loss ÷ the suggested brands' margin. NOT the spend on "
-                  "restricted brands for cash & TPA patients: that is brand-rules, measure restricted_cash_tpa."),
+                  "restricted brands for cash & TPA patients: that is brand-rules, measure restricted_cash_tpa. "
+                  "NOT out-of-formulary brands: oof-margin-loss."),
         "hint": ("<<REPORTS>> ONLY: MARGIN LOST on cash & TPA patients' brands vs the higher-margin suggestion "
                  "(not spend on restricted brands: brand-rules)"),
+    },
+    # HCG's out-of-formulary spend analysis, on PURCHASES (goods receipts), not patient bills:
+    # the Spend page's Out of formulary section. No payer, patient type or doctor.
+    "oof-margin-loss": {
+        "fn": hcg_reports.oof_margin_loss, "label": "Out-of-Formulary Margin Missed", "plant": True,
+        "category": True, "ratio": True, "needs": "purchase", "window": REPORT_WINDOW,
+        "args": ("month", "segment", "view", "material", "top"),
+        "about": ("<<REPORTS>> ONLY. Margin HCG missed by BUYING out-of-formulary brands instead of the formulary "
+                  "brand its list suggests (HCG's purchase method): missed = the suggested brands' margin − the "
+                  "margin earned; loss % = missed ÷ the suggested brands' margin. By month, hospital, brand and "
+                  "vendor. NOT formulary-compliance's out-of-formulary spend, which is drug cost."),
+        "hint": ("<<REPORTS>> ONLY: MARGIN MISSED on out-of-formulary brands bought vs the suggested formulary "
+                 "brand (not their spend: formulary-compliance); views summary/trend/hospitals/items/vendors"),
     },
 }
 
 # Arguments beyond plant/category that some entries take (each entry lists its own in `args`).
 EXTRA_ARGS: tuple[str, ...] = ("month", "payer", "patient_type", "segment", "method", "view", "doctor",
-                               "material", "measure", "formulary_group", "scheme_group")
+                               "material", "measure", "formulary_group", "scheme_group", "top")
 
 
 def _neutral_kwargs(fn: Callable) -> dict[str, Any]:
@@ -305,7 +320,13 @@ def call_kpi(key: str, plant: Optional[str] = None, category: Optional[str] = No
             kwargs[name] = value
         else:
             ignored.append(name)
+    # `top` is call_kpi's own: it cuts the answer's ranked rows and never reaches the handler
+    top = _top_arg(kwargs.pop("top", None))
     result = entry["fn"](**kwargs)
+    if top is not None:
+        result, applied = hcg_reports.top_rows(result, top)
+        if not applied:
+            ignored.append("top")
     # Provenance tag: how the caller (orchestrator) knows this came from the canonical
     # path and can mark the eventual answer's `verified` status accordingly, rather than
     # trusting the model's own uncertainty judgment (the audit found that self-assessment
@@ -314,6 +335,19 @@ def call_kpi(key: str, plant: Optional[str] = None, category: Optional[str] = No
     if ignored:
         out["_ignored_args"] = sorted(ignored)
     return out
+
+
+def _top_arg(value) -> Optional[int]:
+    """The N of a "top N" (1..TOP_MAX), or None. The model may send it as a string."""
+    if value is None:
+        return None
+    try:
+        n = int(str(value).strip())
+    except ValueError:
+        raise ValueError(f"top must be a whole number of rows, not '{str(value)[:20]}'.") from None
+    if not 1 <= n <= hcg_reports.TOP_MAX:
+        raise ValueError(f"top must be between 1 and {hcg_reports.TOP_MAX}.")
+    return n
 
 
 # What the model sends when it means "every hospital". resolve_plant already treats the first
@@ -378,9 +412,11 @@ _EXTRA_SCHEMA: dict[str, dict] = {
         "formulary-compliance: pooled (default, HCG's current method) or mean of onco and non-onco "
         "(HCG's earlier method).")},
     "view": {"type": "string", "enum": ["summary", "trend", "hospitals", "segments", "types", "payers",
-                                        "classes", "doctors", "items", "measures", "book", "consumption"],
+                                        "classes", "doctors", "items", "vendors", "measures", "book",
+                                        "consumption"],
              "description": ("Which breakdown of a report key: trend = by month, hospitals = every hospital "
-                             "ranked. brand-rules default 'measures'; the others 'summary'.")},
+                             "ranked, vendors = goods suppliers (oof-margin-loss). brand-rules default "
+                             "'measures'; the others 'summary'.")},
     "doctor": {"type": "string", "description": "Treating doctor's name or doctor_id (report keys)."},
     "material": {"type": "string", "description": "Item / brand name or material code (report keys)."},
     "measure": {"type": "string", "enum": ["restricted_scheme", "preferred_scheme", "oof_scheme",
@@ -393,6 +429,9 @@ _EXTRA_SCHEMA: dict[str, dict] = {
         "formulary-compliance items: A formulary, B out of formulary (default), C non formulary.")},
     "scheme_group": {"type": "string", "enum": ["attis", "healthium"],
                      "description": "scheme-brand-saving: narrow to the Attis or the J&J & Covidien → Healthium slice."},
+    "top": {"type": "integer", "minimum": 1, "maximum": hcg_reports.TOP_MAX, "description": (
+        "Report keys, views items / doctors / vendors: how many rows to return, most first. The N of a "
+        "'top N' question.")},
 }
 
 
